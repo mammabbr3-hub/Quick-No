@@ -1,0 +1,12 @@
+Mobile Business Hub - Complete OTP/Admin Audit Patch
+
+Fixed:
+1. otp_admin_sc was loading only service_name/emoji but later reading enabled/global_profit_percent, causing the exact handler crash shown in Telegram.
+2. User OTP country detail was loading only service_name/emoji, which could ignore service-level global profit. It now loads the full service record.
+3. Admin country pages now refresh visible Grizzly price/stock before rendering, so unsynced rows do not misleadingly show 0.00. If a cost is unavailable, the admin sees N/A.
+4. ANY_COUNTRY is displayed as "Any Country" instead of the raw catalogue label.
+5. Admin country detail rendering was rewritten to avoid fragile nested f-strings and to show safe N/A/OFF values.
+6. OTP activation service lookup now uses the full service record for consistent metadata.
+7. Syntax check completed successfully.
+
+No live Grizzly transaction was performed; live provider results still depend on the configured Grizzly API key/account.

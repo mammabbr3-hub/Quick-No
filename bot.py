@@ -31,6 +31,7 @@ import threading
 import time
 import urllib.request
 import urllib.parse
+import re
 try:
     import pycountry
 except Exception:
@@ -2913,7 +2914,31 @@ def show_manual(m):
         "💙 Thank you for using Mobile Business Hub."
     )
     clear_state(m.chat.id)
-    bot.send_message(m.chat.id, text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=back_kb())
+    # Manual must never fall through to the generic "Something went wrong"
+    # message because of an optional link, Telegram HTML parsing, or a
+    # configuration value. Try the rich version first, then safely fall back
+    # to plain text while keeping the full guide available.
+    try:
+        bot.send_message(
+            m.chat.id,
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=back_kb(),
+        )
+    except Exception:
+        logger.exception("Rich Manual delivery failed for chat %s; using plain-text fallback", m.chat.id)
+        plain_text = html.unescape(re.sub(r"<[^>]+>", "", text))
+        try:
+            bot.send_message(
+                m.chat.id,
+                plain_text,
+                disable_web_page_preview=True,
+                reply_markup=back_kb(),
+            )
+        except Exception:
+            logger.exception("Plain-text Manual delivery also failed for chat %s", m.chat.id)
+            raise
 
 
 # ================================================================
@@ -8320,7 +8345,7 @@ def _otp_create_activation(user_id,service_code,country_code,source_chat_id):
     svc_cfg=fetchone('SELECT * FROM otp_services WHERE service_code=?',(service_code,))
     price=_otp_price(row,svc_cfg)
     if price<=0: return None,'❌ Invalid price configured for this service/country.'
-    svc=fetchone('SELECT service_name,emoji FROM otp_services WHERE service_code=?',(service_code,))
+    svc=fetchone('SELECT * FROM otp_services WHERE service_code=?',(service_code,))
     service_name=svc['service_name'] if svc else service_code
     now=_otp_now(); order_id=_otp_order_id()
     with db_tx() as conn:
@@ -8442,7 +8467,7 @@ def otp_country_cb(c):
     if not is_feature_enabled("quick_otp", c.from_user.id):
         return bot.answer_callback_query(c.id, "Quick OTP is currently unavailable.", show_alert=True)
     _,service,code=c.data.split(':',2); row=fetchone('SELECT * FROM otp_service_countries WHERE service_code=? AND country_code=? AND enabled=1 AND profit_active=1',(service,code))
-    svc=fetchone('SELECT service_name,emoji FROM otp_services WHERE service_code=?',(service,))
+    svc=fetchone('SELECT * FROM otp_services WHERE service_code=?',(service,))
     if not row: return bot.answer_callback_query(c.id,'Country unavailable.',show_alert=True)
     kb=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('✅ Buy Number',callback_data=f'otp_buy:{service}:{code}')).add(types.InlineKeyboardButton('⬅️ Countries',callback_data=f'otp_service:{service}'))
     bot.answer_callback_query(c.id); bot.edit_message_text(f'{svc["emoji"] if svc else "📱"} <b>{html.escape(str(svc["service_name"] if svc else service))}</b>\n🌍 {row["flag"]} <b>{html.escape(row["name"])}</b>\n\n📦 Available: <b>{int(row["available_count"]):,}</b>\n💰 Price: <b>{_otp_price(row,svc):.2f} USDT</b>\n\nTap <b>Buy Number</b> to continue.',c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=kb)
@@ -8583,19 +8608,36 @@ def otp_admin_svc(c):
     bot.answer_callback_query(c.id)
 
 def _otp_admin_show_countries(chat_id, service, page, svc):
-    per=20; page=max(0,int(page)); total=int(fetchone('SELECT COUNT(*) AS n FROM otp_service_countries WHERE service_code=?',(service,))['n'])
+    per=20; page=max(0,int(page))
+    total=int(fetchone('SELECT COUNT(*) AS n FROM otp_service_countries WHERE service_code=?',(service,))['n'])
     rows=fetchall('SELECT * FROM otp_service_countries WHERE service_code=? ORDER BY name LIMIT ? OFFSET ?',(service,per,page*per))
-    if not rows and page>0: page-=1; rows=fetchall('SELECT * FROM otp_service_countries WHERE service_code=? ORDER BY name LIMIT ? OFFSET ?',(service,per,page*per))
+    if not rows and page>0:
+        page-=1
+        rows=fetchall('SELECT * FROM otp_service_countries WHERE service_code=? ORDER BY name LIMIT ? OFFSET ?',(service,per,page*per))
+    # Refresh the visible page so the admin sees current Grizzly cost/stock
+    # instead of a misleading 0.00 from an unsynced catalogue row.
+    visible_codes=[str(r['country_code']) for r in rows if str(r['country_code']).isdigit()]
+    if visible_codes:
+        try:
+            otp_sync_service_stock(service, visible_codes)
+            rows=fetchall('SELECT * FROM otp_service_countries WHERE service_code=? ORDER BY name LIMIT ? OFFSET ?',(service,per,page*per))
+        except Exception as exc:
+            logger.warning('Admin visible country refresh failed for %s page %s: %s',service,page,exc)
     service_cfg=fetchone('SELECT * FROM otp_services WHERE service_code=?',(service,))
     kb=types.InlineKeyboardMarkup()
     for r in rows:
-        status='🟢' if _otp_profit_active(r,service_cfg) else '⚪'; kb.add(types.InlineKeyboardButton(f'{status} {r["flag"]} {r["name"]} | {_otp_price(r,service_cfg):.2f}',callback_data=f'otp_admin_sc:{service}:{r["country_code"]}'))
+        status='🟢' if _otp_profit_active(r,service_cfg) else '⚪'
+        price=_otp_price(r,service_cfg) if r['grizzly_cost'] is not None else None
+        price_text=f'{price:.2f}' if price is not None else 'N/A'
+        name=str(r['name'])
+        if name == 'ANY_COUNTRY': name='Any Country'
+        kb.add(types.InlineKeyboardButton(f'{status} {r["flag"]} {name} | {price_text}',callback_data=f'otp_admin_sc:{service}:{r["country_code"]}'))
     nav=[]
     if page>0: nav.append(types.InlineKeyboardButton('⬅️ Previous',callback_data=f'otp_admin_countries:{service}:{page-1}'))
     if (page+1)*per<total: nav.append(types.InlineKeyboardButton('Next ➡️',callback_data=f'otp_admin_countries:{service}:{page+1}'))
     if nav: kb.row(*nav)
     kb.row(types.InlineKeyboardButton('⬅️ Services',callback_data='otp_admin_services:0'))
-    bot.send_message(chat_id,f'{svc["emoji"]} <b>{html.escape(svc["service_name"])}</b>\n\n🌍 Configure a country below.\n🟢 = visible to users\n⚪ = hidden until profit is activated.\n📄 Page {page+1}/{max(1,(total+per-1)//per)}',parse_mode='HTML',reply_markup=kb)
+    bot.send_message(chat_id,f'{svc["emoji"]} <b>{html.escape(svc["service_name"])}</b>\n\n🌍 Configure a country below.\n🟢 = visible to users\n⚪ = hidden until profit is activated.\n💹 Prices/stock refreshed from Grizzly for this page.\n📄 Page {page+1}/{max(1,(total+per-1)//per)}',parse_mode='HTML',reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_admin_countries:'))
 @safe_handler
@@ -8612,7 +8654,7 @@ def otp_admin_countries_page(c):
 @safe_handler
 def otp_admin_sc(c):
     if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
-    _,service,code=c.data.split(':',2); r=fetchone('SELECT * FROM otp_service_countries WHERE service_code=? AND country_code=?',(service,code)); svc=fetchone('SELECT service_name,emoji FROM otp_services WHERE service_code=?',(service,))
+    _,service,code=c.data.split(':',2); r=fetchone('SELECT * FROM otp_service_countries WHERE service_code=? AND country_code=?',(service,code)); svc=fetchone('SELECT * FROM otp_services WHERE service_code=?',(service,))
     if not r: return bot.answer_callback_query(c.id,'Country not found.',show_alert=True)
     try: otp_sync_service_stock(service,[code])
     except Exception as exc: logger.warning('Admin country price refresh failed for %s/%s: %s',service,code,exc)
@@ -8625,8 +8667,13 @@ def otp_admin_sc(c):
     kb.add(types.InlineKeyboardButton('🔴 Turn OFF Service' if svc and int(svc['enabled']) else '🟢 Turn ON Service',callback_data=f'otp_service_toggle:{service}'))
     kb.add(types.InlineKeyboardButton('🔴 Hide Country' if r['enabled'] else '🟢 Activate Country',callback_data=f'otp_toggle:{service}:{code}'))
     kb.add(types.InlineKeyboardButton('⬅️ Countries',callback_data=f'otp_admin_svc:{service}'))
-    status='🟢 LIVE FOR USERS' if _otp_profit_active(r,svc) else '⚪ Hidden from users'
-    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,f'{svc["emoji"] if svc else "🧩"} <b>{html.escape(str(svc["service_name"] if svc else service))}</b>\n🌍 {r["flag"]} <b>{html.escape(r["name"])}</b>\n\n🏷 Grizzly cost: {float(r["grizzly_cost"] or 0):.4f}\n💰 User price: <b>{_otp_price(r,svc):.2f} USDT</b>\n📈 Global profit: <b>{(str(svc["global_profit_percent"]) + "%") if svc["global_profit_percent"] is not None else "OFF"}</b>\n✍️ Manual country price: <b>{(f"{float(r["explicit_price"]):.2f} USDT") if r["explicit_price"] is not None else "OFF"}</b>\n📦 Available: <b>{int(r["available_count"]):,}</b>\n🔘 Status: {status}',parse_mode='HTML',reply_markup=kb)
+    status='🟢 LIVE FOR USERS' if (svc and int(svc['enabled']) and _otp_profit_active(r,svc)) else '⚪ Hidden from users'
+    service_label=svc['service_name'] if svc else service
+    service_emoji=svc['emoji'] if svc else '🧩'
+    global_profit='OFF' if not svc or svc['global_profit_percent'] is None else f"{float(svc['global_profit_percent']):g}%"
+    manual_price='OFF' if r['explicit_price'] is None else f"{float(r['explicit_price']):.2f} USDT"
+    cost_text='N/A' if r['grizzly_cost'] is None else f"{float(r['grizzly_cost']):.4f}"
+    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,f'{service_emoji} <b>{html.escape(str(service_label))}</b>\n🌍 {r["flag"]} <b>{html.escape(r["name"])}</b>\n\n🏷 Grizzly cost: {cost_text}\n💰 User price: <b>{_otp_price(r,svc):.2f} USDT</b>\n📈 Global profit: <b>{global_profit}</b>\n✍️ Manual country price: <b>{manual_price}</b>\n📦 Available: <b>{int(r["available_count"]):,}</b>\n🔘 Status: {status}',parse_mode='HTML',reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_service_toggle:'))
 @safe_handler
