@@ -128,3 +128,6 @@ SECURITY / CONTROL AUDIT UPDATE
 - Added Admin Roles and Control Audit panels. Super Admin controls role changes and system-wide settings.
 - Added server-side authorization checks to sensitive admin callback actions for withdrawals, work approvals/rejections, dashboard queues, and admin funding controls.
 - Legacy Bank Details is retained only as a compatibility handle; withdrawal remains the primary payment-details workflow.
+
+AUTO DELETE / CHAT CLEANUP
+Navigation messages that use Reply Keyboards are automatically deleted when the user starts the next action. Useful result/record messages remain visible. Inline callback messages are preserved when handlers edit them in place.

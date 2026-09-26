@@ -2194,6 +2194,57 @@ from telebot import types
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 BRAND = "✦ Mobile Business Hub 🤖"
 
+# ================================================================
+# AUTO-CLEANUP OF NAVIGATION / OPTION MESSAGES
+# ================================================================
+# Keep the chat clean: bot messages that exist only to show a Reply
+# Keyboard/menu are treated as navigation messages. When the user takes
+# another action, the previous menu is deleted automatically. Useful
+# result/record messages are NOT tracked, so they remain visible.
+_AUTO_OPTION_MESSAGES_LOCK = threading.RLock()
+_AUTO_OPTION_MESSAGES = {}  # chat_id -> message_id
+_AUTO_DELETE_OPTION_MESSAGES = True
+
+def _is_reply_keyboard_markup(reply_markup):
+    return isinstance(reply_markup, types.ReplyKeyboardMarkup)
+
+def _track_option_message(message, reply_markup=None):
+    if not _AUTO_DELETE_OPTION_MESSAGES or not message:
+        return message
+    if _is_reply_keyboard_markup(reply_markup):
+        with _AUTO_OPTION_MESSAGES_LOCK:
+            _AUTO_OPTION_MESSAGES[str(message.chat.id)] = message.message_id
+    return message
+
+def _delete_previous_option_message(chat_id, keep_message_id=None):
+    if not _AUTO_DELETE_OPTION_MESSAGES:
+        return
+    key = str(chat_id)
+    with _AUTO_OPTION_MESSAGES_LOCK:
+        message_id = _AUTO_OPTION_MESSAGES.get(key)
+        if not message_id or (keep_message_id is not None and message_id == keep_message_id):
+            return
+        _AUTO_OPTION_MESSAGES.pop(key, None)
+    try:
+        bot.delete_message(chat_id, message_id)
+    except Exception:
+        logger.debug("Could not auto-delete option message %s for %s", message_id, chat_id, exc_info=True)
+
+# Wrap send_message so every Reply Keyboard menu is automatically registered.
+# This covers main menu, Back/Refresh menus, admin menus, and other navigation
+# screens without changing the financial/OTP result messages.
+_ORIGINAL_SEND_MESSAGE = bot.send_message
+def _send_message_with_option_tracking(chat_id, text, *args, **kwargs):
+    reply_markup = kwargs.get("reply_markup")
+    try:
+        msg = _ORIGINAL_SEND_MESSAGE(chat_id, text, *args, **kwargs)
+    except TypeError:
+        # Preserve compatibility with positional reply_markup calls.
+        msg = _ORIGINAL_SEND_MESSAGE(chat_id, text, *args, **kwargs)
+    return _track_option_message(msg, reply_markup)
+
+bot.send_message = _send_message_with_option_tracking
+
 # Telegram can deliver two rapid taps as separate updates (and pyTelegramBotAPI
 # may process them on different worker threads). Keep a tiny per-user action
 # guard so two buttons cannot start two flows/transactions at the same time.
@@ -2384,6 +2435,14 @@ def safe_handler(func):
             else:
                 bot.send_message(chat_id, _double_action_message(chat_id), parse_mode="HTML")
             return
+
+        # Remove the previous navigation/menu message before processing the
+        # next action. For inline callbacks, keep the clicked message alive
+        # because many handlers edit that exact message in place.
+        keep_message_id = None
+        if hasattr(update, "message") and getattr(update, "message", None):
+            keep_message_id = getattr(update.message, "message_id", None)
+        _delete_previous_option_message(chat_id, keep_message_id=keep_message_id)
 
         wait_notice = _show_wait_notice(chat_id)
         try:
