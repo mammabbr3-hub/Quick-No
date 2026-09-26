@@ -145,6 +145,18 @@ def is_admin(chat_id) -> bool:
         return False
 
 
+def is_super_admin(chat_id) -> bool:
+    """Only primary/configuration admins can change system controls.
+    ADMIN_IDS are the trusted super-admin list; extra_admins remain
+    operational admins but cannot change global settings/messages.
+    """
+    return str(chat_id) in ADMIN_IDS
+
+
+def super_admin_only(chat_id) -> bool:
+    return is_super_admin(chat_id)
+
+
 def add_extra_admin(user_id, added_by):
     sid = str(user_id).strip()
     if not sid.isdigit():
@@ -420,14 +432,16 @@ CREATE TABLE IF NOT EXISTS extra_admins (
 );
 
 CREATE TABLE IF NOT EXISTS audit_log (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    admin_id      TEXT NOT NULL,
-    action        TEXT NOT NULL,
-    target_user   TEXT,
-    amount        REAL,
-    txn_id        TEXT,
-    reason        TEXT,
-    created_at    TEXT NOT NULL
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    admin_id           TEXT NOT NULL,
+    action             TEXT NOT NULL,
+    target_user        TEXT,
+    amount             REAL,
+    txn_id             TEXT,
+    reason             TEXT,
+    created_at         TEXT NOT NULL,
+    channel_sent       INTEGER NOT NULL DEFAULT 0,
+    channel_message_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS fsm_state (
@@ -493,15 +507,17 @@ CREATE TABLE IF NOT EXISTS settings (
 -- "⏰ Auto Messages" panel: each has a title (for the admin's own
 -- reference), the message body, and a daily send time.
 CREATE TABLE IF NOT EXISTS auto_messages (
-    auto_id     TEXT PRIMARY KEY,
-    title       TEXT NOT NULL,
-    body        TEXT NOT NULL,
-    hour        INTEGER NOT NULL,
-    minute      INTEGER NOT NULL,
-    active      INTEGER NOT NULL DEFAULT 1,
-    created_by  TEXT,
-    created_at  TEXT NOT NULL,
-    last_sent_date TEXT
+    auto_id        TEXT PRIMARY KEY,
+    title          TEXT NOT NULL,
+    body           TEXT NOT NULL,
+    hour           INTEGER NOT NULL,
+    minute         INTEGER NOT NULL,
+    active         INTEGER NOT NULL DEFAULT 1,
+    created_by     TEXT,
+    created_at     TEXT NOT NULL,
+    last_sent_date TEXT,
+    target_type    TEXT NOT NULL DEFAULT 'bot_users',
+    target_value   TEXT
 );
 
 -- Admin-defined extra reply-keyboard buttons, added and edited entirely
@@ -560,6 +576,10 @@ _MIGRATIONS = [
     "ALTER TABLE bank_details ADD COLUMN category TEXT",
     "ALTER TABLE auto_messages ADD COLUMN interval_minutes INTEGER",
     "ALTER TABLE auto_messages ADD COLUMN last_sent_at TEXT",
+    "ALTER TABLE auto_messages ADD COLUMN target_type TEXT NOT NULL DEFAULT 'bot_users'",
+    "ALTER TABLE auto_messages ADD COLUMN target_value TEXT",
+    "ALTER TABLE audit_log ADD COLUMN channel_sent INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE audit_log ADD COLUMN channel_message_id INTEGER",
 ]
 
 
@@ -600,7 +620,17 @@ def init_db():
                 if "duplicate column" not in str(e).lower():
                     logger.exception("Migration failed: %s", stmt)
         _migrate_legacy_finance_schema(conn)
-        conn.commit()
+        # Existing audit history predates the Audit Channel dispatcher.
+        # Mark that old history as archived exactly once; future unsent rows
+        # remain durable and will be retried if Telegram delivery fails.
+        try:
+            boot = conn.execute("SELECT value FROM settings WHERE key='audit_channel_bootstrap_v1'").fetchone()
+            if boot is None:
+                conn.execute("UPDATE audit_log SET channel_sent=1 WHERE channel_sent=0")
+                conn.execute("INSERT INTO settings(key,value,updated_at,updated_by) VALUES('audit_channel_bootstrap_v1','1',?, 'SYSTEM')", (now_iso(),))
+                conn.commit()
+        except Exception:
+            logger.exception("Could not initialize audit channel backlog marker")
         _seed_default_menu_options(conn)
         logger.info("Database ready at %s", DB_PATH)
     finally:
@@ -1255,12 +1285,18 @@ def get_setting(key, default=None):
 
 def set_setting(key, value, admin_id=None):
     with db_tx() as conn:
+        old = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
         conn.execute(
             "INSERT INTO settings (key, value, updated_at, updated_by) VALUES (?,?,?,?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
             "updated_at=excluded.updated_at, updated_by=excluded.updated_by",
             (key, str(value), now_iso(), str(admin_id) if admin_id is not None else None),
         )
+        if admin_id is not None and (old is None or str(old["value"]) != str(value)):
+            conn.execute(
+                "INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",
+                (str(admin_id), "SETTING_CHANGED", None, None, key, f"{old['value'] if old else '<unset>'} -> {value}", now_iso()),
+            )
 
 
 def delete_setting(key):
@@ -1508,15 +1544,19 @@ def render_text(key, default, **kwargs):
 TEXT_TEMPLATES = {
     "welcome": (
         "👋 Welcome message ({full_name},{brand},{referral_line},{referral_link})",
-        "👋 Dear {full_name},\n\n🤖 {brand}\n\n"
-        "This bot is 3 in 1 Channel Wallet and Group"
-        "\n\nThis bot is your personal digital work platform 💼 —\n"
-        "📤 submit work, 🎁 earn referral rewards, 💰 manage your wallet,\n"
-        "💳 fund your wallet, 🏦 withdraw USDT, and 📞 get support,\n"
-        "all in one place.\n\n"
+        "✨ <b>WELCOME TO {brand}</b> ✨\n\n"
+        "👋 Hello <b>{full_name}</b>!\n\n"
+        "🚀 Your all-in-one digital service hub is ready.\n\n"
+        "📱 Quick OTP\n"
+        "💳 Fund Wallet\n"
+        "💸 Withdraw\n"
+        "📤 Submit Work\n"
+        "🎁 Referral Rewards\n"
+        "🏦 Bank / Wallet Details\n"
+        "🎧 Support\n\n"
         "{referral_line}"
-        "🔗 Your Referral Link:\n{referral_link}\n\n"
-        "👉 Please select an option below to get started.",
+        "🔗 <b>Your Referral Link</b>\n<code>{referral_link}</code>\n\n"
+        "👇 <b>Choose a service below to get started.</b>",
     ),
     "withdrawal_approved": (
         "🎉 Withdrawal approved ({brand},{amount},{wd_id})",
@@ -1679,7 +1719,7 @@ def reserved_labels_now() -> set:
         "📋 Banned Users", "📋 Manage Custom Handles", "📋 Pending Approvals",
         "📝 Edit Bot Text", "📝 Submission ID Search", "📢 Broadcast",
         "🔍 Search", "🔎 Track User",
-        "🔙 Back", "🚫 Ban User", "🛠 Feature Control", "🧩 Menu Editor", "📱 Quick OTP", "📱 Quick OTP Settings", "⚙️ Community Settings", "/start",
+        "🔙 Back", "🚫 Ban User", "🛠 Feature Control", "🛠 Maintenance Mode", "🧩 Menu Editor", "📱 Quick OTP", "📱 Quick OTP Settings", "⚙️ Community Settings", "/start",
     }
     try:
         current |= {r["label"] for r in fetchall("SELECT label FROM menu_options WHERE active=1")}
@@ -1745,12 +1785,12 @@ def is_referral_enabled():
 # AUTO MESSAGES (admin-scheduled recurring broadcasts)
 # ---------------------------------------------------------------
 
-def create_auto_message(auto_id, title, body, hour, minute, admin_id, interval_minutes=None):
+def create_auto_message(auto_id, title, body, hour, minute, admin_id, interval_minutes=None, target_type='bot_users', target_value=None):
     with db_tx() as conn:
         conn.execute(
             "INSERT INTO auto_messages (auto_id, title, body, hour, minute, active, "
-            "created_by, created_at, interval_minutes) VALUES (?,?,?,?,?,1,?,?,?)",
-            (auto_id, title, body, hour, minute, str(admin_id), now_iso(), interval_minutes),
+            "created_by, created_at, interval_minutes, last_sent_at, target_type, target_value) VALUES (?,?,?,?,?,1,?,?,?,?,?,?)",
+            (auto_id, title, body, hour, minute, str(admin_id), now_iso(), interval_minutes, None, target_type, target_value),
         )
 
 
@@ -2105,6 +2145,45 @@ def _actor_may_proceed(chat_id, func_name) -> bool:
     return False
 
 
+def maintenance_enabled() -> bool:
+    return get_setting("maintenance_mode", "0") == "1"
+
+
+def maintenance_message(chat_id):
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("🔄 Try Again Later", callback_data="maintenance_try"),
+        types.InlineKeyboardButton("📞 Contact Support", callback_data="maintenance_support"),
+    )
+    bot.send_message(
+        chat_id,
+        "🛠 <b>Maintenance in Progress</b>\n\n"
+        "We are currently performing maintenance and system updates. "
+        "Most services are temporarily unavailable.\n\n"
+        "Please try again later. If you need assistance, contact Support.\n\n"
+        "Thank you for your patience.",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+def _maintenance_allowed(update, chat_id) -> bool:
+    if not maintenance_enabled() or is_admin(chat_id):
+        return True
+    # Keep support available so users can contact the team during maintenance.
+    func_name = getattr(update, "__name__", "")
+    if func_name in {"support", "_handle_support_text_complaint"}:
+        return True
+    # Allow only the maintenance recovery callbacks while the system is paused.
+    if hasattr(update, "data") and getattr(update, "data", "") in {"maintenance_try", "maintenance_support"}:
+        return True
+    # Once a user has entered the support flow, allow them to finish it.
+    if get_state(chat_id).get("flow") == "support":
+        return True
+    maintenance_message(chat_id)
+    return False
+
+
 def safe_handler(func):
     @functools.wraps(func)
     def wrapper(update, *args, **kwargs):
@@ -2115,6 +2194,14 @@ def safe_handler(func):
             except Exception:
                 logger.exception("Failed to send ban notice to %s", chat_id)
             return
+        # System-wide maintenance gate. Admins remain fully operational;
+        # users can still open and complete Support requests.
+        if maintenance_enabled() and not is_admin(chat_id):
+            if func.__name__ not in {"support", "_handle_support_text_complaint"}:
+                data = getattr(update, "data", "")
+                if data not in {"maintenance_try", "maintenance_support"} and get_state(chat_id).get("flow") != "support":
+                    maintenance_message(chat_id)
+                    return
         try:
             return func(update, *args, **kwargs)
         except InsufficientFundsError as e:
@@ -2150,6 +2237,44 @@ def notify_admins(text, **kwargs):
             logger.exception("Failed to notify admin %s", admin_id)
 
 
+def _audit_channel_id():
+    return _community_id("audit_channel")
+
+def _audit_text(row):
+    action=str(row["action"] or "AUDIT")
+    amount=row["amount"]
+    amount_text=f"\n💰 Amount: <b>{float(amount):.6f} USDT</b>" if amount is not None else ""
+    reason=f"\n📝 Details: {html.escape(str(row['reason']))}" if row["reason"] else ""
+    target=f"\n👤 User: <code>{html.escape(str(row['target_user']))}</code>" if row["target_user"] else ""
+    txn=f"\n🧾 ID: <code>{html.escape(str(row['txn_id']))}</code>" if row["txn_id"] else ""
+    return (f"🔐 <b>MOBILE BUSINESS HUB • AUDIT</b>\n\n"
+            f"⚡ Action: <b>{html.escape(action)}</b>"
+            f"{target}{txn}{amount_text}{reason}\n"
+            f"👮 Actor: <code>{html.escape(str(row['admin_id']))}</code>\n"
+            f"🕒 {html.escape(str(row['created_at']))}")
+
+def audit_channel_dispatcher():
+    """Deliver durable SQLite audit history to the configured channel.
+    The database remains the source of truth; failed Telegram delivery is retried.
+    """
+    while True:
+        try:
+            cid=_audit_channel_id()
+            if cid:
+                rows=fetchall("SELECT * FROM audit_log WHERE channel_sent=0 ORDER BY id LIMIT 25")
+                for row in rows:
+                    try:
+                        sent=bot.send_message(cid,_audit_text(row),parse_mode="HTML")
+                        with db_tx() as conn:
+                            conn.execute("UPDATE audit_log SET channel_sent=1,channel_message_id=? WHERE id=?",(sent.message_id,row["id"]))
+                    except Exception:
+                        logger.exception("Audit channel delivery failed for audit id %s",row["id"])
+                        break
+        except Exception:
+            logger.exception("Audit channel dispatcher error")
+        time.sleep(5)
+
+
 
 # ================================================================
 # COMMUNITY / INTERNAL CHANNEL SETTINGS
@@ -2160,6 +2285,7 @@ COMMUNITY_KEYS = {
     "submission_channel": "community:submission_channel",
     "bank_store_channel": "community:bank_store_channel",
     "support_channel": "community:support_channel",
+    "audit_channel": "community:audit_channel",
 }
 COMMUNITY_LABELS = {
     "user_group": "👥 User Group",
@@ -2167,6 +2293,7 @@ COMMUNITY_LABELS = {
     "submission_channel": "🔐 Submission Channel",
     "bank_store_channel": "🏦 Bank Store Channel",
     "support_channel": "🎧 Support Channel",
+    "audit_channel": "🔐 Audit Channel",
 }
 
 def _community_get(kind):
@@ -2198,11 +2325,14 @@ def _community_settings_text():
         lines.append(f"{COMMUNITY_LABELS[k]}\n🆔 <code>{html.escape(str(cid))}</code>\n🔗 {html.escape(str(link))}")
         lines.append("")
     lines.append("ℹ️ User Group + User Channel are the required join points. Internal channels are admin/business destinations and are never shown as join requirements.")
+    lines.append("🔐 Audit Channel: create a private Telegram channel, add this bot as an administrator, then save its -100… chat ID above. SQLite remains the source of truth; the bot automatically delivers every new audit event to this channel and retries failed deliveries.")
     return "\n".join(lines)
 
-@bot.message_handler(func=lambda m: m.text == "⚙️ Community Settings" and is_admin(m.chat.id))
+@bot.message_handler(func=lambda m: m.text == "⚙️ Community Settings" and is_super_admin(m.chat.id))
 @safe_handler
 def admin_community_settings(m):
+    if not is_super_admin(m.chat.id):
+        return
     clear_state(m.chat.id)
     kb=types.InlineKeyboardMarkup()
     for k in COMMUNITY_KEYS:
@@ -2214,7 +2344,7 @@ def admin_community_settings(m):
 @bot.callback_query_handler(func=lambda c: c.data in ("comm_refresh","comm_check_config"))
 @safe_handler
 def community_refresh_cb(c):
-    if not is_admin(c.message.chat.id): return
+    if not is_super_admin(c.message.chat.id): return
     if c.data == "comm_check_config":
         results=[]
         for k in COMMUNITY_KEYS:
@@ -2236,7 +2366,7 @@ def community_refresh_cb(c):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("comm_set:"))
 @safe_handler
 def community_set_cb(c):
-    if not is_admin(c.message.chat.id): return
+    if not is_super_admin(c.message.chat.id): return
     kind=c.data.split(":",1)[1]
     if kind not in COMMUNITY_KEYS: return
     clear_state(c.message.chat.id)
@@ -2251,7 +2381,7 @@ def community_set_cb(c):
         "The bot must already be a member/admin of the target chat.", parse_mode="HTML", reply_markup=back_kb())
 
 def _handle_community_set(m,state):
-    if not is_admin(m.chat.id): clear_state(m.chat.id); return
+    if not is_super_admin(m.chat.id): clear_state(m.chat.id); return
     kind=state.get("kind")
     raw=(m.text or "").strip()
     parts=[x.strip() for x in raw.split("|",1)]
@@ -2312,48 +2442,51 @@ def community_join_check_cb(c):
 # ================================================================
 
 def main_menu(chat_id=None):
-    """Each side gets its own keyboard, never both mixed together:
-    an admin chat_id gets the admin panel only, everyone else gets
-    the ordinary user menu only. Custom handles (admin-defined extra
-    buttons) are appended as their own rows at the bottom, after
-    everything built-in, and only for users their audience allows —
-    see list_custom_handles_for_user()."""
+    """Professional role-aware keyboard. Super admins control settings;
+    operational admins see day-to-day admin actions only.
+    """
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     if is_admin(chat_id):
         kb.row("📋 Pending Approvals", "🔎 Track User")
         kb.row("🛠 Feature Control")
+        if is_super_admin(chat_id):
+            kb.row("🛠 Maintenance Mode")
         kb.row("📢 Broadcast", "✉️ Message User")
         kb.row("➕ Add/Minus Funds", "📊 Total Users Balance")
         kb.row("💳 Pending Withdrawals")
         kb.row("🚫 Ban User", "✅ Unban User")
         kb.row("👥 Users", "📋 Banned Users")
-        kb.row("➕ Add User", "➕ Add Admin")
-        kb.row("🔍 Search")
-        kb.row("⚙️ Settings", "💳 Fund Wallet Settings")
-        kb.row("⚙️ Community Settings")
-        kb.row("📱 Quick OTP Settings")
-        kb.row("⏰ Auto Messages")
-        kb.row("📝 Edit Bot Text", "🧩 Menu Editor")
-        kb.row("➕ Add Custom Handle", "📋 Manage Custom Handles")
+        if is_super_admin(chat_id):
+            kb.row("➕ Add User", "➕ Add Admin")
+            kb.row("🔍 Search")
+            kb.row("⚙️ Settings", "💳 Fund Wallet Settings")
+            kb.row("⚙️ Community Settings")
+            kb.row("📱 Quick OTP Settings")
+            kb.row("⏰ Auto Messages")
+            kb.row("📝 Edit Bot Text", "🧩 Menu Editor")
+            kb.row("➕ Add Custom Handle", "📋 Manage Custom Handles")
+        else:
+            kb.row("🔍 Search")
     else:
-        kb.row(btn_label("profile"), btn_label("submit_work"))
-        kb.row("💳 Fund Wallet", btn_label("balance"))
-        kb.row(btn_label("withdraw"), btn_label("referrals"))
-        kb.row(btn_label("history"), btn_label("bank_details"))
-        kb.row(btn_label("support"), "📱 Quick OTP")
-        kb.row(btn_label("buy_sell_mail"))
+        # Quick OTP gets the first and most visible row as requested.
+        kb.row("📱 Quick OTP")
+        kb.row(btn_label("balance"), btn_label("withdraw"))
+        kb.row(btn_label("bank_details"), btn_label("profile"))
+        kb.row(btn_label("submit_work"), btn_label("history"))
+        kb.row("💳 Fund Wallet", btn_label("referrals"))
+        kb.row(btn_label("support"), btn_label("buy_sell_mail"))
     try:
         for pair in _rows_of_two([h["label"] for h in list_custom_handles_for_user(chat_id)]):
             kb.row(*pair)
     except Exception:
         logger.exception("Failed to load custom handles for menu (chat_id=%s)", chat_id)
-    kb.row("/start")
+    kb.row("🔄 Refresh", "/start")
     return kb
 
 
 def back_kb():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("🔙 Back")
+    kb.row("🔄 Refresh", "🔙 Back")
     return kb
 
 
@@ -2366,6 +2499,21 @@ def fmt_amount(amount, currency="usdt"):
 # regardless of which flow a user is currently in. This is what
 # guarantees nobody ever gets trapped in a multi-step process.
 # ================================================================
+
+@bot.message_handler(func=lambda m: m.text == "🔄 Refresh")
+@safe_handler
+def universal_refresh(m):
+    # Reset any active conversation flow and rebuild the current menu from
+    # fresh database/configuration state. This is a safe UI recovery action:
+    # it never creates an order, charges the wallet, or changes account data.
+    clear_state(m.chat.id)
+    bot.send_message(
+        m.chat.id,
+        "🔄 <b>Refreshed</b>\n\nThe current session has been reset. Please choose an option from the menu.",
+        parse_mode="HTML",
+        reply_markup=main_menu(m.chat.id),
+    )
+
 
 @bot.message_handler(func=lambda m: m.text == "🔙 Back")
 @safe_handler
@@ -2400,6 +2548,9 @@ def start(msg):
 
     if is_new:
         notify_admins(f"🆕 NEW USER\n\n👤 Name: {full_name}\n🆔 ID: {user_id}")
+        with db_tx() as conn:
+            conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",
+                         ("SYSTEM","NEW_USER",user_id,None,None,full_name,now_iso()))
 
         if ref_id and str(ref_id) != user_id and user_exists(ref_id) and is_referral_enabled():
             ref_usdt = get_referral_amount("usdt")
@@ -2731,7 +2882,7 @@ def build_profile_text(user_id) -> str:
 
     lines = [
         "👤 PROFILE\n",
-        f"🆔 User ID: <code>{user['user_id']}</code>  (👆 danna don copy)",
+        f"🆔 User ID: <code>{user['user_id']}</code>  (tap to copy)",
         f"📛 Name: {html.escape(user['name'] or '—')}",
         f"🔗 Username: {display_username(user)}",
         f"🚫 Status: {'BANNED' if user['banned'] else 'Active'}\n",
@@ -2873,6 +3024,87 @@ def dash_open_bank(c):
 
 
 # ================================================================
+# ADMIN: MAINTENANCE MODE
+# ================================================================
+
+
+def _maintenance_admin_kb():
+    active = maintenance_enabled()
+    kb = types.InlineKeyboardMarkup()
+    kb.row(types.InlineKeyboardButton(
+        "🔴 Turn OFF Maintenance" if active else "🟢 Turn ON Maintenance",
+        callback_data="maintenance_toggle",
+    ))
+    kb.row(types.InlineKeyboardButton("🔄 Refresh Status", callback_data="maintenance_refresh"))
+    return kb
+
+
+def _maintenance_admin_text():
+    status = "🔴 ACTIVE — users are blocked" if maintenance_enabled() else "🟢 OFF — users can access the bot"
+    return (
+        "🛠 <b>MAINTENANCE MODE</b>\n\n"
+        f"Status: <b>{status}</b>\n\n"
+        "When Maintenance Mode is ON, users cannot start transactions or use normal bot features. "
+        "They will receive a maintenance notice with options to try again later or contact Support. "
+        "Admins remain fully operational.\n\n"
+        "Use this mode before deployments, database changes, provider updates, or other maintenance work."
+    )
+
+
+@bot.message_handler(func=lambda m: m.text == "🛠 Maintenance Mode" and is_super_admin(m.chat.id))
+@safe_handler
+def admin_maintenance_mode(m):
+    clear_state(m.chat.id)
+    bot.send_message(m.chat.id, _maintenance_admin_text(), parse_mode="HTML", reply_markup=_maintenance_admin_kb())
+
+
+@bot.callback_query_handler(func=lambda c: c.data in ("maintenance_toggle", "maintenance_refresh"))
+@safe_handler
+def admin_maintenance_cb(c):
+    if not is_super_admin(c.from_user.id):
+        return bot.answer_callback_query(c.id, "Admin only", show_alert=True)
+    if c.data == "maintenance_toggle":
+        new_value = "0" if maintenance_enabled() else "1"
+        set_setting("maintenance_mode", new_value, c.from_user.id)
+        bot.answer_callback_query(c.id, "Maintenance mode updated.")
+    else:
+        bot.answer_callback_query(c.id, "Status refreshed.")
+    try:
+        bot.edit_message_text(_maintenance_admin_text(), c.message.chat.id, c.message.message_id, parse_mode="HTML", reply_markup=_maintenance_admin_kb())
+    except Exception:
+        bot.send_message(c.message.chat.id, _maintenance_admin_text(), parse_mode="HTML", reply_markup=_maintenance_admin_kb())
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "maintenance_try")
+@safe_handler
+def maintenance_try_cb(c):
+    if maintenance_enabled() and not is_admin(c.from_user.id):
+        bot.answer_callback_query(c.id, "Maintenance is still in progress.", show_alert=True)
+        maintenance_message(c.message.chat.id)
+        return
+    bot.answer_callback_query(c.id, "The system is available again.")
+    bot.send_message(c.message.chat.id, "✅ The system is available again. Please choose an option from the menu.", reply_markup=main_menu(c.message.chat.id))
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "maintenance_support")
+@safe_handler
+def maintenance_support_cb(c):
+    if is_admin(c.from_user.id):
+        return bot.answer_callback_query(c.id, "Admins can continue normally.")
+    clear_state(c.message.chat.id)
+    update_state(c.message.chat.id, flow="support")
+    bot.answer_callback_query(c.id)
+    bot.send_message(
+        c.message.chat.id,
+        "📞 <b>Support</b>\n\n"
+        "Please describe the issue you need help with. Our support team will review your request.\n\n"
+        "Send your message below:",
+        parse_mode="HTML",
+        reply_markup=back_kb(),
+    )
+
+
+# ================================================================
 # ADMIN: FEATURE CONTROL ("god-mode" switchboard)
 # ================================================================
 
@@ -2892,7 +3124,7 @@ def _feature_control_kb():
     return kb
 
 
-@bot.message_handler(func=lambda m: m.text == "🛠 Feature Control" and is_admin(m.chat.id))
+@bot.message_handler(func=lambda m: m.text == "🛠 Feature Control" and is_super_admin(m.chat.id))
 @safe_handler
 def admin_feature_control(m):
     clear_state(m.chat.id)
@@ -2914,7 +3146,7 @@ def noop_cb(c):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("featoggle_"))
 @safe_handler
 def admin_feature_toggle_cb(c):
-    if not is_admin(c.message.chat.id):
+    if not is_super_admin(c.message.chat.id):
         bot.answer_callback_query(c.id)
         return
     key = c.data[len("featoggle_"):]
@@ -2933,7 +3165,7 @@ def admin_feature_toggle_cb(c):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("restrictuser_"))
 @safe_handler
 def admin_restrict_user_start(c):
-    if not is_admin(c.message.chat.id):
+    if not is_super_admin(c.message.chat.id):
         bot.answer_callback_query(c.id)
         return
     key = c.data[len("restrictuser_"):]
@@ -2976,7 +3208,7 @@ def _handle_admin_feature_restrict_user_id(m, state):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("userfeat_on_") or c.data.startswith("userfeat_off_"))
 @safe_handler
 def admin_userfeat_toggle_cb(c):
-    if not is_admin(c.message.chat.id):
+    if not is_super_admin(c.message.chat.id):
         bot.answer_callback_query(c.id)
         return
     enable = c.data.startswith("userfeat_on_")
@@ -3230,8 +3462,8 @@ def _handle_admin_add_user_id(m, state):
         bot.send_message(
             target_id,
             "🎉 WELCOME!\n\n"
-            "An ƙara ku cikin tsarin mu.\n\n"
-            "Danna /start don fara amfani da bot ɗin.",
+            "You have been added to our system.\n\n"
+            "Tap /start to begin using the bot.",
         )
     except Exception:
         dm_sent = False
@@ -3243,8 +3475,8 @@ def _handle_admin_add_user_id(m, state):
     )
     if not dm_sent:
         confirm_text += (
-            "\n\n⚠️ Ba a iya aika masa saƙon maraba ba "
-            "(wataƙila bai taɓa yin /start da bot ɗin ba)."
+            "\n\n⚠️ We could not send the welcome message. "
+            "The user may not have started the bot yet."
         )
 
     bot.send_message(
@@ -3328,20 +3560,20 @@ def admin_unban_confirm_cb(c):
 # BROADCAST
 # ================================================================
 
-@bot.message_handler(func=lambda m: m.text == "📢 Broadcast" and is_admin(m.chat.id))
+@bot.message_handler(func=lambda m: m.text == "📢 Broadcast" and is_super_admin(m.chat.id))
 @safe_handler
 def ask_broadcast(m):
     clear_state(m.chat.id)
     kb=types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("👥 All Users")
+    kb.row("🤖 Bot Users")
     kb.row("👥 User Group", "📢 User Channel")
     kb.row("🔙 Back")
     bot.send_message(m.chat.id,"📢 BROADCAST\n\nChoose the destination:",reply_markup=kb)
 
-@bot.message_handler(func=lambda m: m.text in ("👥 All Users","👥 User Group","📢 User Channel") and is_admin(m.chat.id))
+@bot.message_handler(func=lambda m: m.text in ("🤖 Bot Users","👥 All Users","👥 User Group","📢 User Channel") and is_admin(m.chat.id))
 @safe_handler
 def broadcast_target(m):
-    target={"👥 All Users":"all","👥 User Group":"user_group","📢 User Channel":"user_channel"}[m.text]
+    target={"🤖 Bot Users":"all","👥 All Users":"all","👥 User Group":"user_group","📢 User Channel":"user_channel"}[m.text]
     update_state(m.chat.id,flow="admin_broadcast",step="text",target=target)
     bot.send_message(m.chat.id,"📝 Type the message to broadcast:",reply_markup=back_kb())
 
@@ -3375,6 +3607,9 @@ def broadcast_decision_cb(c):
         try: bot.send_message(cid,f"📢 {BRAND}:\n\n{text}"); sent=1
         except Exception as e: bot.send_message(chat_id,f"❌ Could not send to destination: {e}",reply_markup=main_menu(chat_id)); return
     bot.send_message(chat_id,f"✅ Broadcast sent successfully.\n📨 Delivered: {sent}",reply_markup=main_menu(chat_id))
+    with db_tx() as conn:
+        conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",
+                     (str(chat_id),"BROADCAST_SENT",None,None,gen_id("MSG"),f"target={target}; delivered={sent}; {text[:300]}",now_iso()))
 
 
 # ================================================================
@@ -3425,7 +3660,7 @@ def _handle_admin_msg_body(m, state):
 # ADMIN: ADD ANOTHER ADMIN BY NUMERIC TELEGRAM ID
 # ================================================================
 
-@bot.message_handler(func=lambda m: m.text == "➕ Add Admin" and is_admin(m.chat.id))
+@bot.message_handler(func=lambda m: m.text == "➕ Add Admin" and is_super_admin(m.chat.id))
 @safe_handler
 def admin_add_admin_start(m):
     clear_state(m.chat.id)
@@ -3835,7 +4070,7 @@ _SETTING_LABELS = {
 }
 
 
-@bot.message_handler(func=lambda m: m.text == "⚙️ Settings" and is_admin(m.chat.id))
+@bot.message_handler(func=lambda m: m.text == "⚙️ Settings" and is_super_admin(m.chat.id))
 @safe_handler
 def admin_settings_menu(m):
     if not is_admin(m.chat.id):
@@ -3862,7 +4097,7 @@ def admin_settings_menu(m):
 @bot.callback_query_handler(func=lambda c: c.data in ("reftoggle_on", "reftoggle_off"))
 @safe_handler
 def admin_referral_toggle_cb(c):
-    if not is_admin(c.message.chat.id):
+    if not is_super_admin(c.message.chat.id):
         bot.answer_callback_query(c.id)
         return
     turn_on = c.data == "reftoggle_on"
@@ -3874,7 +4109,7 @@ def admin_referral_toggle_cb(c):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("setedit_"))
 @safe_handler
 def admin_settings_edit_cb(c):
-    if not is_admin(c.message.chat.id):
+    if not is_super_admin(c.message.chat.id):
         bot.answer_callback_query(c.id)
         return
     key = c.data[len("setedit_"):]
@@ -3919,7 +4154,7 @@ def _handle_admin_setting(m, state):
 # f"text:{key}" → every future send of that message uses it (see
 # TEXT_TEMPLATES / get_text / render_text near the top of the file).
 
-@bot.message_handler(func=lambda m: m.text == "📝 Edit Bot Text" and is_admin(m.chat.id))
+@bot.message_handler(func=lambda m: m.text == "📝 Edit Bot Text" and is_super_admin(m.chat.id))
 @safe_handler
 def admin_text_menu(m):
     if not is_admin(m.chat.id):
@@ -4032,7 +4267,7 @@ def _handle_text_edit(m, state):
 # — all from inside the bot, no code changes, no redeploy.
 # ================================================================
 
-@bot.message_handler(func=lambda m: m.text == "🧩 Menu Editor" and is_admin(m.chat.id))
+@bot.message_handler(func=lambda m: m.text == "🧩 Menu Editor" and is_super_admin(m.chat.id))
 @safe_handler
 def admin_menu_editor(m):
     if not is_admin(m.chat.id):
@@ -4605,7 +4840,7 @@ FEATURE_LINK_LABELS = {
 # see "EDITABLE BUTTON LABELS" earlier in this file.
 
 
-@bot.message_handler(func=lambda m: m.text == "➕ Add Custom Handle" and is_admin(m.chat.id))
+@bot.message_handler(func=lambda m: m.text == "➕ Add Custom Handle" and is_super_admin(m.chat.id))
 @safe_handler
 def admin_custom_handle_add_start(m):
     if not is_admin(m.chat.id):
@@ -4820,7 +5055,7 @@ def _finish_custom_handle_creation(chat_id):
     )
 
 
-@bot.message_handler(func=lambda m: m.text == "📋 Manage Custom Handles" and is_admin(m.chat.id))
+@bot.message_handler(func=lambda m: m.text == "📋 Manage Custom Handles" and is_super_admin(m.chat.id))
 @safe_handler
 def admin_custom_handle_manage(m):
     if not is_admin(m.chat.id):
@@ -4965,7 +5200,7 @@ def _format_auto_list():
             schedule = f"every {r['interval_minutes']} min"
         else:
             schedule = f"{r['hour']:02d}:{r['minute']:02d} (Lagos, daily)"
-        lines.append(f"{state_icon} {r['title']} — {schedule}")
+        lines.append(f"{state_icon} {r['title']} — {schedule} — 🎯 {r['target_type']}")
         kb.row(
             types.InlineKeyboardButton(f"✏️ {r['title']}", callback_data=f"autoedit_{r['auto_id']}"),
             types.InlineKeyboardButton("🗑 Delete", callback_data=f"autodel_{r['auto_id']}"),
@@ -4974,10 +5209,10 @@ def _format_auto_list():
     return "\n".join(lines), kb
 
 
-@bot.message_handler(func=lambda m: m.text == "⏰ Auto Messages" and is_admin(m.chat.id))
+@bot.message_handler(func=lambda m: m.text == "⏰ Auto Messages" and is_super_admin(m.chat.id))
 @safe_handler
 def admin_auto_list(m):
-    if not is_admin(m.chat.id):
+    if not is_super_admin(m.chat.id):
         return
     clear_state(m.chat.id)
     text, kb = _format_auto_list()
@@ -4990,7 +5225,7 @@ def admin_auto_list(m):
 @bot.callback_query_handler(func=lambda c: c.data == "autoadd")
 @safe_handler
 def admin_auto_add_start(c):
-    if not is_admin(c.message.chat.id):
+    if not is_super_admin(c.message.chat.id):
         bot.answer_callback_query(c.id)
         return
     clear_state(c.message.chat.id)
@@ -5010,19 +5245,36 @@ def _handle_auto_add_title(m, state):
 
 
 def _handle_auto_add_body(m, state):
-    update_state(m.chat.id, step="mode", body=m.text)
+    update_state(m.chat.id, step="target", body=m.text)
     kb = types.InlineKeyboardMarkup()
-    kb.add(
-        types.InlineKeyboardButton("⏰ Daily at a fixed time", callback_data="automode_daily"),
-        types.InlineKeyboardButton("🔁 Repeat every N minutes", callback_data="automode_interval"),
-    )
-    bot.send_message(m.chat.id, "🕒 How should this message be sent?", reply_markup=kb)
+    kb.add(types.InlineKeyboardButton("🤖 Bot Users", callback_data="automsgtarget:bot_users"))
+    kb.add(types.InlineKeyboardButton("👥 User Group", callback_data="automsgtarget:user_group"))
+    kb.add(types.InlineKeyboardButton("📢 User Channel", callback_data="automsgtarget:user_channel"))
+    bot.send_message(m.chat.id, "🎯 <b>Choose where this auto message should go:</b>", parse_mode="HTML", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("automsgtarget:"))
+@safe_handler
+def auto_msg_target_cb(c):
+    if not is_super_admin(c.message.chat.id):
+        bot.answer_callback_query(c.id, "Super admin only", show_alert=True); return
+    state=get_state(c.message.chat.id)
+    if state.get("flow") != "auto_add" or state.get("step") != "target":
+        bot.answer_callback_query(c.id, "⚠️ Expired.", show_alert=True); return
+    target=c.data.split(":",1)[1]
+    if target in ("user_group","user_channel") and not _community_id(target):
+        bot.answer_callback_query(c.id, "Configure this destination first.", show_alert=True); return
+    update_state(c.message.chat.id, step="mode", target_type=target)
+    bot.answer_callback_query(c.id)
+    kb=types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("⏰ Daily at a fixed time", callback_data="automode_daily"))
+    kb.add(types.InlineKeyboardButton("🔁 Repeat every N minutes", callback_data="automode_interval"))
+    bot.send_message(c.message.chat.id, "🕒 <b>Choose the schedule:</b>", parse_mode="HTML", reply_markup=kb)
 
 
 @bot.callback_query_handler(func=lambda c: c.data in ("automode_daily", "automode_interval"))
 @safe_handler
 def auto_add_mode_cb(c):
-    if not is_admin(c.message.chat.id):
+    if not is_super_admin(c.message.chat.id):
         bot.answer_callback_query(c.id)
         return
     chat_id = c.message.chat.id
@@ -5061,7 +5313,7 @@ def _handle_auto_add_time(m, state):
         return
 
     auto_id = gen_id("AUTO")
-    create_auto_message(auto_id, state["title"], state["body"], hour, minute, m.chat.id)
+    create_auto_message(auto_id, state["title"], state["body"], hour, minute, m.chat.id, target_type=state.get("target_type","bot_users"))
     clear_state(m.chat.id)
     bot.send_message(
         m.chat.id,
@@ -5078,7 +5330,7 @@ def _handle_auto_add_interval(m, state):
         return
     interval = int(raw)
     auto_id = gen_id("AUTO")
-    create_auto_message(auto_id, state["title"], state["body"], 0, 0, m.chat.id, interval_minutes=interval)
+    create_auto_message(auto_id, state["title"], state["body"], 0, 0, m.chat.id, interval_minutes=interval, target_type=state.get("target_type","bot_users"))
     clear_state(m.chat.id)
     bot.send_message(
         m.chat.id,
@@ -5091,7 +5343,7 @@ def _handle_auto_add_interval(m, state):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("autodel_"))
 @safe_handler
 def admin_auto_delete_cb(c):
-    if not is_admin(c.message.chat.id):
+    if not is_super_admin(c.message.chat.id):
         bot.answer_callback_query(c.id)
         return
     auto_id = c.data[len("autodel_"):]
@@ -5110,7 +5362,7 @@ def admin_auto_delete_cb(c):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("autoedit_"))
 @safe_handler
 def admin_auto_edit_cb(c):
-    if not is_admin(c.message.chat.id):
+    if not is_super_admin(c.message.chat.id):
         bot.answer_callback_query(c.id)
         return
     auto_id = c.data[len("autoedit_"):]
@@ -5122,6 +5374,7 @@ def admin_auto_edit_cb(c):
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("✏️ Edit Title", callback_data=f"autofield_title_{auto_id}"))
     kb.add(types.InlineKeyboardButton("✏️ Edit Message", callback_data=f"autofield_body_{auto_id}"))
+    kb.add(types.InlineKeyboardButton("🎯 Edit Destination", callback_data=f"autofield_target_{auto_id}"))
     if row["interval_minutes"]:
         kb.add(types.InlineKeyboardButton("🔁 Edit Interval (minutes)", callback_data=f"autofield_interval_{auto_id}"))
         schedule = f"every {row['interval_minutes']} minute(s)"
@@ -5143,7 +5396,7 @@ def admin_auto_edit_cb(c):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("autotoggle_"))
 @safe_handler
 def admin_auto_toggle_cb(c):
-    if not is_admin(c.message.chat.id):
+    if not is_super_admin(c.message.chat.id):
         bot.answer_callback_query(c.id)
         return
     auto_id = c.data[len("autotoggle_"):]
@@ -5159,7 +5412,7 @@ def admin_auto_toggle_cb(c):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("autofield_"))
 @safe_handler
 def admin_auto_field_cb(c):
-    if not is_admin(c.message.chat.id):
+    if not is_super_admin(c.message.chat.id):
         bot.answer_callback_query(c.id)
         return
     _, field, auto_id = c.data.split("_", 2)
@@ -5170,6 +5423,13 @@ def admin_auto_field_cb(c):
     clear_state(c.message.chat.id)
     update_state(c.message.chat.id, flow="auto_edit_field", field=field, auto_id=auto_id)
     bot.answer_callback_query(c.id)
+    if field == "target":
+        kb=types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("🤖 Bot Users", callback_data=f"automsgedit_target:{auto_id}:bot_users"))
+        kb.add(types.InlineKeyboardButton("👥 User Group", callback_data=f"automsgedit_target:{auto_id}:user_group"))
+        kb.add(types.InlineKeyboardButton("📢 User Channel", callback_data=f"automsgedit_target:{auto_id}:user_channel"))
+        bot.send_message(c.message.chat.id, "🎯 Choose the new destination:", reply_markup=kb)
+        return
     prompts = {
         "title": "📝 Send the new title:",
         "body": "✍️ Send the new message text:",
@@ -5179,8 +5439,24 @@ def admin_auto_field_cb(c):
     bot.send_message(c.message.chat.id, prompts[field], reply_markup=back_kb())
 
 
+@bot.callback_query_handler(func=lambda c: c.data.startswith("automsgedit_target:"))
+@safe_handler
+def auto_msg_edit_target_cb(c):
+    if not is_super_admin(c.message.chat.id):
+        bot.answer_callback_query(c.id, "Super admin only", show_alert=True); return
+    _,auto_id,target=c.data.split(":",2)
+    if target in ("user_group","user_channel") and not _community_id(target):
+        bot.answer_callback_query(c.id,"Configure this destination first.",show_alert=True); return
+    row=get_auto_message(auto_id)
+    if not row:
+        bot.answer_callback_query(c.id,"Not found",show_alert=True); return
+    update_auto_message(auto_id,target_type=target)
+    bot.answer_callback_query(c.id,"Destination updated")
+    bot.send_message(c.message.chat.id,f"✅ Destination changed to {target}.",reply_markup=main_menu(c.message.chat.id))
+
+
 def _handle_auto_edit_field(m, state):
-    if not is_admin(m.chat.id):
+    if not is_super_admin(m.chat.id):
         clear_state(m.chat.id)
         return
     field, auto_id = state["field"], state["auto_id"]
@@ -5209,6 +5485,24 @@ def _handle_auto_edit_field(m, state):
     bot.send_message(m.chat.id, "✅ Updated.", reply_markup=main_menu(m.chat.id))
 
 
+def _send_target_message(target_type, body, target_value=None):
+    """Send a scheduled/manual message to the configured audience."""
+    sent=0
+    if target_type == "bot_users":
+        for uid in all_user_ids():
+            try:
+                bot.send_message(uid, f"📢 {BRAND}:\n\n{body}")
+                sent+=1
+            except Exception:
+                logger.exception("Message delivery failed to bot user %s", uid)
+        return sent
+    cid=_community_id(target_type)
+    if cid:
+        bot.send_message(cid, f"📢 {BRAND}:\n\n{body}")
+        return 1
+    return 0
+
+
 def auto_message_scheduler():
     """Background loop: every ~30s, checks whether any active auto
     message's daily send-time has arrived (Africa/Lagos) and, if so,
@@ -5235,32 +5529,26 @@ def auto_message_scheduler():
                             due = True
                     if not due:
                         continue
-                    sent = 0
-                    for uid in all_user_ids():
-                        try:
-                            bot.send_message(uid, r["body"])
-                            sent += 1
-                        except Exception:
-                            logger.exception("Auto message %s failed to reach %s", r["auto_id"], uid)
+                    sent = _send_target_message(r["target_type"], r["body"], r["target_value"])
                     mark_auto_message_sent_at(r["auto_id"], now_iso())
                     logger.info(
-                        "Auto message %s ('%s') sent to %d users (every %d min)",
+                        "Auto message %s ('%s') sent to %d destinations (every %d min)",
                         r["auto_id"], r["title"], sent, r["interval_minutes"],
                     )
+                    with db_tx() as conn:
+                        conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",
+                                     (str(r["created_by"] or "SYSTEM"),"AUTO_MESSAGE_SENT",None,None,r["auto_id"],f"target={r['target_type']}; delivered={sent}",now_iso()))
                     continue
 
                 if r["last_sent_date"] == today_str:
                     continue
                 if now.hour == r["hour"] and now.minute == r["minute"]:
-                    sent = 0
-                    for uid in all_user_ids():
-                        try:
-                            bot.send_message(uid, r["body"])
-                            sent += 1
-                        except Exception:
-                            logger.exception("Auto message %s failed to reach %s", r["auto_id"], uid)
+                    sent = _send_target_message(r["target_type"], r["body"], r["target_value"])
                     mark_auto_message_sent(r["auto_id"], today_str)
-                    logger.info("Auto message %s ('%s') sent to %d users", r["auto_id"], r["title"], sent)
+                    logger.info("Auto message %s ('%s') sent to %d destinations", r["auto_id"], r["title"], sent)
+                    with db_tx() as conn:
+                        conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",
+                                     (str(r["created_by"] or "SYSTEM"),"AUTO_MESSAGE_SENT",None,None,r["auto_id"],f"target={r['target_type']}; delivered={sent}",now_iso()))
         except Exception:
             logger.exception("Auto message scheduler loop error")
         time.sleep(30)
@@ -5994,7 +6282,7 @@ def _handle_fund_decline_reason(m, state):
 
 
 # ---------- ADMIN: FUNDING METHODS ----------
-@bot.message_handler(func=lambda m: m.text == "💳 Fund Wallet Settings" and is_admin(m.chat.id))
+@bot.message_handler(func=lambda m: m.text == "💳 Fund Wallet Settings" and is_super_admin(m.chat.id))
 @safe_handler
 def fund_admin_menu(m):
     clear_state(m.chat.id)
@@ -6009,12 +6297,14 @@ def fund_admin_menu(m):
 @bot.callback_query_handler(func=lambda c: c.data == "fund_admin_add")
 @safe_handler
 def fund_admin_add_cb(c):
-    if not is_admin(c.from_user.id): return bot.answer_callback_query(c.id, "Admin only", show_alert=True)
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id, "Admin only", show_alert=True)
     clear_state(c.from_user.id); update_state(c.from_user.id, flow="fund_admin_add", step="name")
     bot.answer_callback_query(c.id); bot.send_message(c.from_user.id, "✏️ Enter method name. Example: Binance / Bybit / USD Wallet / Nigerian Bank:", reply_markup=back_kb())
 
 
 def _handle_fund_admin_add(m, state):
+    if not is_super_admin(m.chat.id):
+        clear_state(m.chat.id); return
     step=state.get('step')
     value=m.text.strip()
     if not value: return bot.send_message(m.chat.id,"❌ Value cannot be empty.")
@@ -6040,7 +6330,7 @@ def _handle_fund_admin_add(m, state):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("fund_admin_method:"))
 @safe_handler
 def fund_admin_method_cb(c):
-    if not is_admin(c.from_user.id): return bot.answer_callback_query(c.id,"Admin only",show_alert=True)
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,"Admin only",show_alert=True)
     mid=c.data.split(":",1)[1]; row=get_fund_method(mid)
     if not row: return bot.answer_callback_query(c.id,"Not found",show_alert=True)
     kb=types.InlineKeyboardMarkup()
@@ -6053,14 +6343,14 @@ def fund_admin_method_cb(c):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("fund_admin_toggle:"))
 @safe_handler
 def fund_admin_toggle_cb(c):
-    if not is_admin(c.from_user.id): return bot.answer_callback_query(c.id,"Admin only",show_alert=True)
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,"Admin only",show_alert=True)
     mid=c.data.split(":",1)[1]; new=toggle_fund_method(mid,c.from_user.id)
     bot.answer_callback_query(c.id,"Updated"); fund_admin_menu(c.message)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("fund_admin_delete:"))
 @safe_handler
 def fund_admin_delete_cb(c):
-    if not is_admin(c.from_user.id): return bot.answer_callback_query(c.id,"Admin only",show_alert=True)
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,"Admin only",show_alert=True)
     mid=c.data.split(":",1)[1]; delete_fund_method(mid,c.from_user.id)
     bot.answer_callback_query(c.id,"Deleted"); fund_admin_menu(c.message)
 
@@ -6318,6 +6608,30 @@ _FLOW_ROUTES = {
 # balance. All Quick OTP charges/refunds go through the main bot wallet.
 
 OTP_SCHEMA = """
+CREATE TABLE IF NOT EXISTS otp_services (
+    service_code TEXT PRIMARY KEY,
+    service_name TEXT NOT NULL,
+    emoji TEXT NOT NULL DEFAULT '🧩',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    global_profit_percent REAL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS otp_service_countries (
+    service_code TEXT NOT NULL,
+    country_code TEXT NOT NULL,
+    name TEXT NOT NULL,
+    flag TEXT NOT NULL DEFAULT '🌍',
+    grizzly_cost REAL,
+    explicit_price REAL,
+    markup_percent REAL NOT NULL DEFAULT 0,
+    markup_fixed REAL NOT NULL DEFAULT 0,
+    available_count INTEGER NOT NULL DEFAULT 0,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    profit_active INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(service_code,country_code)
+);
+CREATE INDEX IF NOT EXISTS idx_otp_sc_user ON otp_service_countries(service_code,enabled,profit_active);
 CREATE TABLE IF NOT EXISTS otp_countries (
     code TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -6328,10 +6642,22 @@ CREATE TABLE IF NOT EXISTS otp_countries (
     markup_percent REAL NOT NULL DEFAULT 0,
     markup_fixed REAL NOT NULL DEFAULT 0,
     available_count INTEGER NOT NULL DEFAULT 0,
-    enabled INTEGER NOT NULL DEFAULT 1,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    profit_active INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_otp_countries_enabled ON otp_countries(enabled);
+CREATE TABLE IF NOT EXISTS otp_price_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    service_code TEXT NOT NULL,
+    country_code TEXT NOT NULL,
+    country_name TEXT NOT NULL,
+    old_cost REAL,
+    new_cost REAL NOT NULL,
+    direction TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    notified INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_otp_price_alerts_created ON otp_price_alerts(created_at);
 CREATE TABLE IF NOT EXISTS otp_orders (
     order_id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
@@ -6354,103 +6680,82 @@ CREATE INDEX IF NOT EXISTS idx_otp_orders_user_status ON otp_orders(user_id,stat
 CREATE INDEX IF NOT EXISTS idx_otp_orders_status ON otp_orders(status);
 """
 
-_GRIZZLY_FALLBACK = {
-    "1":("Ukraine","🇺🇦"),"2":("Kazakhstan","🇰🇿"),"3":("China","🇨🇳"),"4":("Philippines","🇵🇭"),
-    "6":("Indonesia","🇮🇩"),"7":("Malaysia","🇲🇾"),"8":("Kenya","🇰🇪"),"9":("Tanzania","🇹🇿"),
-    "10":("Vietnam","🇻🇳"),"11":("Kyrgyzstan","🇰🇬"),"12":("USA (virtual)","🇺🇸"),"13":("Israel","🇮🇱"),
-    "14":("Hong Kong","🇭🇰"),"15":("Poland","🇵🇱"),"16":("United Kingdom","🇬🇧"),"17":("Madagascar","🇲🇬"),
-    "18":("DR Congo","🇨🇩"),"19":("Nigeria","🇳🇬"),"20":("Macao","🇲🇴"),"21":("Egypt","🇪🇬"),
-    "22":("India","🇮🇳"),"23":("Ireland","🇮🇪"),"24":("Cambodia","🇰🇭"),"25":("Laos","🇱🇦"),
-    "26":("Haiti","🇭🇹"),"27":("Ivory Coast","🇨🇮"),"28":("Gambia","🇬🇲"),"29":("Serbia","🇷🇸"),
-    "30":("Yemen","🇾🇪"),"31":("South Africa","🇿🇦"),"32":("Romania","🇷🇴"),"33":("Colombia","🇨🇴"),
-    "34":("Estonia","🇪🇪"),"35":("Azerbaijan","🇦🇿"),"36":("Canada","🇨🇦"),"37":("Morocco","🇲🇦"),
-    "38":("Ghana","🇬🇭"),"39":("Argentina","🇦🇷"),"40":("Uzbekistan","🇺🇿"),"41":("Cameroon","🇨🇲"),
-    "42":("Chad","🇹🇩"),"43":("Germany","🇩🇪"),"44":("Lithuania","🇱🇹"),"45":("Croatia","🇭🇷"),
-    "46":("Sweden","🇸🇪"),"48":("Netherlands","🇳🇱"),"49":("Latvia","🇱🇻"),"50":("Austria","🇦🇹"),
-    "52":("Thailand","🇹🇭"),"53":("Saudi Arabia","🇸🇦"),"55":("Taiwan","🇹🇼"),"56":("Spain","🇪🇸"),
-    "58":("Algeria","🇩🇿"),"59":("Slovenia","🇸🇮"),"60":("Bangladesh","🇧🇩"),"61":("Senegal","🇸🇳"),
-    "62":("Turkey","🇹🇷"),"63":("Czech Republic","🇨🇿"),"64":("Sri Lanka","🇱🇰"),"65":("Peru","🇵🇪"),
-    "66":("Pakistan","🇵🇰"),"67":("New Zealand","🇳🇿"),"68":("Guinea","🇬🇳"),"69":("Mali","🇲🇱"),
-    "71":("Ethiopia","🇪🇹"),"73":("Brazil","🇧🇷"),"74":("Afghanistan","🇦🇫"),"75":("Uganda","🇺🇬"),
-    "76":("Angola","🇦🇴"),"77":("Cyprus","🇨🇾"),"78":("France","🇫🇷"),"79":("Papua New Guinea","🇵🇬"),
-    "80":("Mozambique","🇲🇿"),"81":("Nepal","🇳🇵"),"82":("Belgium","🇧🇪"),"83":("Bulgaria","🇧🇬"),
-    "84":("Hungary","🇭🇺"),"86":("Italy","🇮🇹"),"87":("Paraguay","🇵🇾"),"88":("Honduras","🇭🇳"),
-    "89":("Tunisia","🇹🇳"),"90":("Nicaragua","🇳🇮"),"91":("Timor-Leste","🇹🇱"),"92":("Bolivia","🇧🇴"),
-    "93":("Costa Rica","🇨🇷"),"94":("Guatemala","🇬🇹"),"95":("United Arab Emirates","🇦🇪"),"96":("Zimbabwe","🇿🇼"),
-    "97":("Puerto Rico","🇵🇷"),"99":("Togo","🇹🇬"),"100":("Kuwait","🇰🇼"),"101":("Salvador","🇸🇻"),
-    "102":("Tonga","🇹🇴"),"103":("Jamaica","🇯🇲"),"104":("Trinidad and Tobago","🇹🇹"),"105":("Ecuador","🇪🇨"),
-    "106":("Swaziland","🇸🇿"),"107":("Oman","🇴🇲"),"108":("Bosnia and Herzegovina","🇧🇦"),"109":("Dominican Republic","🇩🇴"),
-    "111":("Qatar","🇶🇦"),"112":("Panama","🇵🇦"),"114":("Mauritania","🇲🇷"),"115":("Sierra Leone","🇸🇱"),
-    "116":("Jordan","🇯🇴"),"117":("Portugal","🇵🇹"),"118":("Barbados","🇧🇧"),"119":("Burundi","🇧🇮"),
-    "120":("Benin","🇧🇯"),"121":("Brunei Darussalam","🇧🇳"),"122":("Bahamas","🇧🇸"),"123":("Botswana","🇧🇼"),
-    "124":("Belize","🇧🇿"),"125":("Central African Republic","🇨🇫"),"128":("Georgia","🇬🇪"),"129":("Greece","🇬🇷"),
-    "130":("Guinea-Bissau","🇬🇼"),"131":("Guyana","🇬🇾"),"132":("Iceland","🇮🇸"),"133":("Comoros","🇰🇲"),
-    "134":("Saint Kitts and Nevis","🇰🇳"),"135":("Liberia","🇱🇷"),"136":("Lesotho","🇱🇸"),"137":("Malawi","🇲🇼"),
-    "138":("Namibia","🇳🇦"),"139":("Niger","🇳🇪"),"140":("Rwanda","🇷🇼"),"141":("Slovakia","🇸🇰"),
-    "142":("Suriname","🇸🇷"),"143":("Tajikistan","🇹🇯"),"145":("Bahrain","🇧🇭"),"146":("Reunion","🇷🇪"),
-    "147":("Zambia","🇿🇲"),"148":("Armenia","🇦🇲"),"149":("Somalia","🇸🇴"),"150":("Republic of the Congo","🇨🇬"),
-    "151":("Chile","🇨🇱"),"152":("Burkina Faso","🇧🇫"),"154":("Gabon","🇬🇦"),"155":("Albania","🇦🇱"),
-    "156":("Uruguay","🇺🇾"),"157":("Mauritius","🇲🇺"),"158":("Bhutan","🇧🇹"),"159":("Maldives","🇲🇻"),
-    "160":("Burundi","🇧🇮"),"161":("Turkmenistan","🇹🇲"),"162":("French Guiana","🇬🇫"),"163":("Finland","🇫🇮"),
-    "164":("Saint Lucia","🇱🇨"),"165":("Luxembourg","🇱🇺"),"166":("Saint Vincent","🇻🇨"),"167":("Equatorial Guinea","🇬🇶"),
-    "168":("Djibouti","🇩🇯"),"169":("Antigua and Barbuda","🇦🇬"),"170":("Cayman Islands","🇰🇾"),"171":("Montenegro","🇲🇪"),
-    "172":("Denmark","🇩🇰"),"173":("Switzerland","🇨🇭"),"174":("Norway","🇳🇴"),"175":("Australia","🇦🇺"),
-    "176":("Eritrea","🇪🇷"),"177":("South Sudan","🇸🇸"),"178":("Sao Tome and Principe","🇸🇹"),"179":("Aruba","🇦🇼"),
-    "180":("Montserrat","🇲🇸"),"181":("Anguilla","🇦🇮"),"182":("Japan","🇯🇵"),"183":("North Macedonia","🇲🇰"),
-    "184":("Seychelles","🇸🇨"),"185":("New Caledonia","🇳🇨"),"186":("Cape Verde","🇨🇻"),"187":("USA","🇺🇸"),
-    "188":("Palestine","🇵🇸"),"189":("Fiji","🇫🇯"),"199":("Malta","🇲🇹"),"201":("Gibraltar","🇬🇮"),
-    "203":("Kosovo","🇽🇰"),"204":("Niue","🇳🇺"),"1003":("Bermuda","🇧🇲"),"1007":("Vanuatu","🇻🇺"),
-    "1008":("Greenland","🇬🇱"),"1011":("Martinique","🇲🇶"),"1012":("French Polynesia","🇵🇫"),"10161":("American Samoa","🇦🇸"),
-    "10348":("Liechtenstein","🇱🇮"),"10349":("Sint Maarten","🇸🇽"),"10350":("South Korea","🇰🇷"),"10351":("Singapore","🇸🇬"),
+
+_GRIZZLY_COUNTRY_META = {'1': ('Ukraine', 'UA'), '2': ('Kazakhstan', 'KZ'), '3': ('China', 'CN'), '4': ('Philippines', 'PH'), '6': ('Indonesia', 'ID'), '7': ('Malaysia', 'MY'), '8': ('Kenya', 'KE'), '9': ('Tanzania', 'TZ'), '10': ('Vietnam', 'VN'), '11': ('Kyrgyzstan', 'KG'), '12': ('USA (virtual)', 'US'), '13': ('Israel', 'IL'), '14': ('Hong Kong', 'HK'), '15': ('Poland', 'PL'), '16': ('United Kingdom', 'GB'), '17': ('Madagascar', 'MG'), '18': ('DR Congo', 'CD'), '19': ('Nigeria', 'NG'), '20': ('Macao', 'MO'), '21': ('Egypt', 'EG'), '22': ('India', 'IN'), '23': ('Ireland', 'IE'), '24': ('Cambodia', 'KH'), '25': ('Laos', 'LA'), '26': ('Haiti', 'HT'), '27': ('Ivory Coast', 'CI'), '28': ('Gambia', 'GM'), '29': ('Serbia', 'RS'), '30': ('Yemen', 'YE'), '31': ('South Africa', 'ZA'), '32': ('Romania', 'RO'), '33': ('Colombia', 'CO'), '34': ('Estonia', 'EE'), '35': ('Azerbaijan', 'AZ'), '36': ('Canada', 'CA'), '37': ('Morocco', 'MA'), '38': ('Ghana', 'GH'), '39': ('Argentina', 'AR'), '40': ('Uzbekistan', 'UZ'), '41': ('Cameroon', 'CM'), '42': ('Chad', 'TD'), '43': ('Germany', 'DE'), '44': ('Lithuania', 'LT'), '45': ('Croatia', 'HR'), '46': ('Sweden', 'SE'), '48': ('Netherlands', 'NL'), '49': ('Latvia', 'LV'), '50': ('Austria', 'AT'), '52': ('Thailand', 'TH'), '53': ('Saudi Arabia', 'SA'), '55': ('Taiwan', 'TW'), '56': ('Spain', 'ES'), '58': ('Algeria', 'DZ'), '59': ('Slovenia', 'SI'), '60': ('Bangladesh', 'BD'), '61': ('Senegal', 'SN'), '62': ('Turkey', 'TR'), '63': ('Czech Republic', 'CZ'), '64': ('Sri Lanka', 'LK'), '65': ('Peru', 'PE'), '66': ('Pakistan', 'PK'), '67': ('New Zealand', 'NZ'), '68': ('Guinea', 'GN'), '69': ('Mali', 'ML'), '71': ('Ethiopia', 'ET'), '73': ('Brazil', 'BR'), '74': ('Afghanistan', 'AF'), '75': ('Uganda', 'UG'), '76': ('Angola', 'AO'), '77': ('Cyprus', 'CY'), '78': ('France', 'FR'), '79': ('Papua New Guinea', 'PG'), '80': ('Mozambique', 'MZ'), '81': ('Nepal', 'NP'), '82': ('Belgium', 'BE'), '83': ('Bulgaria', 'BG'), '84': ('Hungary', 'HU'), '86': ('Italy', 'IT'), '87': ('Paraguay', 'PY'), '88': ('Honduras', 'HN'), '89': ('Tunisia', 'TN'), '90': ('Nicaragua', 'NI'), '91': ('Timor-Leste', 'TL'), '92': ('Bolivia', 'BO'), '93': ('Costa Rica', 'CR'), '94': ('Guatemala', 'GT'), '95': ('United Arab Emirates', 'AE'), '96': ('Zimbabwe', 'ZW'), '97': ('Puerto Rico', 'PR'), '99': ('Togo', 'TG'), '100': ('Kuwait', 'KW'), '101': ('El Salvador', 'SV'), '102': ('Tonga', 'TO'), '103': ('Jamaica', 'JM'), '104': ('Trinidad and Tobago', 'TT'), '105': ('Ecuador', 'EC'), '106': ('Eswatini', 'SZ'), '107': ('Oman', 'OM'), '108': ('Bosnia and Herzegovina', 'BA'), '109': ('Dominican Republic', 'DO'), '111': ('Qatar', 'QA'), '112': ('Panama', 'PA'), '114': ('Mauritania', 'MR'), '115': ('Sierra Leone', 'SL'), '116': ('Jordan', 'JO'), '117': ('Portugal', 'PT'), '118': ('Barbados', 'BB'), '119': ('Burundi', 'BI'), '120': ('Benin', 'BJ'), '121': ('Brunei Darussalam', 'BN'), '122': ('Bahamas', 'BS'), '123': ('Botswana', 'BW'), '124': ('Belize', 'BZ'), '125': ('Central African Republic', 'CF'), '128': ('Georgia', 'GE'), '129': ('Greece', 'GR'), '130': ('Guinea-Bissau', 'GW'), '131': ('Guyana', 'GY'), '132': ('Iceland', 'IS'), '133': ('Comoros', 'KM'), '134': ('Saint Kitts and Nevis', 'KN'), '135': ('Liberia', 'LR'), '136': ('Lesotho', 'LS'), '137': ('Malawi', 'MW'), '138': ('Namibia', 'NA'), '139': ('Niger', 'NE'), '140': ('Rwanda', 'RW'), '141': ('Slovakia', 'SK'), '142': ('Suriname', 'SR'), '143': ('Tajikistan', 'TJ'), '145': ('Bahrain', 'BH'), '146': ('Reunion', 'RE'), '147': ('Zambia', 'ZM'), '148': ('Armenia', 'AM'), '149': ('Somalia', 'SO'), '150': ('Republic of the Congo', 'CG'), '151': ('Chile', 'CL'), '152': ('Burkina Faso', 'BF'), '154': ('Gabon', 'GA'), '155': ('Albania', 'AL'), '156': ('Uruguay', 'UY'), '157': ('Mauritius', 'MU'), '158': ('Bhutan', 'BT'), '159': ('Maldives', 'MV'), '161': ('Turkmenistan', 'TM'), '162': ('French Guiana', 'GF'), '163': ('Finland', 'FI'), '164': ('Saint Lucia', 'LC'), '165': ('Luxembourg', 'LU'), '166': ('Saint Vincent', 'VC'), '167': ('Equatorial Guinea', 'GQ'), '168': ('Djibouti', 'DJ'), '169': ('Antigua and Barbuda', 'AG'), '170': ('Cayman Islands', 'KY'), '171': ('Montenegro', 'ME'), '172': ('Denmark', 'DK'), '173': ('Switzerland', 'CH'), '174': ('Norway', 'NO'), '175': ('Australia', 'AU'), '176': ('Eritrea', 'ER'), '177': ('South Sudan', 'SS'), '178': ('Sao Tome and Principe', 'ST'), '179': ('Aruba', 'AW'), '180': ('Montserrat', 'MS'), '181': ('Anguilla', 'AI'), '182': ('Japan', 'JP'), '183': ('North Macedonia', 'MK'), '184': ('Seychelles', 'SC'), '185': ('New Caledonia', 'NC'), '186': ('Cape Verde', 'CV'), '187': ('USA', 'US'), '188': ('Palestine', 'PS'), '189': ('Fiji', 'FJ'), '199': ('Malta', 'MT'), '201': ('Gibraltar', 'GI'), '203': ('Kosovo', 'XK'), '204': ('Niue', 'NU'), '1003': ('Bermuda', 'BM'), '1007': ('Vanuatu', 'VU'), '1008': ('Greenland', 'GL'), '1011': ('Martinique', 'MQ'), '1012': ('French Polynesia', 'PF'), '10161': ('American Samoa', 'AS'), '10348': ('Liechtenstein', 'LI'), '10349': ('Sint Maarten', 'SX'), '10350': ('South Korea', 'KR'), '10351': ('Singapore', 'SG')}
+
+_OTP_SERVICE_EMOJIS = {
+    'whatsapp':'🟢','facebook':'🔵','telegram':'✈️','instagram':'📸','google':'🔎','gmail':'✉️','youtube':'▶️',
+    'tiktok':'🎵','twitter':'🐦','x':'❎','discord':'🎮','signal':'🔐','snapchat':'👻','viber':'📞','line':'💚',
+    'messenger':'💬','paypal':'💳','apple':'🍎','amazon':'📦','netflix':'🎬','uber':'🚕','airbnb':'🏠','tinder':'🔥',
+    'linkedin':'💼','reddit':'👽','github':'🐙','steam':'🎮','microsoft':'🪟','outlook':'📧','yahoo':'💜','binance':'🟡',
+    'coinbase':'🪙','chatgpt':'🤖','openai':'🤖','claude':'🧠','foodpanda':'🍔','doordash':'🍟','spotify':'🎧',
 }
 
 def _otp_now():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
+def _otp_flag_from_iso(code):
+    code=str(code or '').upper().strip()
+    if len(code) != 2 or not code.isalpha(): return '🌍'
+    return ''.join(chr(127397 + ord(ch)) for ch in code)
+
+def _otp_price(row, service_row=None):
+    cost=float(row['grizzly_cost'] or 0)
+    # A manual country price is a hard override and NEVER follows the global percentage.
+    if row['explicit_price'] is not None:
+        return round(float(row['explicit_price']),2)
+    pct=None
+    if service_row is not None:
+        try: pct=service_row['global_profit_percent']
+        except Exception: pct=None
+    if pct is None:
+        try: pct=row['markup_percent']
+        except Exception: pct=0
+    return round(cost + cost*float(pct or 0)/100 + float(row['markup_fixed'] or 0),2)
+
 def otp_db_init():
     with db_tx() as conn:
         conn.executescript(OTP_SCHEMA)
+        # SQLite migrations for existing installations.
+        try: conn.execute('ALTER TABLE otp_services ADD COLUMN global_profit_percent REAL')
+        except Exception: pass
+        # Backward-compatible migration: keep old WA settings usable in the new composite table.
+        old=conn.execute('SELECT * FROM otp_countries').fetchall()
+        for r in old:
+            conn.execute('INSERT OR IGNORE INTO otp_services(service_code,service_name,emoji,enabled,updated_at) VALUES(?,?,?,?,?)',
+                         (r['service_code'] or 'wa','WhatsApp','🟢',1,_otp_now()))
+            conn.execute("""INSERT OR IGNORE INTO otp_service_countries
+                (service_code,country_code,name,flag,grizzly_cost,explicit_price,markup_percent,markup_fixed,available_count,enabled,profit_active,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (r['service_code'] or 'wa',r['code'],r['name'],r['flag'],r['grizzly_cost'],r['explicit_price'],r['markup_percent'],r['markup_fixed'],r['available_count'],r['enabled'],r['profit_active'],r['updated_at']))
 
 def _otp_http(action, **params):
     if not GRIZZLY_API_KEY:
         raise RuntimeError('GRIZZLY_API_KEY is not configured')
     q={'api_key':GRIZZLY_API_KEY,'action':action,**params}
     url=GRIZZLY_BASE_URL+'?'+urllib.parse.urlencode(q)
-    req=urllib.request.Request(url,headers={'User-Agent':'MobileDigitalHub-QuickOTP/1.0'})
+    req=urllib.request.Request(url,headers={'User-Agent':os.environ.get('GRIZZLY_USER_AGENT','MobileDigitalHub-QuickOTP/3.0').strip() or 'MobileDigitalHub-QuickOTP/3.0'})
     try:
         with urllib.request.urlopen(req,timeout=30) as r:
             body=r.read().decode('utf-8','replace').strip()
     except Exception as exc:
         raise ConnectionError(str(exc)) from exc
-    try:
-        data=json.loads(body)
-    except Exception:
-        data=None
+    try: data=json.loads(body)
+    except Exception: data=None
     if isinstance(data,dict):
         activation_id=data.get('activationId') or data.get('activation_id') or data.get('id')
         phone=data.get('phoneNumber') or data.get('phone_number')
         cost=data.get('activationCost') or data.get('activation_cost') or data.get('cost')
         sms=data.get('sms') if isinstance(data.get('sms'),dict) else {}
         otp=sms.get('code') or data.get('code') or data.get('otp')
-        if activation_id and phone:
-            return {'status':'ok','raw':body,'activation_id':str(activation_id),'phone':str(phone),'cost':cost}
+        if activation_id and phone: return {'status':'ok','raw':body,'activation_id':str(activation_id),'phone':str(phone),'cost':cost}
         if otp: return {'status':'ok','raw':body,'otp':str(otp)}
-        if _otp_is_price_matrix(data): return {'status':'ok','raw':body,'data':data}
         return {'status':str(data.get('status') or 'ok').lower(),'raw':body,'data':data}
     if body.startswith('ACCESS_NUMBER:') or body.startswith('ACCESS_NUMBER_V2:'):
         p=body.split(':',2); return {'status':'ok','raw':body,'activation_id':p[1],'phone':p[2]} if len(p)==3 else {'status':'error','raw':body}
     if body.startswith('STATUS_OK:'): return {'status':'ok','raw':body,'otp':body.split(':',1)[1]}
-    if body in {'STATUS_WAIT_CODE','STATUS_WAIT_RETRY','STATUS_CANCEL','NO_ACTIVATION','ACCESS_CANCEL','ACCESS_ACTIVATION'}:
-        return {'status':body,'raw':body}
+    if body in {'STATUS_WAIT_CODE','STATUS_WAIT_RETRY','STATUS_CANCEL','NO_ACTIVATION','ACCESS_CANCEL','ACCESS_ACTIVATION'}: return {'status':body,'raw':body}
     return {'status':'error','raw':body}
-
-def _otp_is_price_matrix(payload):
-    for v in payload.values():
-        if isinstance(v,dict):
-            for node in v.values():
-                if isinstance(node,dict) and ('cost' in node or 'price' in node) and any(k in node for k in ('count','stock','available','qty','total')):
-                    return True
-    return False
 
 def _otp_flag_from_iso(iso):
     iso=(iso or '').upper()
@@ -6461,104 +6766,174 @@ def _otp_parse_rows(payload, service='wa'):
     data=payload.get('data',payload) if isinstance(payload,dict) else payload
     out=[]
     if isinstance(data,dict):
+        # API may return service -> countries OR countries -> service/cost nodes.
         for code,node in data.items():
-            if not str(code).isdigit() or not isinstance(node,dict): continue
+            if not isinstance(node,dict): continue
             svc=node.get(service) if isinstance(node.get(service),dict) else node
+            if not isinstance(svc,dict): continue
+            country_code=str(code)
+            if not country_code.isdigit():
+                # Some responses wrap countries inside a named object.
+                continue
             cost=svc.get('cost',svc.get('price',svc.get('activationCost')))
             count=svc.get('count',svc.get('available',svc.get('stock',svc.get('qty',svc.get('total',0)))))
-            meta=_GRIZZLY_FALLBACK.get(str(code),('Country '+str(code),'🌍'))
+            meta=_GRIZZLY_COUNTRY_META.get(country_code,('Country '+country_code,''))
             name=svc.get('name') or node.get('name') or meta[0]
-            flag=svc.get('flag') or node.get('flag') or meta[1]
-            iso=svc.get('iso') or node.get('iso')
-            if iso: flag=_otp_flag_from_iso(iso)
+            iso=svc.get('iso') or node.get('iso') or meta[1]
+            flag=_otp_flag_from_iso(iso) if iso else (svc.get('flag') or node.get('flag') or '🌍')
             try: count=int(count or 0)
             except: count=0
             try: cost=float(cost) if cost is not None else None
             except: cost=None
-            if cost is not None: out.append({'code':str(code),'name':str(name),'flag':flag,'cost':cost,'count':count})
+            if cost is not None: out.append({'code':country_code,'name':str(name),'flag':flag,'cost':cost,'count':count})
     return out
 
-def otp_sync_stock():
+def _otp_parse_services(payload):
+    data=payload.get('services',payload.get('data',payload)) if isinstance(payload,dict) else payload
+    out=[]
+    if isinstance(data,dict):
+        for code,node in data.items():
+            if isinstance(node,dict): name=node.get('name') or node.get('title') or node.get('service') or str(code)
+            else: name=str(node or code)
+            out.append((str(code),str(name)))
+    elif isinstance(data,list):
+        for node in data:
+            if isinstance(node,dict):
+                code=node.get('code') or node.get('id') or node.get('service')
+                name=node.get('name') or node.get('title') or node.get('service_name') or code
+                if code: out.append((str(code),str(name)))
+    # Some providers expose a list of {service_code: ..., service_name: ...} under data.
+    unique={c:n for c,n in out if c}
+    return list(unique.items())
+
+def _otp_service_emoji(name):
+    low=str(name).lower()
+    for key,emoji in _OTP_SERVICE_EMOJIS.items():
+        if key in low: return emoji
+    return '🧩'
+
+def otp_sync_services():
+    last=None
+    for action in ('getServices','get_services'):
+        try:
+            r=_otp_http(action)
+            if r.get('status')=='error': last=r; continue
+            rows=_otp_parse_services(r.get('data',r))
+            if not rows: last=r; continue
+            with db_tx() as conn:
+                for code,name in rows:
+                    conn.execute("""INSERT INTO otp_services(service_code,service_name,emoji,enabled,updated_at)
+                                    VALUES(?,?,?,?,?) ON CONFLICT(service_code) DO UPDATE SET service_name=excluded.service_name,emoji=excluded.emoji,updated_at=excluded.updated_at""",
+                                 (code,name,_otp_service_emoji(name),1,_otp_now()))
+            return len(rows)
+        except Exception as exc: last=exc
+    raise RuntimeError(f'Grizzly service sync failed: {last}')
+
+def _otp_notify_price_alerts(service_code, alerts):
+    if not alerts: return
+    svc=fetchone('SELECT service_name FROM otp_services WHERE service_code=?',(service_code,))
+    sname=svc['service_name'] if svc else service_code
+    lines=['🔔 <b>QUICK OTP • GRIZZLY PRICE CHANGE</b>', '', f'🧩 Service: <b>{html.escape(str(sname))}</b>']
+    for code,name,old_cost,new_cost,direction,flag in alerts[:25]:
+        arrow='📈' if direction=='increased' else '📉'
+        lines.append(f'{arrow} {flag} <b>{html.escape(str(name))}</b>: {old_cost:.4f} → {new_cost:.4f} USDT')
+    if len(alerts)>25: lines.append(f'… and {len(alerts)-25} more changes.')
+    text='\n'.join(lines)
+    for admin_id in ADMIN_IDS:
+        try: bot.send_message(int(admin_id),text,parse_mode='HTML')
+        except Exception as exc: logger.warning('OTP price alert send failed to %s: %s',admin_id,exc)
+    try:
+        ids=','.join(str(x[0]) for x in alerts)
+        with db_tx() as conn:
+            conn.execute('UPDATE otp_price_alerts SET notified=1 WHERE service_code=? AND notified=0 AND id IN (SELECT id FROM otp_price_alerts WHERE service_code=? ORDER BY id DESC LIMIT ?)',(service_code,service_code,len(alerts)))
+    except Exception: pass
+
+def otp_sync_service_stock(service_code):
     last=None
     for action in ('getPricesV3','getPricesV2','getPrices'):
         try:
-            r=_otp_http(action,service='wa')
-            if r.get('status')!='error':
-                rows=_otp_parse_rows(r)
-                if rows:
-                    with db_tx() as conn:
-                        for x in rows:
-                            old=conn.execute('SELECT explicit_price,markup_percent,markup_fixed,enabled FROM otp_countries WHERE code=?',(x['code'],)).fetchone()
-                            if old:
-                                conn.execute('UPDATE otp_countries SET name=?,flag=?,service_code=?,grizzly_cost=?,available_count=?,updated_at=? WHERE code=?',(x['name'],x['flag'],'wa',x['cost'],x['count'],_otp_now(),x['code']))
-                            else:
-                                conn.execute('INSERT INTO otp_countries(code,name,flag,service_code,grizzly_cost,explicit_price,markup_percent,markup_fixed,available_count,enabled,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(x['code'],x['name'],x['flag'],'wa',x['cost'],x['cost'],0,0,x['count'],1,_otp_now()))
-                    return len(rows)
-            last=r
+            r=_otp_http(action,service=service_code)
+            if r.get('status')=='error': last=r; continue
+            rows=_otp_parse_rows(r,service=service_code)
+            if not rows: last=r; continue
+            alerts=[]
+            with db_tx() as conn:
+                svc=conn.execute('SELECT service_name FROM otp_services WHERE service_code=?',(service_code,)).fetchone()
+                if not svc: conn.execute('INSERT OR IGNORE INTO otp_services(service_code,service_name,emoji,enabled,updated_at) VALUES(?,?,?,?,?)',(service_code,service_code,_otp_service_emoji(service_code),1,_otp_now()))
+                for x in rows:
+                    old=conn.execute('SELECT name,grizzly_cost FROM otp_service_countries WHERE service_code=? AND country_code=?',(service_code,x['code'])).fetchone()
+                    old_cost=float(old['grizzly_cost']) if old and old['grizzly_cost'] is not None else None
+                    new_cost=float(x['cost'] or 0)
+                    if old_cost is not None and abs(old_cost-new_cost) > 1e-9:
+                        direction='increased' if new_cost > old_cost else 'decreased'
+                        conn.execute('INSERT INTO otp_price_alerts(service_code,country_code,country_name,old_cost,new_cost,direction,created_at,notified) VALUES(?,?,?,?,?,?,?,0)',(service_code,x['code'],x['name'],old_cost,new_cost,direction,_otp_now()))
+                        alerts.append((x['code'],x['name'],old_cost,new_cost,direction,x['flag']))
+                    conn.execute("""INSERT INTO otp_service_countries(service_code,country_code,name,flag,grizzly_cost,explicit_price,markup_percent,markup_fixed,available_count,enabled,profit_active,updated_at)
+                                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                                    ON CONFLICT(service_code,country_code) DO UPDATE SET name=excluded.name,flag=excluded.flag,grizzly_cost=excluded.grizzly_cost,available_count=excluded.available_count,updated_at=excluded.updated_at""",
+                                 (service_code,x['code'],x['name'],x['flag'] or _otp_flag_from_iso(x.get('iso2')),x['cost'],None,0,0,x['count'],0,0,_otp_now()))
+            if alerts: _otp_notify_price_alerts(service_code, alerts)
+            return len(rows)
         except Exception as exc: last=exc
-    raise RuntimeError(f'Grizzly stock sync failed: {last}')
+    raise RuntimeError(f'Grizzly stock sync failed for {service_code}: {last}')
 
-def _otp_price(row):
-    cost=float(row['grizzly_cost'] or 0)
-    if row['explicit_price'] is not None: return round(float(row['explicit_price']),2)
-    return round(cost + cost*float(row['markup_percent'] or 0)/100 + float(row['markup_fixed'] or 0),2)
+def otp_sync_stock():
+    # Backward-compatible alias: sync services and WhatsApp stock only.
+    try: otp_sync_services()
+    except Exception as exc: logger.warning('Legacy service sync failed: %s',exc)
+    return otp_sync_service_stock('wa')
 
-def _otp_order_id():
-    return 'QOTP-'+secrets.token_hex(4).upper()
+def _otp_profit_active(row, service_row=None):
+    return bool(row['profit_active']) and bool(row['enabled']) and _otp_price(row, service_row) > float(row['grizzly_cost'] or 0)
 
+def _otp_order_id(): return 'QOTP-'+secrets.token_hex(4).upper()
 def _otp_balance(user_id):
-    row=fetchone('SELECT usdt FROM wallets WHERE user_id=?',(str(user_id),))
-    return float(row['usdt']) if row else 0.0
-
-def _otp_get_ui(order_id):
-    return fetchone('SELECT chat_id,message_id FROM otp_orders WHERE order_id=?',(order_id,))
+    row=fetchone('SELECT usdt FROM wallets WHERE user_id=?',(str(user_id),)); return float(row['usdt']) if row else 0.0
 
 def _otp_update_message(chat_id,message_id,text,kb):
     try: bot.edit_message_text(text,chat_id=chat_id,message_id=message_id,parse_mode='HTML',reply_markup=kb)
     except Exception as exc:
-        # Telegram returns a benign error when the text/keyboard is unchanged.
         if 'message is not modified' not in str(exc).lower(): logger.warning('OTP UI update failed: %s',exc)
 
 def _otp_waiting_text(o,remaining,manual_remaining):
-    auto=max(0,int(remaining)); manual=max(0,int(manual_remaining))
-    a=f'{auto//60:02d}:{auto%60:02d}'; m=f'{manual//60:02d}:{manual%60:02d}'
-    return (f'📱 <b>Number received</b>\n\nPhone no: <code>{html.escape(str(o["phone_number"]))}</code>\n\n'
-            f'💰 <b>Price 🪙</b>: {float(o["selling_price"]):.2f} USDT\n'
-            f'📦 <b>Order (available):</b> <code>#{o["order_id"]}</code>\n'
-            f'📊 <b>Available</b>: {int(o["available_count"] or 0):,}\n'
-            f'⚖️ <b>Main balance</b>: {_otp_balance(o["user_id"]):.2f} USDT\n\n'
-            f'⏳ <b>Waiting for OTP</b>\n⏱ Auto cancel: <b>{a}</b>\n'
-            f'✋ <b>Cancel available in {m}</b>')
+    a=max(0,int(remaining)); m=max(0,int(manual_remaining));
+    return (f'📱 <b>QUICK OTP • MOBILE BUSINESS HUB</b>\n\n'
+            f'{_otp_service_emoji(o.get("service_name") or o.get("service_code"))} Service: <b>{html.escape(str(o.get("service_name") or o.get("service_code")))}</b>\n'
+            f'🌍 Country: <b>{html.escape(str(o["country_name"]))}</b>\n'
+            f'📞 Number: <code>{html.escape(str(o["phone_number"]))}</code>\n'
+            f'💰 Price: <b>{float(o["selling_price"]):.2f} USDT</b>\n'
+            f'🧾 Order ID: <code>{o["order_id"]}</code>\n\n'
+            f'🔐 <b>Waiting for your OTP…</b>\n'
+            f'⏱ Auto cancel: <b>{a//60:02d}:{a%60:02d}</b>\n'
+            f'✋ Cancel available in: <b>{m//60:02d}:{m%60:02d}</b>\n\n'
+            f'💳 Balance: <b>{_otp_balance(o["user_id"]):.2f} USDT</b>\n━━━━━━━━━━━━━━\n'
+            f'💡 Keep this screen open. Your OTP will appear here automatically.')
 
-def _otp_kb(order_id, country_code, manual_remaining):
-    if manual_remaining>0:
-        label=f'✋ Cancel available {manual_remaining//60:02d}:{manual_remaining%60:02d}'
-        cancel=f'otp_cancel:{order_id}'
-    else:
-        label='❌ Cancel'; cancel=f'otp_cancel:{order_id}'
-    return types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{country_code}')).add(types.InlineKeyboardButton(label,callback_data=cancel))
+def _otp_kb(order_id,service_code,country_code,manual_remaining):
+    label=f'✋ Cancel available {manual_remaining//60:02d}:{manual_remaining%60:02d}' if manual_remaining>0 else '❌ Cancel'
+    return types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{service_code}:{country_code}')).add(types.InlineKeyboardButton(label,callback_data=f'otp_cancel:{order_id}'))
 
-def _otp_create_activation(user_id,country_code,source_chat_id):
-    # Refresh the requested country from Grizzly first so Available and cost are live.
-    otp_sync_stock()
-    row=fetchone('SELECT * FROM otp_countries WHERE code=? AND enabled=1 AND service_code="wa"',(str(country_code),))
-    if not row: return None,'This country is no longer available.'
-    if int(row['available_count'] or 0)<=0: return None,'❌ No number is currently available for this country.'
-    price=_otp_price(row)
-    if price<=0: return None,'❌ Invalid price configured for this country.'
+def _otp_create_activation(user_id,service_code,country_code,source_chat_id):
+    try: otp_sync_service_stock(service_code)
+    except Exception as exc: logger.warning('OTP service stock refresh failed: %s',exc)
+    row=fetchone('SELECT * FROM otp_service_countries WHERE service_code=? AND country_code=? AND enabled=1 AND profit_active=1',(service_code,str(country_code)))
+    if not row: return None,'This service/country is no longer available.'
+    if int(row['available_count'] or 0)<=0: return None,'❌ No number is currently available for this service and country.'
+    svc_cfg=fetchone('SELECT * FROM otp_services WHERE service_code=?',(service_code,))
+    price=_otp_price(row,svc_cfg)
+    if price<=0: return None,'❌ Invalid price configured for this service/country.'
+    svc=fetchone('SELECT service_name,emoji FROM otp_services WHERE service_code=?',(service_code,))
+    service_name=svc['service_name'] if svc else service_code
     now=_otp_now(); order_id=_otp_order_id()
-    # Reserve the shared wallet atomically BEFORE calling Grizzly.
     with db_tx() as conn:
         ensure_wallet(conn,user_id)
         w=conn.execute('SELECT usdt FROM wallets WHERE user_id=?',(str(user_id),)).fetchone()
         if not w or float(w['usdt'])+1e-9<price: return None,f'💰 Insufficient balance.\nRequired: {price:.2f} USDT\nBalance: {float(w["usdt"]):.2f} USDT'
-        adjust_balance(conn,user_id,'usdt',-price,'OTP_PURCHASE',reason=f'Quick OTP purchase {order_id}',related_txn=order_id,processed_by=user_id)
-        conn.execute('INSERT INTO otp_orders(order_id,user_id,country_code,country_name,service_code,status,selling_price,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',(order_id,str(user_id),row['code'],row['name'],'wa','processing',price,now,now))
-    try:
-        result=_otp_http('getNumberV2',service='wa',country=str(row['code']),maxPrice=str(row['grizzly_cost']))
-    except Exception as exc:
-        with db_tx() as conn:
-            conn.execute('UPDATE otp_orders SET status="manual_reconciliation",updated_at=? WHERE order_id=? AND status="processing"',(_otp_now(),order_id))
+        adjust_balance(conn,user_id,'usdt',-price,'OTP_PURCHASE',reason=f'Quick OTP {service_name} purchase {order_id}',related_txn=order_id,processed_by=user_id)
+        conn.execute('INSERT INTO otp_orders(order_id,user_id,country_code,country_name,service_code,status,selling_price,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',(order_id,str(user_id),row['country_code'],row['name'],service_code,'processing',price,now,now))
+    try: result=_otp_http('getNumberV2',service=service_code,country=str(row['country_code']),maxPrice=str(row['grizzly_cost']))
+    except Exception:
+        with db_tx() as conn: conn.execute('UPDATE otp_orders SET status="manual_reconciliation",updated_at=? WHERE order_id=? AND status="processing"',(_otp_now(),order_id))
         return None,f'⚠️ Grizzly did not confirm the request. Order <code>{order_id}</code> is under safe reconciliation; balance was not auto-refunded.'
     if result.get('status')!='ok' or not result.get('activation_id'):
         with db_tx() as conn:
@@ -6568,59 +6943,120 @@ def _otp_create_activation(user_id,country_code,source_chat_id):
     activation_id=result['activation_id']; phone=result['phone']; raw_cost=float(result.get('cost') or row['grizzly_cost'] or 0)
     with db_tx() as conn:
         conn.execute('UPDATE otp_orders SET status="waiting",phone_number=?,activation_id=?,raw_cost=?,updated_at=? WHERE order_id=?',(phone,activation_id,raw_cost,_otp_now(),order_id))
-    return fetchone('SELECT * FROM otp_orders WHERE order_id=?',(order_id,)),None
+        conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",(str(user_id),"OTP_PURCHASE",str(user_id),price,order_id,f'service={service_name}; country={row["name"]}; provider_cost={raw_cost:.6f}',_otp_now()))
+    return fetchone('SELECT o.*,s.service_name FROM otp_orders o LEFT JOIN otp_services s ON s.service_code=o.service_code WHERE o.order_id=?',(order_id,)),None
+
+def _otp_show_services(chat_id, page=0, edit=None):
+    per=20; page=max(0,int(page))
+    services=fetchall('SELECT * FROM otp_services WHERE enabled=1 ORDER BY service_name')
+    eligible=[]
+    for svc in services:
+        countries=fetchall('SELECT * FROM otp_service_countries WHERE service_code=? AND enabled=1 AND profit_active=1 AND available_count>0',(svc['service_code'],))
+        if any(_otp_profit_active(r,svc) for r in countries): eligible.append(svc)
+    total=len(eligible)
+    rows=eligible[page*per:(page+1)*per]
+    if not rows and page>0:
+        page=max(0,page-1); rows=eligible[page*per:(page+1)*per]
+    if not rows:
+        text='📱 <b>QUICK OTP</b>\n\n⏳ No service is active yet. Please check back shortly.'
+        if edit: bot.edit_message_text(text,chat_id,edit,parse_mode='HTML')
+        else: bot.send_message(chat_id,text,parse_mode='HTML')
+        return
+    kb=types.InlineKeyboardMarkup()
+    for r in rows: kb.add(types.InlineKeyboardButton(f'{r["emoji"]} {r["service_name"]}',callback_data=f'otp_service:{r["service_code"]}'))
+    nav=[]
+    if page>0: nav.append(types.InlineKeyboardButton('⬅️ Previous',callback_data=f'otp_services_page:{page-1}'))
+    if (page+1)*per<total: nav.append(types.InlineKeyboardButton('Next ➡️',callback_data=f'otp_services_page:{page+1}'))
+    if nav: kb.row(*nav)
+    text=f'📱 <b>QUICK OTP</b>\n\n🎯 Choose the service you want to verify.\n🔐 Secure • ⚡ Fast • 💳 Pay from your USDT balance\n\n👇 <b>Select a service:</b>\n📄 Page {page+1}/{max(1,(total+per-1)//per)}'
+    if edit: bot.edit_message_text(text,chat_id,edit,parse_mode='HTML',reply_markup=kb)
+    else: bot.send_message(chat_id,text,parse_mode='HTML',reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('otp_services_page:'))
+@safe_handler
+def otp_services_page_cb(c):
+    bot.answer_callback_query(c.id); _otp_show_services(c.message.chat.id,int(c.data.split(':',1)[1]),edit=c.message.message_id)
 
 @bot.message_handler(func=lambda m: m.text == '📱 Quick OTP')
 @safe_handler
 def otp_entry(m):
     if feature_blocked_message(m,'quick_otp'): return
-    try:
-        otp_sync_stock()
-    except Exception as exc:
-        logger.warning('Quick OTP stock sync failed: %s',exc)
-    rows=fetchall('SELECT * FROM otp_countries WHERE enabled=1 AND available_count>0 ORDER BY name')
+    try: otp_sync_services()
+    except Exception as exc: logger.warning('Quick OTP service sync failed: %s',exc)
+    _otp_show_services(m.chat.id, 0, edit=None)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('otp_service:'))
+@safe_handler
+def otp_service_cb(c):
+    service=c.data.split(':',1)[1]; svc=fetchone('SELECT * FROM otp_services WHERE service_code=? AND enabled=1',(service,))
+    if not svc: return bot.answer_callback_query(c.id,'Service unavailable.',show_alert=True)
+    try: otp_sync_service_stock(service)
+    except Exception as exc: logger.warning('OTP service refresh failed: %s',exc)
+    _otp_show_countries(c.message.chat.id, service, 0, svc, edit=c.message.message_id); bot.answer_callback_query(c.id)
+
+def _otp_show_countries(chat_id, service, page, svc, edit=None):
+    per=20; page=max(0,int(page))
+    where='service_code=? AND enabled=1 AND profit_active=1 AND available_count>0'
+    service_cfg=fetchone('SELECT * FROM otp_services WHERE service_code=?',(service,))
+    all_rows=fetchall(f'SELECT * FROM otp_service_countries WHERE {where} ORDER BY name', (service,))
+    rows=[r for r in all_rows if _otp_profit_active(r,service_cfg)]
+    total=len(rows)
+    rows=rows[page*per:(page+1)*per]
     if not rows:
-        bot.send_message(m.chat.id,'🌍 No WhatsApp countries are currently available right now.')
-        return
+        if page>0: page=max(0,page-1); rows=rows[page*per:(page+1)*per]
+        if not rows: return
     kb=types.InlineKeyboardMarkup()
-    for r in rows[:100]: kb.add(types.InlineKeyboardButton(f'{r["flag"]} {r["name"]} — {_otp_price(r):.2f} USDT ({int(r["available_count"]):,})',callback_data=f'otp_country:{r["code"]}'))
-    bot.send_message(m.chat.id,'📱 <b>Quick OTP</b>\n\nChoose a country:',parse_mode='HTML',reply_markup=kb)
+    for r in rows: kb.add(types.InlineKeyboardButton(f'{r["flag"]} {r["name"]} • {_otp_price(r,service_cfg):.2f} USDT',callback_data=f'otp_country:{service}:{r["country_code"]}'))
+    nav=[]
+    if page>0: nav.append(types.InlineKeyboardButton('⬅️ Previous',callback_data=f'otp_countries_page:{service}:{page-1}'))
+    if (page+1)*per<total: nav.append(types.InlineKeyboardButton('Next ➡️',callback_data=f'otp_countries_page:{service}:{page+1}'))
+    if nav: kb.row(*nav)
+    kb.add(types.InlineKeyboardButton('⬅️ Services',callback_data='otp_services_back'))
+    text=f'{svc["emoji"]} <b>{html.escape(svc["service_name"])}</b>\n\n🌍 Choose a country:\n💰 Prices shown are the final Mobile Business Hub price.\n📄 Page {page+1}/{max(1,(total+per-1)//per)}'
+    if edit: bot.edit_message_text(text,chat_id,edit,parse_mode='HTML',reply_markup=kb)
+    else: bot.send_message(chat_id,text,parse_mode='HTML',reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('otp_countries_page:'))
+@safe_handler
+def otp_countries_page_cb(c):
+    _,service,page=c.data.split(':',2); svc=fetchone('SELECT service_name,emoji FROM otp_services WHERE service_code=? AND enabled=1',(service,))
+    if not svc: return bot.answer_callback_query(c.id,'Service unavailable.',show_alert=True)
+    try: otp_sync_service_stock(service)
+    except Exception as exc: logger.warning('OTP country refresh failed for %s: %s',service,exc)
+    _otp_show_countries(c.message.chat.id,service,int(page),svc,edit=c.message.message_id); bot.answer_callback_query(c.id)
+
+@bot.callback_query_handler(func=lambda c: c.data=='otp_services_back')
+@safe_handler
+def otp_services_back_cb(c): bot.answer_callback_query(c.id); _otp_show_services(c.message.chat.id,0,edit=c.message.message_id)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_country:'))
 @safe_handler
 def otp_country_cb(c):
-    code=c.data.split(':',1)[1]; row=fetchone('SELECT * FROM otp_countries WHERE code=? AND enabled=1',(code,))
+    _,service,code=c.data.split(':',2); row=fetchone('SELECT * FROM otp_service_countries WHERE service_code=? AND country_code=? AND enabled=1 AND profit_active=1',(service,code))
+    svc=fetchone('SELECT service_name,emoji FROM otp_services WHERE service_code=?',(service,))
     if not row: return bot.answer_callback_query(c.id,'Country unavailable.',show_alert=True)
-    p=_otp_price(row)
-    bot.answer_callback_query(c.id)
-    kb=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('✅ Buy Number',callback_data=f'otp_buy:{code}')).add(types.InlineKeyboardButton('⬅️ Back',callback_data='otp_back'))
-    bot.edit_message_text(f'{row["flag"]} <b>{row["name"]}</b>\n\n📊 Available: <b>{int(row["available_count"]):,}</b>\n💰 Price: <b>{p:.2f} USDT</b>\n\nConfirm purchase?',c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda c: c.data=='otp_back')
-@safe_handler
-def otp_back_cb(c):
-    bot.answer_callback_query(c.id); otp_entry(c.message)
+    kb=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('✅ Buy Number',callback_data=f'otp_buy:{service}:{code}')).add(types.InlineKeyboardButton('⬅️ Countries',callback_data=f'otp_service:{service}'))
+    bot.answer_callback_query(c.id); bot.edit_message_text(f'{svc["emoji"] if svc else "📱"} <b>{html.escape(str(svc["service_name"] if svc else service))}</b>\n🌍 {row["flag"]} <b>{html.escape(row["name"])}</b>\n\n📦 Available: <b>{int(row["available_count"]):,}</b>\n💰 Price: <b>{_otp_price(row,svc):.2f} USDT</b>\n\nTap <b>Buy Number</b> to continue.',c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_buy:'))
 @safe_handler
 def otp_buy_cb(c):
-    code=c.data.split(':',1)[1]; bot.answer_callback_query(c.id,'Processing…')
-    result,msg=_otp_create_activation(c.from_user.id,code,c.message.chat.id)
+    _,service,code=c.data.split(':',2); bot.answer_callback_query(c.id,'Processing…')
+    result,msg=_otp_create_activation(c.from_user.id,service,code,c.message.chat.id)
     if not result: return bot.send_message(c.message.chat.id,msg,parse_mode='HTML')
-    r=fetchone('SELECT * FROM otp_countries WHERE code=?',(code,)); bal=_otp_balance(c.from_user.id)
-    text=_otp_waiting_text({**dict(result),'available_count':r['available_count']},1200,300)
-    sent=bot.send_message(c.message.chat.id,text,parse_mode='HTML',reply_markup=_otp_kb(result['order_id'],code,300))
+    r=fetchone('SELECT * FROM otp_service_countries WHERE service_code=? AND country_code=?',(service,code))
+    text=_otp_waiting_text(dict(result),1200,300)
+    sent=bot.send_message(c.message.chat.id,text,parse_mode='HTML',reply_markup=_otp_kb(result['order_id'],service,code,300))
     with db_tx() as conn: conn.execute('UPDATE otp_orders SET chat_id=?,message_id=?,updated_at=? WHERE order_id=?',(str(sent.chat.id),sent.message_id,_otp_now(),result['order_id']))
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_new:'))
 @safe_handler
 def otp_new_cb(c):
-    code=c.data.split(':',1)[1]; bot.answer_callback_query(c.id,'Getting a new number…')
-    result,msg=_otp_create_activation(c.from_user.id,code,c.message.chat.id)
+    _,service,code=c.data.split(':',2); bot.answer_callback_query(c.id,'Getting a new number…')
+    result,msg=_otp_create_activation(c.from_user.id,service,code,c.message.chat.id)
     if not result: return bot.send_message(c.message.chat.id,msg,parse_mode='HTML')
-    r=fetchone('SELECT * FROM otp_countries WHERE code=?',(code,))
-    text=_otp_waiting_text({**dict(result),'available_count':r['available_count']},1200,300)
-    sent=bot.send_message(c.message.chat.id,text,parse_mode='HTML',reply_markup=_otp_kb(result['order_id'],code,300))
+    text=_otp_waiting_text(dict(result),1200,300)
+    sent=bot.send_message(c.message.chat.id,text,parse_mode='HTML',reply_markup=_otp_kb(result['order_id'],service,code,300))
     with db_tx() as conn: conn.execute('UPDATE otp_orders SET chat_id=?,message_id=?,updated_at=? WHERE order_id=?',(str(sent.chat.id),sent.message_id,_otp_now(),result['order_id']))
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_cancel:'))
@@ -6629,95 +7065,272 @@ def otp_cancel_cb(c):
     order_id=c.data.split(':',1)[1]; o=fetchone('SELECT * FROM otp_orders WHERE order_id=? AND user_id=?',(order_id,str(c.from_user.id)))
     if not o or o['status']!='waiting': return bot.answer_callback_query(c.id,'This order is no longer cancellable.',show_alert=True)
     elapsed=(datetime.now(timezone.utc)-datetime.fromisoformat(o['created_at'])).total_seconds(); remaining=300-elapsed
-    if remaining>0:
-        mm=int(remaining)//60; ss=int(remaining)%60
-        return bot.answer_callback_query(c.id,f'⏱ Cancel will be available in {mm:02d}:{ss:02d}',show_alert=True)
+    if remaining>0: return bot.answer_callback_query(c.id,f'⏱ Cancel will be available in {int(remaining)//60:02d}:{int(remaining)%60:02d}',show_alert=True)
     try: r=_otp_http('setStatus',id=o['activation_id'],status='8')
-    except Exception as exc: return bot.answer_callback_query(c.id,'Network error. Please try again.',show_alert=True)
-    if r.get('raw') not in {'ACCESS_CANCEL','STATUS_CANCEL','NO_ACTIVATION'}:
-        return bot.answer_callback_query(c.id,'Cancel was not accepted by Grizzly yet.',show_alert=True)
+    except Exception: return bot.answer_callback_query(c.id,'Network error. Please try again.',show_alert=True)
+    if r.get('raw') not in {'ACCESS_CANCEL','STATUS_CANCEL','NO_ACTIVATION'}: return bot.answer_callback_query(c.id,'Cancel was not accepted by Grizzly yet.',show_alert=True)
     with db_tx() as conn:
         cur=conn.execute('SELECT * FROM otp_orders WHERE order_id=? AND status="waiting" AND refunded=0',(order_id,)).fetchone()
         if not cur: return bot.answer_callback_query(c.id,'Order already closed.',show_alert=True)
         adjust_balance(conn,cur['user_id'],'usdt',float(cur['selling_price']),'OTP_REFUND',reason=f'Quick OTP manual cancel {order_id}',related_txn=order_id,processed_by=cur['user_id'])
         conn.execute('UPDATE otp_orders SET status="cancelled",refunded=1,updated_at=? WHERE order_id=?',(_otp_now(),order_id))
+        conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",(str(cur['user_id']),"OTP_REFUND",str(cur['user_id']),cur['selling_price'],order_id,"manual cancel",_otp_now()))
     bot.answer_callback_query(c.id,'Cancelled and refunded.')
     try: bot.delete_message(o['chat_id'],o['message_id'])
     except Exception: pass
 
-@bot.message_handler(func=lambda m: m.text == '📱 Quick OTP Settings' and is_admin(m.chat.id))
+@bot.message_handler(func=lambda m: m.text == '📱 Quick OTP Settings' and is_super_admin(m.chat.id))
 @safe_handler
 def otp_admin_menu(m):
     kb=types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton('🔄 Sync Grizzly Stock',callback_data='otp_admin_sync'))
-    kb.add(types.InlineKeyboardButton('🌍 Countries & Prices',callback_data='otp_admin_countries'))
-    bot.send_message(m.chat.id,'📱 <b>QUICK OTP SETTINGS</b>\n\nOnly Grizzly/OTP settings live here. Wallet, deposits and referrals remain in the main system.',parse_mode='HTML',reply_markup=kb)
+    kb.row(types.InlineKeyboardButton('🔄 Sync All Services',callback_data='otp_admin_sync_services'))
+    kb.row(types.InlineKeyboardButton('🧩 Services & Pricing',callback_data='otp_admin_services:0'))
+    kb.row(types.InlineKeyboardButton('📊 Active Services',callback_data='otp_admin_active'))
+    kb.row(types.InlineKeyboardButton('🔔 Price Change Alerts',callback_data='otp_admin_alerts'))
+    bot.send_message(m.chat.id,'📱 <b>QUICK OTP SETTINGS</b>\n\n🧩 Services → 🌍 Countries → 💹 Profit → 🟢 Active\n\nOnly Super Admins can control these settings.',parse_mode='HTML',reply_markup=kb)
 
-@bot.callback_query_handler(func=lambda c: c.data=='otp_admin_sync')
+@bot.callback_query_handler(func=lambda c: c.data=='otp_admin_sync_services')
 @safe_handler
-def otp_admin_sync(c):
-    if not is_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Admin only',show_alert=True)
-    try: n=otp_sync_stock(); bot.answer_callback_query(c.id,f'Synced {n} countries.')
-    except Exception as exc: bot.answer_callback_query(c.id,f'Sync failed: {str(exc)[:180]}',show_alert=True)
+def otp_admin_sync_services(c):
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
+    try: n=otp_sync_services(); bot.answer_callback_query(c.id,f'✅ Synced {n:,} Grizzly services.')
+    except Exception as exc: bot.answer_callback_query(c.id,f'❌ Sync failed: {str(exc)[:180]}',show_alert=True)
 
-@bot.callback_query_handler(func=lambda c: c.data=='otp_admin_countries')
+@bot.callback_query_handler(func=lambda c: c.data.startswith('otp_admin_services:'))
 @safe_handler
-def otp_admin_countries(c):
-    if not is_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Admin only',show_alert=True)
-    rows=fetchall('SELECT * FROM otp_countries ORDER BY name LIMIT 80')
+def otp_admin_services(c):
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
+    try: otp_sync_services()
+    except Exception: pass
+    page=max(0,int(c.data.split(':',1)[1] or 0)); per=20; rows=fetchall('SELECT * FROM otp_services ORDER BY service_name LIMIT ? OFFSET ?',(per, page*per))
+    total=fetchone('SELECT COUNT(*) AS n FROM otp_services')['n']; kb=types.InlineKeyboardMarkup()
+    for r in rows: kb.add(types.InlineKeyboardButton(f'{r["emoji"]} {r["service_name"]}',callback_data=f'otp_admin_svc:{r["service_code"]}'))
+    nav=[]
+    if page>0: nav.append(types.InlineKeyboardButton('⬅️ Prev',callback_data=f'otp_admin_services:{page-1}'))
+    if (page+1)*per<total: nav.append(types.InlineKeyboardButton('Next ➡️',callback_data=f'otp_admin_services:{page+1}'))
+    if nav: kb.row(*nav)
+    kb.row(types.InlineKeyboardButton('🔄 Sync',callback_data='otp_admin_sync_services'))
+    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,f'🧩 <b>GRIZZLY SERVICES</b>\n\nShowing {page*per+1 if total else 0}-{min((page+1)*per,total)} of {total:,}.\n\nSelect a service to configure its countries and profit.',parse_mode='HTML',reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('otp_admin_svc:'))
+@safe_handler
+def otp_admin_svc(c):
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
+    service=c.data.split(':',1)[1]; svc=fetchone('SELECT * FROM otp_services WHERE service_code=?',(service,))
+    if not svc: return bot.answer_callback_query(c.id,'Service not found.',show_alert=True)
+    try: otp_sync_service_stock(service)
+    except Exception as exc: logger.warning('Admin stock sync failed for %s: %s',service,exc)
+    _otp_admin_show_countries(c.from_user.id,service,0,svc)
+    bot.answer_callback_query(c.id)
+
+def _otp_admin_show_countries(chat_id, service, page, svc):
+    per=20; page=max(0,int(page)); total=int(fetchone('SELECT COUNT(*) AS n FROM otp_service_countries WHERE service_code=?',(service,))['n'])
+    rows=fetchall('SELECT * FROM otp_service_countries WHERE service_code=? ORDER BY name LIMIT ? OFFSET ?',(service,per,page*per))
+    if not rows and page>0: page-=1; rows=fetchall('SELECT * FROM otp_service_countries WHERE service_code=? ORDER BY name LIMIT ? OFFSET ?',(service,per,page*per))
+    service_cfg=fetchone('SELECT * FROM otp_services WHERE service_code=?',(service,))
     kb=types.InlineKeyboardMarkup()
     for r in rows:
-        status='🟢' if r['enabled'] else '🔴'; kb.add(types.InlineKeyboardButton(f'{status} {r["flag"]} {r["name"]} | {_otp_price(r):.2f} | {int(r["available_count"]):,}',callback_data=f'otp_admin_country:{r["code"]}'))
-    kb.add(types.InlineKeyboardButton('🔄 Sync',callback_data='otp_admin_sync'))
-    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,'🌍 <b>Quick OTP Countries / Prices</b>\n\n🟢 enabled • 🔴 disabled',parse_mode='HTML',reply_markup=kb)
+        status='🟢' if _otp_profit_active(r,service_cfg) else '⚪'; kb.add(types.InlineKeyboardButton(f'{status} {r["flag"]} {r["name"]} | {_otp_price(r,service_cfg):.2f}',callback_data=f'otp_admin_sc:{service}:{r["country_code"]}'))
+    nav=[]
+    if page>0: nav.append(types.InlineKeyboardButton('⬅️ Previous',callback_data=f'otp_admin_countries:{service}:{page-1}'))
+    if (page+1)*per<total: nav.append(types.InlineKeyboardButton('Next ➡️',callback_data=f'otp_admin_countries:{service}:{page+1}'))
+    if nav: kb.row(*nav)
+    kb.row(types.InlineKeyboardButton('⬅️ Services',callback_data='otp_admin_services:0'))
+    bot.send_message(chat_id,f'{svc["emoji"]} <b>{html.escape(svc["service_name"])}</b>\n\n🌍 Configure a country below.\n🟢 = visible to users\n⚪ = hidden until profit is activated.\n📄 Page {page+1}/{max(1,(total+per-1)//per)}',parse_mode='HTML',reply_markup=kb)
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith('otp_admin_country:'))
+@bot.callback_query_handler(func=lambda c: c.data.startswith('otp_admin_countries:'))
 @safe_handler
-def otp_admin_country(c):
-    if not is_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Admin only',show_alert=True)
-    code=c.data.split(':',1)[1]; r=fetchone('SELECT * FROM otp_countries WHERE code=?',(code,))
-    if not r: return bot.answer_callback_query(c.id,'Not found',show_alert=True)
-    kb=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('✏️ Set Price',callback_data=f'otp_set_price:{code}')).add(types.InlineKeyboardButton('🟢 Enable' if not r['enabled'] else '🔴 Disable',callback_data=f'otp_toggle:{code}')).add(types.InlineKeyboardButton('⬅️ Countries',callback_data='otp_admin_countries'))
-    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,f'{r["flag"]} <b>{r["name"]}</b>\n\nGrizzly cost: {float(r["grizzly_cost"] or 0):.4f}\nSelling price: <b>{_otp_price(r):.2f} USDT</b>\nAvailable: <b>{int(r["available_count"]):,}</b>\nStatus: {"Enabled" if r["enabled"] else "Disabled"}',parse_mode='HTML',reply_markup=kb)
+def otp_admin_countries_page(c):
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
+    _,service,page=c.data.split(':',2); svc=fetchone('SELECT service_name,emoji FROM otp_services WHERE service_code=?',(service,))
+    if not svc: return bot.answer_callback_query(c.id,'Service not found.',show_alert=True)
+    try: otp_sync_service_stock(service)
+    except Exception as exc: logger.warning('Admin stock sync failed for %s: %s',service,exc)
+    _otp_admin_show_countries(c.from_user.id,service,int(page),svc); bot.answer_callback_query(c.id)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('otp_admin_sc:'))
+@safe_handler
+def otp_admin_sc(c):
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
+    _,service,code=c.data.split(':',2); r=fetchone('SELECT * FROM otp_service_countries WHERE service_code=? AND country_code=?',(service,code)); svc=fetchone('SELECT service_name,emoji FROM otp_services WHERE service_code=?',(service,))
+    if not r: return bot.answer_callback_query(c.id,'Country not found.',show_alert=True)
+    kb=types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton('💵 Manual Price',callback_data=f'otp_set_price:{service}:{code}'))
+    if r['explicit_price'] is not None:
+        kb.add(types.InlineKeyboardButton('🧹 Remove Manual Price',callback_data=f'otp_clear_price:{service}:{code}'))
+    kb.add(types.InlineKeyboardButton('📈 Service Global %',callback_data=f'otp_global_profit:{service}'))
+    kb.add(types.InlineKeyboardButton('🔴 OFF' if r['enabled'] else '🟢 ACTIVE',callback_data=f'otp_toggle:{service}:{code}'))
+    kb.add(types.InlineKeyboardButton('⬅️ Countries',callback_data=f'otp_admin_svc:{service}'))
+    status='🟢 LIVE FOR USERS' if _otp_profit_active(r,svc) else '⚪ Hidden from users'
+    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,f'{svc["emoji"] if svc else "🧩"} <b>{html.escape(str(svc["service_name"] if svc else service))}</b>\n🌍 {r["flag"]} <b>{html.escape(r["name"])}</b>\n\n🏷 Grizzly cost: {float(r["grizzly_cost"] or 0):.4f}\n💰 User price: <b>{_otp_price(r,svc):.2f} USDT</b>\n📈 Global profit: <b>{(str(svc["global_profit_percent"]) + "%") if svc["global_profit_percent"] is not None else "OFF"}</b>\n✍️ Manual country price: <b>{(f"{float(r["explicit_price"]):.2f} USDT") if r["explicit_price"] is not None else "OFF"}</b>\n📦 Available: <b>{int(r["available_count"]):,}</b>\n🔘 Status: {status}',parse_mode='HTML',reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_toggle:'))
 @safe_handler
 def otp_toggle(c):
-    if not is_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Admin only',show_alert=True)
-    code=c.data.split(':',1)[1]
-    with db_tx() as conn: conn.execute('UPDATE otp_countries SET enabled=CASE enabled WHEN 1 THEN 0 ELSE 1 END,updated_at=? WHERE code=?',(_otp_now(),code))
-    bot.answer_callback_query(c.id,'Updated'); otp_admin_country(c)
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
+    _,service,code=c.data.split(':',2)
+    with db_tx() as conn: conn.execute('UPDATE otp_service_countries SET enabled=CASE enabled WHEN 1 THEN 0 ELSE 1 END,updated_at=? WHERE service_code=? AND country_code=?',(_otp_now(),service,code))
+    bot.answer_callback_query(c.id,'Updated'); otp_admin_sc(c)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('otp_profit:'))
+@safe_handler
+def otp_profit_cb(c):
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
+    _,service,code=c.data.split(':',2); r=fetchone('SELECT * FROM otp_service_countries WHERE service_code=? AND country_code=?',(service,code))
+    if not r: return bot.answer_callback_query(c.id,'Not found',show_alert=True)
+    kb=types.InlineKeyboardMarkup()
+    for pct in (5,10,15,30,50): kb.add(types.InlineKeyboardButton(f'➕ {pct}%',callback_data=f'otp_profit_set:{service}:{code}:{pct}'))
+    kb.add(types.InlineKeyboardButton('✍️ Manual percentage',callback_data=f'otp_profit_manual:{service}:{code}'))
+    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,f'📈 <b>{r["name"]}</b>\n\nChoose profit above the live Grizzly cost:',parse_mode='HTML',reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('otp_profit_set:'))
+@safe_handler
+def otp_profit_set_cb(c):
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
+    _,service,code,pct=c.data.split(':',3); pct=float(pct)
+    with db_tx() as conn: conn.execute('UPDATE otp_service_countries SET markup_percent=?,markup_fixed=0,explicit_price=NULL,profit_active=1,enabled=1,updated_at=? WHERE service_code=? AND country_code=?',(pct,_otp_now(),service,code))
+    bot.answer_callback_query(c.id,f'{pct:g}% active'); otp_admin_sc(c)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('otp_profit_manual:'))
+@safe_handler
+def otp_profit_manual_cb(c):
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
+    _,service,code=c.data.split(':',2); r=fetchone('SELECT name FROM otp_service_countries WHERE service_code=? AND country_code=?',(service,code))
+    if not r: return bot.answer_callback_query(c.id,'Not found',show_alert=True)
+    clear_state(c.from_user.id); update_state(c.from_user.id,flow='otp_profit_manual',step=None,otp_service=service,otp_country=code)
+    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,f'✍️ Send profit percentage for <b>{r["name"]}</b>.\nExample: <code>22.5</code>',parse_mode='HTML',reply_markup=back_kb())
+
+def _handle_otp_profit_manual(m,state):
+    if not is_super_admin(m.chat.id): clear_state(m.chat.id); return
+    service=state.get('otp_service'); code=state.get('otp_country')
+    try: pct=float(m.text.strip())
+    except Exception: return bot.send_message(m.chat.id,'❌ Send a valid percentage, e.g. 25 or 22.5.')
+    if pct<=0 or pct>1000: return bot.send_message(m.chat.id,'❌ Percentage must be greater than 0 and at most 1000%.')
+    with db_tx() as conn: conn.execute('UPDATE otp_service_countries SET markup_percent=?,markup_fixed=0,explicit_price=NULL,profit_active=1,enabled=1,updated_at=? WHERE service_code=? AND country_code=?',(pct,_otp_now(),service,code))
+    clear_state(m.chat.id); bot.send_message(m.chat.id,f'✅ Profit set to {pct:g}%. This service/country is now 🟢 ACTIVE for users.',reply_markup=main_menu(m.chat.id))
+
+_FLOW_ROUTES[('otp_profit_manual',None)] = _handle_otp_profit_manual
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('otp_global_profit:'))
+@safe_handler
+def otp_global_profit_cb(c):
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
+    service=c.data.split(':',1)[1]; svc=fetchone('SELECT * FROM otp_services WHERE service_code=?',(service,))
+    if not svc: return bot.answer_callback_query(c.id,'Service not found.',show_alert=True)
+    current='OFF' if svc['global_profit_percent'] is None else f'{float(svc["global_profit_percent"]):g}%'
+    kb=types.InlineKeyboardMarkup()
+    kb.row(types.InlineKeyboardButton('➕ 5%',callback_data=f'otp_global_adjust:{service}:5'),types.InlineKeyboardButton('➕ 10%',callback_data=f'otp_global_adjust:{service}:10'))
+    kb.row(types.InlineKeyboardButton('➖ 5%',callback_data=f'otp_global_adjust:{service}:-5'),types.InlineKeyboardButton('➖ 10%',callback_data=f'otp_global_adjust:{service}:-10'))
+    kb.add(types.InlineKeyboardButton('✍️ Set exact %',callback_data=f'otp_global_manual:{service}'))
+    kb.add(types.InlineKeyboardButton('🧹 Remove / OFF',callback_data=f'otp_global_clear:{service}'))
+    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,f'📈 <b>GLOBAL PROFIT • {html.escape(svc["service_name"])}</b>\n\nCurrent: <b>{current}</b>\n\nThis applies to every country in this service except countries with a manual price. Manual-price countries are excluded and must be priced separately.',parse_mode='HTML',reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('otp_global_adjust:'))
+@safe_handler
+def otp_global_adjust_cb(c):
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
+    _,service,delta=c.data.split(':',2); delta=float(delta); svc=fetchone('SELECT * FROM otp_services WHERE service_code=?',(service,))
+    if not svc: return bot.answer_callback_query(c.id,'Service not found.',show_alert=True)
+    current=float(svc['global_profit_percent'] or 0); new=round(current+delta,4)
+    if new<0: new=0
+    with db_tx() as conn:
+        conn.execute('UPDATE otp_services SET global_profit_percent=?,updated_at=? WHERE service_code=?',(new,_otp_now(),service))
+        conn.execute('UPDATE otp_service_countries SET enabled=1,profit_active=1,updated_at=? WHERE service_code=? AND explicit_price IS NULL',(_otp_now(),service))
+    bot.answer_callback_query(c.id,f'Global profit: {new:g}%'); otp_global_profit_cb(c)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('otp_global_clear:'))
+@safe_handler
+def otp_global_clear_cb(c):
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
+    service=c.data.split(':',1)[1]
+    with db_tx() as conn: conn.execute('UPDATE otp_services SET global_profit_percent=NULL,updated_at=? WHERE service_code=?',(_otp_now(),service))
+    bot.answer_callback_query(c.id,'Global percentage removed.'); otp_global_profit_cb(c)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('otp_global_manual:'))
+@safe_handler
+def otp_global_manual_cb(c):
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
+    service=c.data.split(':',1)[1]; svc=fetchone('SELECT service_name FROM otp_services WHERE service_code=?',(service,))
+    if not svc: return bot.answer_callback_query(c.id,'Service not found.',show_alert=True)
+    clear_state(c.from_user.id); update_state(c.from_user.id,flow='otp_global_manual',step=None,otp_service=service)
+    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,f'✍️ Send exact global profit percentage for <b>{html.escape(svc["service_name"])}</b>.\nExample: <code>25</code>\nUse <code>0</code> to keep prices at Grizzly cost (countries still need to be above cost to show users).',parse_mode='HTML',reply_markup=back_kb())
+
+def _handle_otp_global_manual(m,state):
+    if not is_super_admin(m.chat.id): clear_state(m.chat.id); return
+    service=state.get('otp_service')
+    try: pct=float(m.text.strip())
+    except Exception: return bot.send_message(m.chat.id,'❌ Send a valid percentage, e.g. 25 or 12.5.')
+    if pct<0 or pct>1000: return bot.send_message(m.chat.id,'❌ Percentage must be between 0 and 1000%.')
+    with db_tx() as conn:
+        conn.execute('UPDATE otp_services SET global_profit_percent=?,updated_at=? WHERE service_code=?',(pct,_otp_now(),service))
+        conn.execute('UPDATE otp_service_countries SET enabled=1,profit_active=1,updated_at=? WHERE service_code=? AND explicit_price IS NULL',(_otp_now(),service))
+    clear_state(m.chat.id); bot.send_message(m.chat.id,f'✅ Global profit set to {pct:g}% for this service. Manual-price countries remain excluded from this rule.',reply_markup=main_menu(m.chat.id))
+
+_FLOW_ROUTES[('otp_global_manual',None)] = _handle_otp_global_manual
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('otp_clear_price:'))
+@safe_handler
+def otp_clear_price_cb(c):
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
+    _,service,code=c.data.split(':',2)
+    with db_tx() as conn: conn.execute('UPDATE otp_service_countries SET explicit_price=NULL,profit_active=1,updated_at=? WHERE service_code=? AND country_code=?',(_otp_now(),service,code))
+    bot.answer_callback_query(c.id,'Manual price removed. Country now follows global service pricing.'); otp_admin_sc(c)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_set_price:'))
 @safe_handler
 def otp_set_price_cb(c):
-    if not is_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Admin only',show_alert=True)
-    code=c.data.split(':',1)[1]; r=fetchone('SELECT * FROM otp_countries WHERE code=?',(code,))
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
+    _,service,code=c.data.split(':',2); r=fetchone('SELECT * FROM otp_service_countries WHERE service_code=? AND country_code=?',(service,code))
     if not r: return bot.answer_callback_query(c.id,'Not found',show_alert=True)
-    update_state(c.from_user.id,flow='otp_set_price',step=None,otp_country=code)
-    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,f'💰 Send the new selling price in USDT for {r["name"]}.\n\nCurrent: {_otp_price(r):.2f}\n\nExample: <code>0.85</code>',parse_mode='HTML')
+    clear_state(c.from_user.id); update_state(c.from_user.id,flow='otp_set_price',step=None,otp_service=service,otp_country=code)
+    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,f'💰 Send the final selling price in USDT for <b>{r["name"]}</b>.\nCurrent: {_otp_price(r,fetchone('SELECT * FROM otp_services WHERE service_code=?',(service,))):.2f}\nExample: <code>0.85</code>',parse_mode='HTML',reply_markup=back_kb())
 
 def _handle_otp_set_price(m,state):
-    code=state.get('otp_country')
+    if not is_super_admin(m.chat.id): clear_state(m.chat.id); return
+    service=state.get('otp_service'); code=state.get('otp_country')
     try: price=round(float(m.text.strip()),2)
     except: return bot.send_message(m.chat.id,'❌ Invalid price. Send a number like 0.85')
     if price<=0: return bot.send_message(m.chat.id,'❌ Price must be greater than 0.')
-    with db_tx() as conn: conn.execute('UPDATE otp_countries SET explicit_price=?,updated_at=? WHERE code=?',(price,_otp_now(),code))
-    clear_state(m.chat.id); bot.send_message(m.chat.id,f'✅ Price updated to {price:.2f} USDT.',reply_markup=main_menu(m.chat.id))
+    r=fetchone('SELECT grizzly_cost FROM otp_service_countries WHERE service_code=? AND country_code=?',(service,code))
+    if not r: return bot.send_message(m.chat.id,'❌ Country not found.')
+    if price<=float(r['grizzly_cost'] or 0): return bot.send_message(m.chat.id,f'❌ User price must be above Grizzly cost ({float(r["grizzly_cost"] or 0):.4f} USDT).')
+    with db_tx() as conn: conn.execute('UPDATE otp_service_countries SET explicit_price=?,markup_percent=0,markup_fixed=0,profit_active=1,enabled=1,updated_at=? WHERE service_code=? AND country_code=?',(price,_otp_now(),service,code))
+    clear_state(m.chat.id); bot.send_message(m.chat.id,f'✅ Final user price updated to {price:.2f} USDT. 🟢 Active.',reply_markup=main_menu(m.chat.id))
 
 _FLOW_ROUTES[('otp_set_price',None)] = _handle_otp_set_price
 
+@bot.callback_query_handler(func=lambda c: c.data=='otp_admin_alerts')
+@safe_handler
+def otp_admin_alerts(c):
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
+    rows=fetchall('SELECT a.*,s.service_name FROM otp_price_alerts a LEFT JOIN otp_services s ON s.service_code=a.service_code ORDER BY a.id DESC LIMIT 30')
+    if not rows: return bot.answer_callback_query(c.id,'No Grizzly price changes recorded yet.',show_alert=True)
+    lines=['🔔 <b>RECENT GRIZZLY PRICE CHANGES</b>','']
+    for r in rows:
+        arrow='📈' if r['direction']=='increased' else '📉'
+        lines.append(f'{arrow} {r["service_name"] or r["service_code"]} • {r["country_name"]}: {float(r["old_cost"]):.4f} → {float(r["new_cost"]):.4f} USDT')
+    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,'\n'.join(lines),parse_mode='HTML')
+
+# OTP worker: keep the existing safe reconciliation/refund behavior, but use the selected service.
+def _otp_price_watcher():
+    # Watch only services that have at least one configured/active country, avoiding thousands of unnecessary API calls.
+    while True:
+        try:
+            services=fetchall('SELECT DISTINCT service_code FROM otp_service_countries WHERE enabled=1 OR explicit_price IS NOT NULL OR profit_active=1')
+            for r in services:
+                try: otp_sync_service_stock(r['service_code'])
+                except Exception as exc: logger.warning('OTP price watcher failed for %s: %s',r['service_code'],exc)
+        except Exception: logger.exception('OTP price watcher error')
+        time.sleep(600)
+
 def _otp_worker():
-    # UI countdown is derived from created_at every second; it never depends on
-    # worker sleep drift. Provider status is polled less frequently.
     last_status={}
     while True:
         try:
-            active=fetchall('SELECT * FROM otp_orders WHERE status="waiting" ORDER BY created_at LIMIT 300')
+            active=fetchall('SELECT o.*,s.service_name FROM otp_orders o LEFT JOIN otp_services s ON s.service_code=o.service_code WHERE o.status="waiting" ORDER BY o.created_at LIMIT 300')
             now=datetime.now(timezone.utc)
             for o in active:
-                try:
-                    created=datetime.fromisoformat(o['created_at']); elapsed=(now-created).total_seconds()
+                try: elapsed=(now-datetime.fromisoformat(o['created_at'])).total_seconds()
                 except Exception: continue
                 auto=max(0,1200-int(elapsed)); manual=max(0,300-int(elapsed))
                 if elapsed>=1200:
@@ -6733,8 +7346,7 @@ def _otp_worker():
                     except Exception: pass
                     continue
                 if o['chat_id'] and o['message_id']:
-                    country=o['country_code']; _otp_update_message(o['chat_id'],o['message_id'],_otp_waiting_text(o,auto,manual),_otp_kb(o['order_id'],country,manual))
-                # Poll provider status about every 5 seconds per activation.
+                    _otp_update_message(o['chat_id'],o['message_id'],_otp_waiting_text(o,auto,manual),_otp_kb(o['order_id'],o['service_code'],o['country_code'],manual))
                 if elapsed-last_status.get(o['order_id'],-999)>=5:
                     last_status[o['order_id']]=elapsed
                     try: r=_otp_http('getStatusV2',id=o['activation_id'])
@@ -6745,11 +7357,13 @@ def _otp_worker():
                         except Exception: pass
                         with db_tx() as conn:
                             cur=conn.execute('SELECT * FROM otp_orders WHERE order_id=? AND status="waiting"',(o['order_id'],)).fetchone()
-                            if cur: conn.execute('UPDATE otp_orders SET status="completed",otp_code=?,updated_at=? WHERE order_id=?',(otp,_otp_now(),o['order_id']))
+                            if cur:
+                                conn.execute('UPDATE otp_orders SET status="completed",otp_code=?,updated_at=? WHERE order_id=?',(otp,_otp_now(),o['order_id']))
+                                conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",(str(cur['user_id']),"OTP_COMPLETED",str(cur['user_id']),cur['selling_price'],o['order_id'],f'service={cur["service_code"]}; country={cur["country_name"]}',_otp_now()))
                         try: bot.delete_message(o['chat_id'],o['message_id'])
                         except Exception: pass
-                        kb=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{o["country_code"]}'))
-                        bot.send_message(o['user_id'],f'🔐 <b>OTP received</b>\n\nOrder: <code>{o["order_id"]}</code>\n🔑 OTP: <code>{html.escape(str(otp))}</code>\n\n✅ Activation completed.',parse_mode='HTML',reply_markup=kb)
+                        kb=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{o["service_code"]}:{o["country_code"]}'))
+                        bot.send_message(o['user_id'],f'🔐 <b>OTP RECEIVED</b>\n\n{html.escape(str(o["service_name"] or o["service_code"]))} • {html.escape(str(o["country_name"]))}\n🧾 Order: <code>{o["order_id"]}</code>\n🔑 OTP: <code>{html.escape(str(otp))}</code>\n\n✅ Activation completed.',parse_mode='HTML',reply_markup=kb)
                     elif r.get('raw') in {'STATUS_CANCEL','NO_ACTIVATION'}:
                         with db_tx() as conn:
                             cur=conn.execute('SELECT * FROM otp_orders WHERE order_id=? AND status="waiting" AND refunded=0',(o['order_id'],)).fetchone()
@@ -6758,12 +7372,9 @@ def _otp_worker():
                                 conn.execute('UPDATE otp_orders SET status="cancelled",refunded=1,updated_at=? WHERE order_id=?',(_otp_now(),o['order_id']))
                         try: bot.delete_message(o['chat_id'],o['message_id'])
                         except Exception: pass
-            # prune status cache
             live={x['order_id'] for x in active}; last_status={k:v for k,v in last_status.items() if k in live}
-        except Exception:
-            logger.exception('Quick OTP worker error')
+        except Exception: logger.exception('Quick OTP worker error')
         time.sleep(1)
-
 
 @bot.message_handler(func=lambda m: m.content_type == "text")
 @safe_handler
@@ -6793,9 +7404,11 @@ def main():
     init_db()
     otp_db_init()
     threading.Thread(target=_otp_worker, daemon=True, name="quick-otp-worker").start()
+    threading.Thread(target=_otp_price_watcher, daemon=True, name="quick-otp-price-watcher").start()
     logger.info("%s starting…", BRAND)
     print(f"🚀 {BRAND} is starting…")
-    threading.Thread(target=auto_message_scheduler, daemon=True).start()
+    threading.Thread(target=auto_message_scheduler, daemon=True, name="auto-message-scheduler").start()
+    threading.Thread(target=audit_channel_dispatcher, daemon=True, name="audit-channel-dispatcher").start()
     bot.infinity_polling(timeout=20, long_polling_timeout=10)
 
 
