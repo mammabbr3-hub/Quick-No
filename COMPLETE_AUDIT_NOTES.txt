@@ -1,12 +1,41 @@
-Mobile Business Hub - Complete OTP/Admin Audit Patch
+FINAL PRE-DEPLOY AUDIT — Mobile Business Hub
+Date: 2026-09-26
 
-Fixed:
-1. otp_admin_sc was loading only service_name/emoji but later reading enabled/global_profit_percent, causing the exact handler crash shown in Telegram.
-2. User OTP country detail was loading only service_name/emoji, which could ignore service-level global profit. It now loads the full service record.
-3. Admin country pages now refresh visible Grizzly price/stock before rendering, so unsynced rows do not misleadingly show 0.00. If a cost is unavailable, the admin sees N/A.
-4. ANY_COUNTRY is displayed as "Any Country" instead of the raw catalogue label.
-5. Admin country detail rendering was rewritten to avoid fragile nested f-strings and to show safe N/A/OFF values.
-6. OTP activation service lookup now uses the full service record for consistent metadata.
-7. Syntax check completed successfully.
+Main user menu checked:
+1. Quick OTP
+2. My Account | Support
+3. Fund Wallet
+4. Submit Work | History
+5. Withdrawal | BUY OR SELL MAIL
+6. Refresh
 
-No live Grizzly transaction was performed; live provider results still depend on the configured Grizzly API key/account.
+Removed from built-in user menu:
+- Manual
+- Separate Bank Details main-menu entry
+
+Feature control audit:
+- Every built-in main-menu feature has a global ON/OFF control.
+- Every built-in main-menu feature has per-user restriction control.
+- Quick OTP callbacks re-check the Quick OTP feature.
+- Withdrawal/payment-detail callbacks re-check Withdrawal/payment-detail feature.
+- Fund Wallet callback/proof handlers re-check Fund Wallet feature.
+- Submit Work media/proof processing re-checks Submit Work feature.
+- Support media processing re-checks Support feature.
+- Custom handles have global/per-user controls and re-check active state during in-progress input.
+- Work/Mail menu options have individual active + feature-control checks.
+- Referral reward callback re-checks referral feature; referral link button is hidden when referrals are disabled.
+
+Admin/security audit:
+- Super Admin is required for global Feature Control and role/system settings.
+- Sensitive admin callbacks were statically audited for server-side admin checks.
+- User feature controls do not grant admin permissions.
+- Legacy Bank Details is no longer a Feature Control item; payment details are governed by Withdrawal Payment Details and are managed inside Withdrawal.
+
+Validation:
+- Python compile: PASS
+- Main-menu feature mapping: PASS
+- Handler feature guards: PASS
+- Manual built-in handler removed: PASS
+- ZIP integrity: checked after packaging
+
+No live Telegram/Grizzly transaction was performed in this audit.

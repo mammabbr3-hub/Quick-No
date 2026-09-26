@@ -1757,7 +1757,6 @@ FEATURES = {
     "quick_otp":     ("📱 Quick OTP", "📱 Quick OTP"),
     "account":       ("👤 My Account", "👤 My Account"),
     "support":       ("📞 Support", "📞 Support"),
-    "manual":        ("📘 Manual", "📘 Manual"),
     "fund_wallet":   ("💳 Fund Wallet", "💳 Fund Wallet"),
     "submit_work":   ("📤 Submit Work", "📤 Submit Work"),
     "history":       ("📜 History", "📜 History"),
@@ -1769,7 +1768,6 @@ FEATURES = {
     "referrals":     ("👥 My Referrals", "👥 My Referrals"),
     "profile":       ("👤 My Profile", "👤 My Profile"),
     "withdrawal_payment_details": ("🏦 Withdrawal Payment Details", "🏦 Withdrawal Payment Details"),
-    "bank_details": ("🏦 Bank Details (legacy)", "🏦 Bank Details (legacy)"),
 }
 
 
@@ -1795,7 +1793,6 @@ BUTTON_LABELS = {
     "bank_details":  "🏦 Bank Details",
     "support":       "📞 Support",
     "buy_sell_mail": "🛒 BUY OR SELL MAIL",
-    "manual":        "📘 Manual",
 }
 
 
@@ -1827,7 +1824,7 @@ def reserved_labels_now() -> set:
         "💵 Withdrawal ID Search", "📊 Total Users Balance",
         "📋 Banned Users", "📋 Manage Custom Handles", "📋 Pending Approvals",
         "📝 Edit Bot Text", "📝 Submission ID Search", "📢 Broadcast",
-        "🔍 Search", "🔎 Track User", "🔎 Search Any ID",
+        "🔍 Search", "🔎 Track User", "🔎 Search Any ID", "📘 Manual", "Manual",
         "🔙 Back", "🚫 Ban User", "🛠 Feature Control", "🛠 Maintenance Mode", "🧩 Menu Editor", "📱 Quick OTP", "📱 Quick OTP Settings", "⚙️ Community Settings", "/start",
     }
     try:
@@ -2197,6 +2194,40 @@ from telebot import types
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 BRAND = "✦ Mobile Business Hub 🤖"
 
+# Telegram can deliver two rapid taps as separate updates (and pyTelegramBotAPI
+# may process them on different worker threads). Keep a tiny per-user action
+# guard so two buttons cannot start two flows/transactions at the same time.
+_ACTION_GUARD_LOCK = threading.RLock()
+_ACTION_GUARD_STATE = {}
+_ACTION_GUARD_WINDOW = 0.85
+
+def _update_action_signature(update):
+    if hasattr(update, "data") and getattr(update, "data", None):
+        return "callback:" + str(update.data)
+    if hasattr(update, "text") and getattr(update, "text", None):
+        return "message:" + str(update.text).strip()
+    if hasattr(update, "message") and getattr(update.message, "text", None):
+        return "message:" + str(update.message.text).strip()
+    return type(update).__name__
+
+def _double_action_message(chat_id):
+    return (
+        "⚠️ <b>Please choose one option at a time.</b>\n\n"
+        "It looks like two buttons were selected at the same time. "
+        "Please wait for the first selection to finish, then choose the option you want."
+    )
+
+def _guard_rapid_action(update, chat_id):
+    """Return False when this update is a rapid second tap for this user."""
+    now = time.monotonic()
+    signature = _update_action_signature(update)
+    with _ACTION_GUARD_LOCK:
+        previous = _ACTION_GUARD_STATE.get(str(chat_id))
+        _ACTION_GUARD_STATE[str(chat_id)] = (now, signature)
+        if previous and (now - previous[0]) < _ACTION_GUARD_WINDOW:
+            return False
+    return True
+
 
 # ================================================================
 # ERROR-SAFE HANDLER WRAPPER
@@ -2218,7 +2249,7 @@ def _chat_id_of(update):
 # back, /start, opening/using Support (including finishing an
 # in-progress complaint), and Support. Every other
 # action is blocked for a banned user with a clear restriction notice.
-BAN_EXEMPT_HANDLERS = {"universal_back", "start", "support", "show_manual"}
+BAN_EXEMPT_HANDLERS = {"universal_back", "start", "support"}
 
 
 def _send_ban_notice(chat_id):
@@ -2311,6 +2342,17 @@ def safe_handler(func):
                 if data not in {"maintenance_try", "maintenance_support"} and get_state(chat_id).get("flow") != "support":
                     maintenance_message(chat_id)
                     return
+        if not _guard_rapid_action(update, chat_id):
+            # For callback buttons, acknowledge the tap so Telegram stops
+            # showing the loading spinner; then give a clear instruction.
+            if hasattr(update, "id") and hasattr(update, "data"):
+                try:
+                    bot.answer_callback_query(update.id, "Please choose one option at a time.", show_alert=True)
+                except Exception:
+                    logger.exception("Could not acknowledge rapid callback for %s", chat_id)
+            else:
+                bot.send_message(chat_id, _double_action_message(chat_id), parse_mode="HTML")
+            return
         try:
             return func(update, *args, **kwargs)
         except InsufficientFundsError as e:
@@ -2630,7 +2672,7 @@ def main_menu(chat_id=None):
     else:
         # User menu layout requested by the owner:
         # 1) Quick OTP
-        # 2) My Account / Support / Manual
+        # 2) My Account / Support
         # 3) Fund Wallet
         # 4) Submit Work / History
         # 5) Withdrawal / BUY OR SELL MAIL
@@ -2640,7 +2682,7 @@ def main_menu(chat_id=None):
         # button. They are collected and managed from inside Withdrawal.
         if is_feature_enabled("quick_otp", chat_id):
             kb.row("📱 Quick OTP")
-        row = [x for key, x in (("account", btn_label("account")), ("support", btn_label("support")), ("manual", btn_label("manual"))) if is_feature_enabled(key, chat_id)]
+        row = [x for key, x in (("account", btn_label("account")), ("support", btn_label("support"))) if is_feature_enabled(key, chat_id)]
         if row:
             kb.row(*row)
         if is_feature_enabled("fund_wallet", chat_id):
@@ -2652,7 +2694,7 @@ def main_menu(chat_id=None):
         if row:
             kb.row(*row)
     try:
-        custom_labels = [h["label"] for h in list_custom_handles_for_user(chat_id)]
+        custom_labels = [h["label"] for h in list_custom_handles_for_user(chat_id) if str(h["label"]).strip().lower() not in {"manual", "📘 manual"}]
         for row in _user_menu_rows(custom_labels) if not is_admin(chat_id) else _rows_of_two(custom_labels):
             kb.row(*row)
     except Exception:
@@ -2818,132 +2860,29 @@ def _bot_public_identity():
     return _BOT_PUBLIC_HANDLE_CACHE
 
 
-@bot.message_handler(func=lambda m: m.text == btn_label("manual"))
-@safe_handler
-def show_manual(m):
-    if feature_blocked_message(m, "manual"):
-        return
-    """Complete user guide for every main user feature."""
-    handle, bot_link = _bot_public_identity()
-    bot_line = f"🤖 Bot Handle: <b>{html.escape(handle)}</b>"
-    if bot_link:
-        bot_line += f"\n🔗 Bot Link: <a href=\"{html.escape(bot_link, quote=True)}\">{html.escape(bot_link)}</a>"
-
-    support_line = (
-        f"🔗 Support Group/Channel: <a href=\"{html.escape(SUPPORT_GROUP_LINK, quote=True)}\">{html.escape(SUPPORT_GROUP_LINK)}</a>"
-        if SUPPORT_GROUP_LINK else
-        "🔗 Support: Open the 📞 Support button in this bot."
-    )
-    work_line = (
-        f"🔗 Approved Work Channel: <a href=\"{html.escape(WORK_CHANNEL_LINK, quote=True)}\">{html.escape(WORK_CHANNEL_LINK)}</a>"
-        if WORK_CHANNEL_LINK else
-        "📤 Approved Work: Results are handled through the Submit Work flow and the configured work destination."
-    )
-
-    text = (
-        "📘 <b>MOBILE BUSINESS HUB — USER MANUAL</b>\n\n"
-        "Welcome 👋 This guide explains how to use every main feature of the bot.\n\n"
-        f"{bot_line}\n"
-        f"{support_line}\n"
-        f"{work_line}\n\n"
-
-        "━━━━━━━━━━━━━━━━━━\n"
-        "📱 <b>1. QUICK OTP</b>\n"
-        "• Tap 📱 Quick OTP.\n"
-        "• Choose the service you need, such as WhatsApp or Telegram.\n"
-        "• Choose a country that is currently enabled and available.\n"
-        "• Review the country, selling price and availability.\n"
-        "• Confirm <b>Buy Number</b> to purchase a number.\n"
-        "• The bot gives you the activation details and waits for the SMS code.\n"
-        "• Follow the activation status shown by the bot.\n"
-        "• Your wallet is charged only when the purchase is successfully created; failed purchases are handled by the bot's refund/reconciliation flow.\n\n"
-
-        "👤 <b>2. MY ACCOUNT</b>\n"
-        "Your account page combines your profile, balance and referral information. You can see your Telegram ID, name, username, USDT balance, approved/pending work and referral statistics.\n"
-        "• Your personal referral link is shown there when referrals are enabled.\n"
-        "• Share your referral link with friends to earn the configured referral reward.\n\n"
-
-        "📞 <b>3. SUPPORT</b>\n"
-        "Use Support when you have a problem, payment issue, work issue, OTP issue or any question that needs the team. Provide your User ID and a clear explanation so the team can investigate faster.\n\n"
-
-        "📘 <b>4. MANUAL</b>\n"
-        "This button opens this complete guide. You can return to the main menu at any time with 🔙 Back.\n\n"
-
-        "💳 <b>5. FUND WALLET</b>\n"
-        "• Tap 💳 Fund Wallet.\n"
-        "• Select an available funding method.\n"
-        "• Follow the instructions shown by the bot.\n"
-        "• If proof/payment evidence is requested, submit it exactly as instructed.\n"
-        "• Wait for admin review/approval when the selected method requires approval.\n"
-        "• Your approved amount is added to your USDT wallet balance and recorded in the transaction ledger.\n\n"
-
-        "💳 <b>6. PAYMENT DETAILS (INSIDE WITHDRAWAL)</b>\n"
-        "Payment details are now managed directly from 💸 Withdrawal. You do not need a separate Bank Details menu. The first time you withdraw, the bot will ask you to choose your crypto exchange/wallet and submit the required payment ID or wallet details.\n"
-        "• If payment details are already saved, Withdrawal will show the saved destination and ask whether you want to use it or change it.\n"
-        "• If you choose to change it, submit the new details and wait for admin approval.\n"
-        "• For USDT withdrawals, make sure the destination details are correct before requesting payment.\n\n"
-
-        "📤 <b>7. SUBMIT WORK</b>\n"
-        "Use Submit Work to send completed digital work according to the available work categories and instructions. Submit the required information or files, then wait for the team to review the submission. Approved work is recorded in your account.\n\n"
-
-        "📜 <b>8. HISTORY</b>\n"
-        "History shows your recorded transactions/activity so you can check previous wallet movements and relevant references.\n\n"
-
-        "💸 <b>9. WITHDRAWAL</b>\n"
-        "• Tap 💸 Withdrawal.\n"
-        "• If you have no saved payment details, the bot will ask you to set them up immediately.\n"
-        "• If details are already saved, the bot will show them and ask whether you want to use them or change them.\n"
-        "• After choosing the payment destination, enter the withdrawal amount.\n"
-        "• The minimum withdrawal is shown before submission.\n"
-        "• After submitting, the request becomes <b>PENDING</b> until the team reviews it.\n\n"
-
-        "🛒 <b>10. BUY OR SELL MAIL</b>\n"
-        "Open this section to view the currently configured mail buying/selling options. Follow the exact instructions shown for the selected option and submit any required details.\n\n"
-
-        "🔄 <b>11. REFRESH</b>\n"
-        "Use 🔄 Refresh if a screen gets stuck, an old step remains active, or you want to reset the current session. Refresh does not create an order or change your balance; it simply clears the active conversation state and rebuilds the menu.\n\n"
-
-        "🔙 <b>12. BACK</b>\n"
-        "Use 🔙 Back to leave the current flow and return to the main menu.\n\n"
-
-        "⚠️ <b>IMPORTANT</b>\n"
-        "• Never share your Telegram login code, password or private recovery information with anyone.\n"
-        "• Check the amount and destination before confirming any financial action.\n"
-        "• If something looks wrong, stop and contact Support rather than repeating a payment.\n"
-        "• During maintenance, some services may temporarily be unavailable. Follow the maintenance message and try again later.\n\n"
-        "💙 Thank you for using Mobile Business Hub."
-    )
-    clear_state(m.chat.id)
-    # Manual must never fall through to the generic "Something went wrong"
-    # message because of an optional link, Telegram HTML parsing, or a
-    # configuration value. Try the rich version first, then safely fall back
-    # to plain text while keeping the full guide available.
-    try:
-        bot.send_message(
-            m.chat.id,
-            text,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-            reply_markup=back_kb(),
-        )
-    except Exception:
-        logger.exception("Rich Manual delivery failed for chat %s; using plain-text fallback", m.chat.id)
-        plain_text = html.unescape(re.sub(r"<[^>]+>", "", text))
-        try:
-            bot.send_message(
-                m.chat.id,
-                plain_text,
-                disable_web_page_preview=True,
-                reply_markup=back_kb(),
-            )
-        except Exception:
-            logger.exception("Plain-text Manual delivery also failed for chat %s", m.chat.id)
-            raise
-
-
 # ================================================================
 # MY ACCOUNT — PROFILE + BALANCE + REFERRAL SUMMARY
 # ================================================================
+
+def _safe_referral_link(user_id):
+    """Build a valid Telegram referral link, or return an empty string.
+
+    An empty BOT_LINK used to produce values such as `?start=123`, which
+    Telegram rejects as an invalid inline-button URL and surfaced to users
+    as the unhelpful generic "Something went wrong" message.
+    """
+    base = (BOT_LINK or "").strip().rstrip("/")
+    if base.startswith("https://t.me/") or base.startswith("http://t.me/"):
+        return base + ("&" if "?" in base else "?") + f"start={user_id}"
+    try:
+        me = bot.get_me()
+        username = getattr(me, "username", None)
+        if username:
+            return f"https://t.me/{username}?start={user_id}"
+    except Exception:
+        logger.exception("Could not resolve bot username for referral link")
+    return ""
+
 
 @bot.message_handler(func=lambda m: m.text == btn_label("account"))
 @safe_handler
@@ -2958,7 +2897,7 @@ def show_my_account(m):
 
     w = get_wallet(m.chat.id)
     sub_counts = count_submissions_by_status(m.chat.id)
-    referral_link = f"{BOT_LINK}?start={m.chat.id}"
+    referral_link = _safe_referral_link(m.chat.id)
     referral_status = (
         f"🎁 Referral Reward: {fmt_amount(get_referral_amount('usdt'), 'usdt')} USDT per successful referral"
         if is_referral_enabled() else
@@ -2978,15 +2917,14 @@ def show_my_account(m):
         f"👤 Invited: {w['ref_count']} users\n"
         f"🪙 Earned: {w['ref_usdt']:.6f} USDT\n"
         f"{referral_status}\n\n"
-        f"🔗 <b>Your Referral Link</b>\n<code>{html.escape(referral_link)}</code>\n\n"
+        f"🔗 <b>Your Referral Link</b>\n<code>{html.escape(referral_link or 'Not available yet — please try again shortly.')}</code>\n\n"
         "Use the buttons below to manage your account."
     )
 
     kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.row(
-        types.InlineKeyboardButton("🎁 Referral Link", url=referral_link),
-        types.InlineKeyboardButton("💸 Withdraw", callback_data="withdraw_usdt"),
-    )
+    if is_feature_enabled("referrals", m.chat.id) and referral_link:
+        kb.row(types.InlineKeyboardButton("🎁 Referral Link", url=referral_link))
+    kb.row(types.InlineKeyboardButton("💸 Withdraw", callback_data="withdraw_usdt"))
     bot.send_message(m.chat.id, text, parse_mode="HTML", reply_markup=kb)
 
 
@@ -3014,6 +2952,8 @@ def show_referrals(m):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("refpay_"))
 @safe_handler
 def process_ref_payment(c):
+    if not is_feature_enabled("referrals", c.from_user.id):
+        return bot.answer_callback_query(c.id, "Referral rewards are currently unavailable.", show_alert=True)
     _, currency, referred_user_id = c.data.split("_", 2)
     if currency != "usdt":
         return bot.answer_callback_query(c.id, "Only USDT referral rewards are supported.", show_alert=True)
@@ -3085,7 +3025,7 @@ def show_withdraw_menu(m):
 
 
 def _show_withdraw_payment_setup(chat_id):
-    if not is_feature_enabled("withdrawal_payment_details", chat_id) or not is_feature_enabled("bank_details", chat_id):
+    if not is_feature_enabled("withdrawal_payment_details", chat_id):
         bot.send_message(chat_id, "🚫 Withdrawal payment-details setup is currently unavailable. Please contact Support.", reply_markup=main_menu(chat_id))
         return
     methods = list_withdrawal_methods(active_only=True)
@@ -6260,7 +6200,13 @@ def admin_custom_handle_delete_cb(c):
 
 
 def _handle_custom_handle_input(m, state):
-    _finish_custom_handle_forward(m, state["handle_id"], complaint_text=m.text.strip())
+    handle_id = state.get("handle_id")
+    handle = get_custom_handle(handle_id)
+    key = f"custom_handle:{handle_id}"
+    if handle is None or not bool(handle["active"]) or not is_feature_enabled(key, m.chat.id):
+        clear_state(m.chat.id)
+        return bot.send_message(m.chat.id, "🚫 This handle is currently unavailable.", reply_markup=main_menu(m.chat.id))
+    _finish_custom_handle_forward(m, handle_id, complaint_text=m.text.strip())
 
 
 def _finish_custom_handle_forward(m, handle_id, complaint_text=None, media_type=None, file_id=None):
@@ -6804,15 +6750,29 @@ def receive_media(m):
     flow = state.get("flow")
 
     if flow == "fund_wallet" and state.get("step") == "proof":
+        if not is_feature_enabled("fund_wallet", m.chat.id):
+            clear_state(m.chat.id)
+            return bot.send_message(m.chat.id, "🚫 Fund Wallet is currently unavailable.", reply_markup=main_menu(m.chat.id))
         if m.content_type != "photo":
             bot.send_message(m.chat.id, "📸 Please send the payment receipt as a photo/screenshot only.", reply_markup=back_kb())
         else:
             fund_proof_photo(m)
     elif flow == "work" and state.get("sub_type"):
+        if not is_feature_enabled("submit_work", m.chat.id):
+            clear_state(m.chat.id)
+            return bot.send_message(m.chat.id, "🚫 Submit Work is currently unavailable.", reply_markup=main_menu(m.chat.id))
         _receive_work_proof(m, state)
     elif flow == "support":
+        if not is_feature_enabled("support", m.chat.id):
+            clear_state(m.chat.id)
+            return bot.send_message(m.chat.id, "🚫 Support is currently unavailable.", reply_markup=main_menu(m.chat.id))
         _finish_support_ticket(m, complaint_text=None, media_type=m.content_type, file_id=_extract_file_id(m))
     elif flow == "custom_handle_input":
+        handle = get_custom_handle(state.get("handle_id"))
+        key = f"custom_handle:{state.get('handle_id')}"
+        if handle is None or not bool(handle["active"]) or not is_feature_enabled(key, m.chat.id):
+            clear_state(m.chat.id)
+            return bot.send_message(m.chat.id, "🚫 This handle is currently unavailable.", reply_markup=main_menu(m.chat.id))
         _finish_custom_handle_forward(m, state["handle_id"], complaint_text=None, media_type=m.content_type, file_id=_extract_file_id(m))
     # else: not in a flow that accepts media — silently ignore.
 
@@ -7050,7 +7010,7 @@ def _list_kb(items):
 @bot.message_handler(func=lambda m: m.text == btn_label("bank_details"))
 @safe_handler
 def bank_menu(m):
-    if not is_feature_enabled("bank_details", m.chat.id) or not is_feature_enabled("withdrawal_payment_details", m.chat.id):
+    if not is_feature_enabled("withdrawal_payment_details", m.chat.id):
         bot.send_message(m.chat.id, "🚫 Withdrawal payment-details setup is currently unavailable. Please contact Support.", reply_markup=main_menu(m.chat.id))
         return
     # Backwards compatibility for an old/custom keyboard. Payment details
@@ -7310,6 +7270,8 @@ def fund_wallet_menu(m):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("fund_method:"))
 @safe_handler
 def fund_method_cb(c):
+    if not is_feature_enabled("fund_wallet", c.from_user.id):
+        return bot.answer_callback_query(c.id, "Fund Wallet is currently unavailable.", show_alert=True)
     method_id = c.data.split(":", 1)[1]
     row = get_fund_method(method_id)
     if not row or not int(row['active']):
@@ -7352,6 +7314,9 @@ def _handle_fund_amount(m, state):
 @bot.message_handler(content_types=["photo"], func=lambda m: get_state(m.chat.id).get("flow") == "fund_wallet" and get_state(m.chat.id).get("step") == "proof")
 @safe_handler
 def fund_proof_photo(m):
+    if not is_feature_enabled("fund_wallet", m.chat.id):
+        clear_state(m.chat.id)
+        return bot.send_message(m.chat.id, "🚫 Fund Wallet is currently unavailable.", reply_markup=main_menu(m.chat.id))
     state = get_state(m.chat.id)
     row = get_fund_method(state.get('fund_method_id'))
     if not row:
@@ -7391,6 +7356,9 @@ def fund_proof_photo(m):
 @bot.message_handler(func=lambda m: get_state(m.chat.id).get("flow") == "fund_wallet" and get_state(m.chat.id).get("step") == "proof")
 @safe_handler
 def fund_proof_text_block(m):
+    if not is_feature_enabled("fund_wallet", m.chat.id):
+        clear_state(m.chat.id)
+        return bot.send_message(m.chat.id, "🚫 Fund Wallet is currently unavailable.", reply_markup=main_menu(m.chat.id))
     bot.send_message(m.chat.id, "📸 Please send the payment receipt as a photo/screenshot only.", reply_markup=back_kb())
 
 
@@ -8319,22 +8287,42 @@ def _otp_update_message(chat_id,message_id,text,kb):
         if 'message is not modified' not in str(exc).lower(): logger.warning('OTP UI update failed: %s',exc)
 
 def _otp_waiting_text(o,remaining,manual_remaining):
-    a=max(0,int(remaining)); m=max(0,int(manual_remaining));
-    return (f'📱 <b>QUICK OTP • MOBILE BUSINESS HUB</b>\n\n'
-            f'{_otp_service_emoji(o.get("service_name") or o.get("service_code"))} Service: <b>{html.escape(str(o.get("service_name") or o.get("service_code")))}</b>\n'
-            f'🌍 Country: <b>{html.escape(str(o["country_name"]))}</b>\n'
-            f'📞 Number: <code>{html.escape(str(o["phone_number"]))}</code>\n'
-            f'💰 Price: <b>{float(o["selling_price"]):.2f} USDT</b>\n'
-            f'🧾 Order ID: <code>{o["order_id"]}</code>\n\n'
-            f'🔐 <b>Waiting for your OTP…</b>\n'
-            f'⏱ Auto cancel: <b>{a//60:02d}:{a%60:02d}</b>\n'
-            f'✋ Cancel available in: <b>{m//60:02d}:{m%60:02d}</b>\n\n'
-            f'💳 Balance: <b>{_otp_balance(o["user_id"]):.2f} USDT</b>\n━━━━━━━━━━━━━━\n'
-            f'💡 Keep this screen open. Your OTP will appear here automatically.')
+    # Compact OTP waiting screen. Only the phone number is copyable; the
+    # country code is displayed as normal text so Telegram does not create
+    # a second copyable item.
+    a=max(0,int(remaining));
+    return (f'╭───────────────╮\n'
+            f'   📱 <b>QUICK OTP</b>\n'
+            f'╰───────────────╯\n\n'
+            f'🌎 Country Code: {html.escape(str(o.get("country_code") or ""))}\n'
+            f'🪙 Price: ${float(o.get("selling_price") or 0):.2f}\n\n'
+            f'{_otp_service_emoji(o.get("service_name") or o.get("service_code"))} <b>{html.escape(str(o.get("service_name") or o.get("service_code")))}</b> • {html.escape(str(o.get("country_name")))}\n\n'
+            f'📞 Phone Number\n'
+            f'<code>{html.escape(str(o["phone_number"]))}</code>\n\n'
+            f'⏳ <b>Waiting for OTP…</b>\n\n'
+            f'⏱ Auto Cancel: {a//60:02d}:{a%60:02d}')
+
+def _otp_received_update_text(o):
+    # Edit the existing waiting message in place. The OTP and phone number
+    # remain together in this single message; no second OTP message is sent.
+    return (f'╭───────────────╮\n'
+            f'   📱 <b>QUICK OTP</b>\n'
+            f'╰───────────────╯\n\n'
+            f'🌎 Country Code: {html.escape(str(o.get("country_code") or ""))}\n'
+            f'🪙 Price: ${float(o.get("selling_price") or 0):.2f}\n\n'
+            f'{_otp_service_emoji(o.get("service_name") or o.get("service_code"))} <b>{html.escape(str(o.get("service_name") or o.get("service_code")))}</b> • {html.escape(str(o.get("country_name")))}\n\n'
+            f'📞 Phone Number\n'
+            f'<code>{html.escape(str(o["phone_number"]))}</code>\n\n'
+            f'✅ <b>OTP RECEIVED</b>\n\n'
+            f'🔐 <b>OTP: {html.escape(str(o.get("otp_code") or o.get("otp") or ""))}</b>\n'
+            f'📱 The OTP for {html.escape(str(o["phone_number"]))} is {html.escape(str(o.get("otp_code") or o.get("otp") or ""))}')
 
 def _otp_kb(order_id,service_code,country_code,manual_remaining):
+    # Get New Number always stays available and means: release the current
+    # activation (if still waiting), then request another number for the SAME
+    # service + country. Cancel remains subject to the 5-minute manual window.
     label=f'✋ Cancel available {manual_remaining//60:02d}:{manual_remaining%60:02d}' if manual_remaining>0 else '❌ Cancel'
-    return types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{service_code}:{country_code}')).add(types.InlineKeyboardButton(label,callback_data=f'otp_cancel:{order_id}'))
+    return types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{order_id}')).add(types.InlineKeyboardButton(label,callback_data=f'otp_cancel:{order_id}'))
 
 def _otp_create_activation(user_id,service_code,country_code,source_chat_id):
     try: otp_sync_service_stock(service_code)
@@ -8490,12 +8478,42 @@ def otp_buy_cb(c):
 def otp_new_cb(c):
     if not is_feature_enabled("quick_otp", c.from_user.id):
         return bot.answer_callback_query(c.id, "Quick OTP is currently unavailable.", show_alert=True)
-    _,service,code=c.data.split(':',2); bot.answer_callback_query(c.id,'Getting a new number…')
+    order_id=c.data.split(':',1)[1]
+    old=fetchone('SELECT * FROM otp_orders WHERE order_id=? AND user_id=?',(order_id,str(c.from_user.id)))
+    if not old:
+        return bot.answer_callback_query(c.id,'This OTP request is no longer available.',show_alert=True)
+    service,code=old['service_code'],old['country_code']
+
+    # If the current activation is still waiting, release it first. Grizzly
+    # supports early cancellation; this lets Get New Number work immediately
+    # instead of waiting for the 5-minute manual-cancel window or the 20-minute
+    # automatic expiry. The old activation is refunded before a new purchase.
+    if old['status']=='waiting':
+        try:
+            r=_otp_http('setStatus',id=old['activation_id'],status='8')
+        except Exception:
+            return bot.answer_callback_query(c.id,'Unable to release the current number. Please try again.',show_alert=True)
+        if r.get('raw') not in {'ACCESS_CANCEL','STATUS_CANCEL','NO_ACTIVATION'}:
+            return bot.answer_callback_query(c.id,'Grizzly has not released the current number yet. Please try again.',show_alert=True)
+        with db_tx() as conn:
+            cur=conn.execute('SELECT * FROM otp_orders WHERE order_id=? AND status="waiting" AND refunded=0',(order_id,)).fetchone()
+            if cur:
+                adjust_balance(conn,cur['user_id'],'usdt',float(cur['selling_price']),'OTP_REFUND',reason=f'Quick OTP replace number {order_id}',related_txn=order_id,processed_by=cur['user_id'])
+                conn.execute('UPDATE otp_orders SET status="cancelled",refunded=1,updated_at=? WHERE order_id=?',(_otp_now(),order_id))
+
+    bot.answer_callback_query(c.id,'Getting a new number…')
     result,msg=_otp_create_activation(c.from_user.id,service,code,c.message.chat.id)
-    if not result: return bot.send_message(c.message.chat.id,msg,parse_mode='HTML')
+    if not result:
+        # The old activation was already released/refunded, so report the
+        # failure without charging the user again.
+        return bot.answer_callback_query(c.id, str(msg)[:190], show_alert=True)
+
+    # Reuse the SAME Telegram message for the new number instead of creating
+    # another waiting message. This keeps the OTP screen clean.
     text=_otp_waiting_text(dict(result),1200,300)
-    sent=bot.send_message(c.message.chat.id,text,parse_mode='HTML',reply_markup=_otp_kb(result['order_id'],service,code,300))
-    with db_tx() as conn: conn.execute('UPDATE otp_orders SET chat_id=?,message_id=?,updated_at=? WHERE order_id=?',(str(sent.chat.id),sent.message_id,_otp_now(),result['order_id']))
+    _otp_update_message(c.message.chat.id,c.message.message_id,text,_otp_kb(result['order_id'],service,code,300))
+    with db_tx() as conn:
+        conn.execute('UPDATE otp_orders SET chat_id=?,message_id=?,updated_at=? WHERE order_id=?',(str(c.message.chat.id),c.message.message_id,_otp_now(),result['order_id']))
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_cancel:'))
 @safe_handler
@@ -8884,10 +8902,16 @@ def _otp_worker():
                             if cur:
                                 conn.execute('UPDATE otp_orders SET status="completed",otp_code=?,updated_at=? WHERE order_id=?',(otp,_otp_now(),o['order_id']))
                                 conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",(str(cur['user_id']),"OTP_COMPLETED",str(cur['user_id']),cur['selling_price'],o['order_id'],f'service={cur["service_code"]}; country={cur["country_name"]}',_otp_now()))
-                        try: bot.delete_message(o['chat_id'],o['message_id'])
-                        except Exception: pass
-                        kb=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{o["service_code"]}:{o["country_code"]}'))
-                        bot.send_message(o['user_id'],f'🔐 <b>OTP RECEIVED</b>\n\n{html.escape(str(o["service_name"] or o["service_code"]))} • {html.escape(str(o["country_name"]))}\n🧾 Order: <code>{o["order_id"]}</code>\n🔑 OTP: <code>{html.escape(str(otp))}</code>\n\n✅ Activation completed.',parse_mode='HTML',reply_markup=kb)
+                        # Update the existing waiting message in place. Do NOT send
+                        # a second OTP message: the phone number and OTP stay together.
+                        try:
+                            updated_order=dict(o)
+                            updated_order['phone_number']=cur['phone_number'] or o['phone_number']
+                            updated_order['otp_code']=otp
+                            kb=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{o["order_id"]}'))
+                            _otp_update_message(o['chat_id'],o['message_id'],_otp_received_update_text(updated_order),kb)
+                        except Exception as exc:
+                            logger.warning('OTP received UI update failed: %s',exc)
                     elif r.get('raw') in {'STATUS_CANCEL','NO_ACTIVATION'}:
                         with db_tx() as conn:
                             cur=conn.execute('SELECT * FROM otp_orders WHERE order_id=? AND status="waiting" AND refunded=0',(o['order_id'],)).fetchone()
@@ -8928,8 +8952,12 @@ def generic_state_router(m):
     if handler is None:
         bot.send_message(
             m.chat.id,
-            "❌ Please use the buttons/menu to continue.\n\n"
-            "Your message was not processed — nothing has been sent or changed.",
+            "⚠️ <b>Please choose one option at a time.</b>\n\n"
+            "The previous selection is no longer active. Please tap the option you want from the current menu. "
+            "If two buttons were pressed together, wait a moment and choose only one.\n\n"
+            "Nothing was sent or changed.",
+            parse_mode="HTML",
+            reply_markup=main_menu(m.chat.id),
         )
         return
     handler(m, state)
