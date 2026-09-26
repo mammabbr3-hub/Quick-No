@@ -8290,11 +8290,14 @@ def _otp_parse_single_price(payload, service_code, country_code):
     return cost,count
 
 def otp_sync_service_stock(service_code, country_codes=None):
-    # The current Grizzly docs require country for getPricesV3. The previous
-    # implementation called getPricesV3 with only service, which is why the
-    # provider returned BAD_ACTION and the catalogue stayed empty.
-    try: otp_sync_countries()
-    except Exception as exc: logger.warning('Grizzly country sync failed: %s',exc)
+    # IMPORTANT PERFORMANCE RULE:
+    # Never force a full country catalogue refresh from a user click.
+    # A service can have many countries and each price/stock lookup is an
+    # external Grizzly request. User-facing handlers should either use the
+    # cached DB values or refresh only the requested country.
+    if country_codes is None:
+        try: otp_sync_countries()
+        except Exception as exc: logger.warning('Grizzly country sync failed: %s',exc)
     _otp_ensure_service_countries(service_code)
     if country_codes is None:
         rows=fetchall('SELECT country_code FROM otp_service_countries WHERE service_code=? AND (enabled=1 OR profit_active=1 OR explicit_price IS NOT NULL) ORDER BY name',(service_code,))
@@ -8399,8 +8402,12 @@ def _otp_kb(order_id,service_code,country_code,manual_remaining):
     return types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{order_id}')).add(types.InlineKeyboardButton(label,callback_data=f'otp_cancel:{order_id}'))
 
 def _otp_create_activation(user_id,service_code,country_code,source_chat_id):
-    try: otp_sync_service_stock(service_code)
-    except Exception as exc: logger.warning('OTP service stock refresh failed: %s',exc)
+    # Refresh ONLY the selected country before purchase. The previous code
+    # refreshed every country in the service here, which could make Telegram
+    # appear frozen for several seconds (or longer) on services such as
+    # Telegram.
+    try: otp_sync_service_stock(service_code, [str(country_code)])
+    except Exception as exc: logger.warning('OTP selected-country refresh failed: %s',exc)
     row=fetchone('SELECT * FROM otp_service_countries WHERE service_code=? AND country_code=? AND enabled=1 AND profit_active=1',(service_code,str(country_code)))
     if not row: return None,'This service/country is no longer available.'
     if int(row['available_count'] or 0)<=0: return None,'❌ No number is currently available for this service and country.'
@@ -8464,13 +8471,50 @@ def otp_services_page_cb(c):
         return bot.answer_callback_query(c.id, "Quick OTP is currently unavailable.", show_alert=True)
     bot.answer_callback_query(c.id); _otp_show_services(c.message.chat.id,int(c.data.split(':',1)[1]),edit=c.message.message_id)
 
+_OTP_CATALOG_REFRESH_LOCK = threading.Lock()
+_OTP_CATALOG_REFRESH_AT = 0.0
+_OTP_CATALOG_REFRESH_TTL = 60.0
+
+def _otp_refresh_catalog_async():
+    global _OTP_CATALOG_REFRESH_AT
+    if not _OTP_CATALOG_REFRESH_LOCK.acquire(blocking=False):
+        return
+    def worker():
+        global _OTP_CATALOG_REFRESH_AT
+        try:
+            otp_sync_services()
+            _OTP_CATALOG_REFRESH_AT = time.time()
+        except Exception as exc:
+            logger.warning('Background Quick OTP catalogue refresh failed: %s', exc)
+        finally:
+            _OTP_CATALOG_REFRESH_LOCK.release()
+    threading.Thread(target=worker, daemon=True, name='quick-otp-catalog-refresh').start()
+
 @bot.message_handler(func=lambda m: m.text == '📱 Quick OTP')
 @safe_handler
 def otp_entry(m):
     if feature_blocked_message(m,'quick_otp'): return
-    try: otp_sync_services()
-    except Exception as exc: logger.warning('Quick OTP service sync failed: %s',exc)
+    # Show the cached catalogue immediately. Only refresh Grizzly in the
+    # background so the user does not wait on an external API call.
+    service_count=fetchone('SELECT COUNT(*) AS n FROM otp_services WHERE enabled=1')
+    if not service_count or int(service_count['n'] or 0)==0:
+        try: otp_sync_services()
+        except Exception as exc: logger.warning('Initial Quick OTP service sync failed: %s',exc)
+        global _OTP_CATALOG_REFRESH_AT
+        _OTP_CATALOG_REFRESH_AT=time.time()
+    elif time.time()-_OTP_CATALOG_REFRESH_AT >= _OTP_CATALOG_REFRESH_TTL:
+        _otp_refresh_catalog_async()
     _otp_show_services(m.chat.id, 0, edit=None)
+
+def _otp_refresh_service_async(chat_id, message_id, service, svc):
+    def worker():
+        try:
+            otp_sync_service_stock(service)
+            # Update the same message after the live stock refresh completes.
+            _otp_show_countries(chat_id, service, 0, svc, edit=message_id)
+        except Exception as exc:
+            logger.warning('Background OTP service refresh failed for %s: %s', service, exc)
+    threading.Thread(target=worker, daemon=True, name=f'quick-otp-stock-{service}').start()
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_service:'))
 @safe_handler
@@ -8479,9 +8523,12 @@ def otp_service_cb(c):
         return bot.answer_callback_query(c.id, "Quick OTP is currently unavailable.", show_alert=True)
     service=c.data.split(':',1)[1]; svc=fetchone('SELECT * FROM otp_services WHERE service_code=? AND enabled=1',(service,))
     if not svc: return bot.answer_callback_query(c.id,'Service unavailable.',show_alert=True)
-    try: otp_sync_service_stock(service)
-    except Exception as exc: logger.warning('OTP service refresh failed: %s',exc)
-    _otp_show_countries(c.message.chat.id, service, 0, svc, edit=c.message.message_id); bot.answer_callback_query(c.id)
+    # Acknowledge the Telegram click FIRST, then render cached countries.
+    # Live Grizzly stock refresh runs in the background instead of blocking
+    # the callback for every country in the service.
+    bot.answer_callback_query(c.id,'Please wait…')
+    _otp_show_countries(c.message.chat.id, service, 0, svc, edit=c.message.message_id)
+    _otp_refresh_service_async(c.message.chat.id, c.message.message_id, service, svc)
 
 def _otp_show_countries(chat_id, service, page, svc, edit=None):
     per=20; page=max(0,int(page))
@@ -8512,9 +8559,11 @@ def otp_countries_page_cb(c):
         return bot.answer_callback_query(c.id, "Quick OTP is currently unavailable.", show_alert=True)
     _,service,page=c.data.split(':',2); svc=fetchone('SELECT service_name,emoji FROM otp_services WHERE service_code=? AND enabled=1',(service,))
     if not svc: return bot.answer_callback_query(c.id,'Service unavailable.',show_alert=True)
-    try: otp_sync_service_stock(service)
-    except Exception as exc: logger.warning('OTP country refresh failed for %s: %s',service,exc)
-    _otp_show_countries(c.message.chat.id,service,int(page),svc,edit=c.message.message_id); bot.answer_callback_query(c.id)
+    # Pagination uses the cached catalogue immediately. A live service refresh
+    # is already running from the service-selection step, so never block a
+    # Telegram callback by refreshing every country again.
+    bot.answer_callback_query(c.id,'Please wait…')
+    _otp_show_countries(c.message.chat.id,service,int(page),svc,edit=c.message.message_id)
 
 @bot.callback_query_handler(func=lambda c: c.data=='otp_services_back')
 @safe_handler
