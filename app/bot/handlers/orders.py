@@ -3,6 +3,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram import Bot
 from sqlalchemy import select
 from decimal import Decimal
+from datetime import datetime, timezone, timedelta
 import json
 from app.db.session import SessionLocal
 from app.db.models import User, Country, Order, Wallet, MaintenanceState, OrderEvent
@@ -12,6 +13,8 @@ from app.services.access import allowed
 from app.grizzly.client import GrizzlyClient, GrizzlyTransportError
 
 router = Router()
+MANUAL_CANCEL_WINDOW = timedelta(minutes=5)
+AUTO_CANCEL_TIMEOUT = timedelta(minutes=20)
 
 @router.message(F.text == '📱 Buy WhatsApp OTP')
 async def buy(m: Message):
@@ -59,6 +62,95 @@ async def buy_back(c: CallbackQuery, bot: Bot):
             return await c.answer(msg, show_alert=True)
     await c.message.edit_text('📱 Tap <b>Buy WhatsApp OTP</b> from the main menu to choose a country.', parse_mode='HTML')
     await c.answer()
+
+async def _direct_new_number(c: CallbackQuery, bot: Bot, cid: int):
+    """Purchase another activation for the same country at the CURRENT selling price."""
+    client = GrizzlyClient()
+    async with SessionLocal() as s:
+        u = await s.scalar(select(User).where(User.telegram_id == c.from_user.id).with_for_update())
+        ok, msg = await allowed(bot, s, u, financial=True)
+        if not ok:
+            return None, msg
+        row = await s.scalar(select(Country).where(Country.id == cid, Country.enabled.is_(True)))
+        maint = await s.scalar(select(MaintenanceState).where(MaintenanceState.id == 1))
+        if not u or not row:
+            return None, 'This country is no longer available.'
+        if u.is_blocked:
+            return None, '🚫 Your account is blocked.'
+        if maint and maint.enabled:
+            return None, f'🔧 {maint.message}'
+        price = selling_price(row)
+        if price is None:
+            return None, 'This country is currently unavailable.'
+        wallet = await s.scalar(select(Wallet).where(Wallet.user_id == u.id).with_for_update())
+        if not wallet or Decimal(wallet.balance) < price:
+            return None, '💰 Insufficient balance.'
+        order = await create_order(s, u.id, row, price)
+        await s.commit()
+        order_id = order.id
+        public_id = order.order_id
+        configured_cost = Decimal(row.grizzly_cost) if row.grizzly_cost is not None else None
+        service_code, country_code = row.service_code, row.code
+        country_name, country_flag = row.name, row.flag
+
+    try:
+        result = await client.get_number(service_code, country_code, max_price=configured_cost)
+    except GrizzlyTransportError:
+        async with SessionLocal() as s:
+            order = await s.scalar(select(Order).where(Order.id == order_id).with_for_update())
+            if order and order.status == 'processing':
+                order.status = 'manual_reconciliation'
+                s.add(OrderEvent(order_id=order.id, event_type='manual_reconciliation', data='{\"reason\":\"grizzly_transport_unknown\"}'))
+                await s.commit()
+        return None, f'⚠️ Grizzly did not confirm the request. Order <code>{public_id}</code> is under safe reconciliation; balance was not auto-refunded.'
+    except Exception:
+        result = {'status': 'error', 'error': 'API_ERROR'}
+
+    async with SessionLocal() as s:
+        order = await s.scalar(select(Order).where(Order.id == order_id).with_for_update())
+        if not order:
+            return None, 'Order reconciliation error. Please contact Support.'
+        if result.get('status') != 'ok':
+            await refund_order(s, order)
+            await s.commit()
+            return None, '❌ No number is currently available. Your funds were refunded.'
+        order.activation_id = result['activation_id']
+        order.phone_number = result['phone_number']
+        actual_cost = result.get('activation_cost') or configured_cost
+        order.raw_cost = actual_cost
+        order.profit = (price - actual_cost) if actual_cost is not None else None
+        order.status = 'waiting_for_otp'
+        await s.commit()
+
+    text = (
+        f'📱 <b>Number received</b>\n\n'
+        f'Order: <code>{public_id}</code>\nCountry: {country_flag} {country_name}\n'
+        f'Phone no: <code>{result["phone_number"]}</code>\nPrice: <b>{price:.2f} USDT</b>\n\n'
+        f'⏳ <b>Waiting for OTP</b>\n⏱ Auto cancel: <b>20:00</b>\n✋ Manual cancel: <b>05:00</b>'
+    )
+    sent = await c.message.answer(text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text='🆕 Get New Number', callback_data=f'get_new:{cid}')
+    ]]))
+    async with SessionLocal() as s:
+        s.add(OrderEvent(order_id=order_id, event_type='waiting_ui', data=json.dumps({'chat_id': sent.chat.id, 'message_id': sent.message_id, 'country_id': cid})))
+        await s.commit()
+    return True, None
+
+@router.callback_query(F.data.startswith('get_new:'))
+async def get_new_number(c: CallbackQuery, bot: Bot):
+    raw = c.data.split(':', 1)[1]
+    async with SessionLocal() as s:
+        if raw.isdigit():
+            cid = int(raw)
+        else:
+            cid = await s.scalar(select(Country.id).where(Country.code == raw, Country.service_code == 'wa', Country.enabled.is_(True)))
+    if cid is None:
+        return await c.answer('This country is no longer available.', show_alert=True)
+    await c.answer('Getting a new number…')
+    ok, msg = await _direct_new_number(c, bot, cid)
+    if ok:
+        return
+    await c.message.answer(msg or 'Unable to get a new number.', parse_mode='HTML')
 
 @router.callback_query(F.data.startswith('buy:'))
 async def confirm_buy(c: CallbackQuery, bot: Bot):
@@ -134,16 +226,15 @@ async def confirm_buy(c: CallbackQuery, bot: Bot):
         f'📱 <b>Number received</b>\n\n'
         f'Order: <code>{public_id}</code>\n'
         f'Country: {country_flag} {country_name}\n'
-        f'Number: <code>{result["phone_number"]}</code>\n'
+        f'Phone no: <code>{result["phone_number"]}</code>\n'
         f'Price: <b>{price:.2f} USDT</b>\n\n'
         f'⏳ <b>Waiting for OTP</b>\n'
-        f'⏱ Time remaining: <b>20:00</b>\n\n'
-        f'You can buy another number from the same country while this one is waiting.'
+        f'⏱ Auto cancel: <b>20:00</b>\n✋ Manual cancel: <b>05:00</b>\n\n'
     )
     sent = await c.message.edit_text(
         waiting_text, parse_mode='HTML',
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text='❌ Cancel & Refund', callback_data=f'cancel_order:{order_id}')
+            InlineKeyboardButton(text='🆕 Get New Number', callback_data=f'get_new:{cid}')
         ]])
     )
     async with SessionLocal() as s:
@@ -152,10 +243,54 @@ async def confirm_buy(c: CallbackQuery, bot: Bot):
             ev = await s.scalar(select(OrderEvent).where(
                 OrderEvent.order_id == order_id, OrderEvent.event_type == 'waiting_ui'
             ).order_by(OrderEvent.created_at.desc()))
-            data = json.dumps({'chat_id': sent.chat.id, 'message_id': sent.message_id})
+            data = json.dumps({'chat_id': sent.chat.id, 'message_id': sent.message_id, 'country_id': cid})
             if ev: ev.data = data
             else: s.add(OrderEvent(order_id=order_id, event_type='waiting_ui', data=data))
             await s.commit()
+
+@router.callback_query(F.data.startswith('cancel_ask:'))
+async def cancel_ask(c: CallbackQuery, bot: Bot):
+    oid = int(c.data.split(':', 1)[1])
+    async with SessionLocal() as s:
+        u = await s.scalar(select(User).where(User.telegram_id == c.from_user.id))
+        ok, msg = await allowed(bot, s, u, financial=True)
+        if not ok:
+            return await c.answer(msg, show_alert=True)
+        o = await s.scalar(select(Order).where(Order.id == oid, Order.user_id == u.id))
+        if not o or o.status != 'waiting_for_otp':
+            return await c.answer('This order is no longer cancellable.', show_alert=True)
+        started = o.updated_at or o.created_at
+        if started and datetime.now(timezone.utc) - started < MANUAL_CANCEL_WINDOW:
+            left = MANUAL_CANCEL_WINDOW - (datetime.now(timezone.utc) - started)
+            secs = max(0, int(left.total_seconds()))
+            mm, ss = divmod(secs, 60)
+            return await c.answer(f'⏱ Cancel will be available in {mm:02d}:{ss:02d}.', show_alert=True)
+    await c.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text='✅ Yes, Cancel', callback_data=f'cancel_order:{oid}')
+    ],[
+        InlineKeyboardButton(text='↩️ Keep Waiting', callback_data=f'cancel_back:{oid}')
+    ]]))
+    await c.answer('Confirm cancellation.', show_alert=True)
+
+@router.callback_query(F.data.startswith('cancel_back:'))
+async def cancel_back(c: CallbackQuery, bot: Bot):
+    oid = int(c.data.split(':', 1)[1])
+    async with SessionLocal() as s:
+        u = await s.scalar(select(User).where(User.telegram_id == c.from_user.id))
+        ok, msg = await allowed(bot, s, u, financial=True)
+        if not ok:
+            return await c.answer(msg, show_alert=True)
+        o = await s.scalar(select(Order).where(Order.id == oid, Order.user_id == u.id))
+        if not o or o.status != 'waiting_for_otp':
+            return await c.answer('This order is no longer waiting.', show_alert=True)
+        cid = await s.scalar(select(Country.id).where(Country.code == o.country_code, Country.service_code == 'wa', Country.enabled.is_(True)))
+    if cid is None:
+        return await c.answer('Country is no longer available.', show_alert=True)
+    await c.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text='🆕 Get New Number', callback_data=f'get_new:{cid}'),
+        InlineKeyboardButton(text='❌ Cancel', callback_data=f'cancel_ask:{oid}')
+    ]]))
+    await c.answer('Order is still waiting for OTP.')
 
 @router.callback_query(F.data.startswith('cancel_order:'))
 async def cancel_order(c: CallbackQuery, bot: Bot):
@@ -170,6 +305,12 @@ async def cancel_order(c: CallbackQuery, bot: Bot):
         if not o: return await c.answer('Order not found.', show_alert=True)
         if o.status != 'waiting_for_otp' or not o.activation_id:
             return await c.answer('This order is no longer cancellable.', show_alert=True)
+        started = o.updated_at or o.created_at
+        if started and datetime.now(timezone.utc) - started < MANUAL_CANCEL_WINDOW:
+            left = MANUAL_CANCEL_WINDOW - (datetime.now(timezone.utc) - started)
+            secs = max(0, int(left.total_seconds()))
+            mm, ss = divmod(secs, 60)
+            return await c.answer(f'⏱ Cancel will be available in {mm:02d}:{ss:02d}.', show_alert=True)
         activation_id = o.activation_id
     try:
         result = await client.set_status(activation_id, 8)
