@@ -75,6 +75,7 @@ ADMIN_IDS = {a.strip() for a in _admin_ids_raw.split(",") if a.strip()}
 # Quick OTP / Grizzly integration uses the SAME SQLite database and SAME wallet as Mobile Business Hub.
 GRIZZLY_API_KEY = os.environ.get("GRIZZLY_API_KEY", "").strip()
 GRIZZLY_BASE_URL = os.environ.get("GRIZZLY_BASE_URL", "https://api.grizzlysms.com/stubs/handler_api.php").strip()
+GRIZZLY_OPERATOR = os.environ.get("GRIZZLY_OPERATOR", "").strip()
 
 # ---------------------------------------------------------------
 # SUPPORT GROUP / APPROVED-WORK CHANNEL
@@ -1678,6 +1679,7 @@ FEATURES = {
 # ---------------------------------------------------------------
 
 BUTTON_LABELS = {
+    "account":       "👤 My Account",
     "profile":       "👤 My Profile",
     "submit_work":   "📤 Submit Work",
     "balance":       "💰 My Balance",
@@ -2441,47 +2443,120 @@ def community_join_check_cb(c):
 # MENUS
 # ================================================================
 
+ADMIN_GROUP_LABELS = {
+    "operations": "📋 Operations",
+    "users": "👥 User Management",
+    "finance": "💰 Finance & Wallet",
+    "system": "🛡️ System Control",
+    "communications": "📣 Communications",
+    "content": "🎨 Content & Menus",
+    "otp": "📱 Quick OTP",
+    "community": "🌐 Community",
+}
+
+
+def _admin_group_keyboard(chat_id, group):
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    groups = {
+        "operations": [
+            ["📋 Pending Approvals", "🔎 Track User"],
+            ["💳 Pending Withdrawals"],
+        ],
+        "users": [
+            ["👥 Users", "📋 Banned Users"],
+            ["🚫 Ban User", "✅ Unban User"],
+            ["➕ Add User", "➕ Add Admin"],
+        ],
+        "finance": [
+            ["➕ Add/Minus Funds", "📊 Total Users Balance"],
+            ["⚙️ Settings", "💳 Fund Wallet Settings"],
+        ],
+        "system": [
+            ["🛠 Feature Control", "🛠 Maintenance Mode"],
+        ],
+        "communications": [
+            ["📢 Broadcast", "✉️ Message User"],
+            ["⏰ Auto Messages"],
+        ],
+        "content": [
+            ["📝 Edit Bot Text", "🧩 Menu Editor"],
+            ["➕ Add Custom Handle", "📋 Manage Custom Handles"],
+        ],
+        "otp": [
+            ["📱 Quick OTP Settings"],
+        ],
+        "community": [
+            ["⚙️ Community Settings"],
+        ],
+    }
+    for row in groups.get(group, []):
+        kb.row(*row)
+    kb.row("🔙 Back")
+    return kb
+
+
+def _user_menu_rows(items):
+    """Arrange user buttons cleanly: short labels in groups of three, longer labels in pairs."""
+    short = [x for x in items if len(x) <= 14]
+    long = [x for x in items if len(x) > 14]
+    rows = []
+    for i in range(0, len(short), 3):
+        rows.append(short[i:i + 3])
+    for i in range(0, len(long), 2):
+        rows.append(long[i:i + 2])
+    return rows
+
+
 def main_menu(chat_id=None):
-    """Professional role-aware keyboard. Super admins control settings;
-    operational admins see day-to-day admin actions only.
-    """
+    """Professional role-aware keyboard with grouped admin controls."""
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     if is_admin(chat_id):
-        kb.row("📋 Pending Approvals", "🔎 Track User")
-        kb.row("🛠 Feature Control")
+        kb.row(ADMIN_GROUP_LABELS["operations"], ADMIN_GROUP_LABELS["users"])
+        kb.row(ADMIN_GROUP_LABELS["finance"])
         if is_super_admin(chat_id):
-            kb.row("🛠 Maintenance Mode")
-        kb.row("📢 Broadcast", "✉️ Message User")
-        kb.row("➕ Add/Minus Funds", "📊 Total Users Balance")
-        kb.row("💳 Pending Withdrawals")
-        kb.row("🚫 Ban User", "✅ Unban User")
-        kb.row("👥 Users", "📋 Banned Users")
-        if is_super_admin(chat_id):
-            kb.row("➕ Add User", "➕ Add Admin")
-            kb.row("🔍 Search")
-            kb.row("⚙️ Settings", "💳 Fund Wallet Settings")
-            kb.row("⚙️ Community Settings")
-            kb.row("📱 Quick OTP Settings")
-            kb.row("⏰ Auto Messages")
-            kb.row("📝 Edit Bot Text", "🧩 Menu Editor")
-            kb.row("➕ Add Custom Handle", "📋 Manage Custom Handles")
-        else:
-            kb.row("🔍 Search")
+            kb.row(ADMIN_GROUP_LABELS["system"], ADMIN_GROUP_LABELS["communications"])
+            kb.row(ADMIN_GROUP_LABELS["content"], ADMIN_GROUP_LABELS["otp"])
+            kb.row(ADMIN_GROUP_LABELS["community"])
+        kb.row("🔍 Search")
     else:
-        # Quick OTP gets the first and most visible row as requested.
+        # Quick OTP is intentionally the only button on the first row.
         kb.row("📱 Quick OTP")
-        kb.row(btn_label("balance"), btn_label("withdraw"))
-        kb.row(btn_label("bank_details"), btn_label("profile"))
-        kb.row(btn_label("submit_work"), btn_label("history"))
-        kb.row("💳 Fund Wallet", btn_label("referrals"))
-        kb.row(btn_label("support"), btn_label("buy_sell_mail"))
+        # Account-related items are intentionally consolidated into one button.
+        # My Account contains profile, balance, and referral information so the
+        # main user keyboard stays compact without removing any functionality.
+        user_labels = [
+            btn_label("account"), btn_label("withdraw"),
+            btn_label("bank_details"), btn_label("submit_work"), btn_label("history"),
+            "💳 Fund Wallet", btn_label("support"),
+            btn_label("buy_sell_mail"),
+        ]
+        for row in _user_menu_rows(user_labels):
+            kb.row(*row)
     try:
-        for pair in _rows_of_two([h["label"] for h in list_custom_handles_for_user(chat_id)]):
-            kb.row(*pair)
+        custom_labels = [h["label"] for h in list_custom_handles_for_user(chat_id)]
+        for row in _user_menu_rows(custom_labels) if not is_admin(chat_id) else _rows_of_two(custom_labels):
+            kb.row(*row)
     except Exception:
         logger.exception("Failed to load custom handles for menu (chat_id=%s)", chat_id)
-    kb.row("🔄 Refresh", "/start")
+    kb.row("🔄 Refresh")
     return kb
+
+
+@bot.message_handler(func=lambda m: m.text in ADMIN_GROUP_LABELS.values() and is_admin(m.chat.id))
+@safe_handler
+def admin_group_menu(m):
+    if not is_admin(m.chat.id):
+        return
+    group = next((k for k, v in ADMIN_GROUP_LABELS.items() if v == m.text), None)
+    if group in {"system", "communications", "content", "otp", "community"} and not is_super_admin(m.chat.id):
+        bot.send_message(m.chat.id, "⛔ Super Admin access required.", reply_markup=main_menu(m.chat.id))
+        return
+    clear_state(m.chat.id)
+    bot.send_message(
+        m.chat.id,
+        f"{ADMIN_GROUP_LABELS[group]}\n\nSelect an option:",
+        reply_markup=_admin_group_keyboard(m.chat.id, group),
+    )
 
 
 def back_kb():
@@ -2577,11 +2652,61 @@ def start(msg):
         msg.chat.id,
         render_text(
             "welcome", _welcome_default,
-            full_name=full_name, brand=BRAND,
-            referral_line=referral_line, referral_link=referral_link,
+            full_name=html.escape(full_name),
+            brand=html.escape(BRAND),
+            referral_line=referral_line,
+            referral_link=html.escape(referral_link),
         ),
+        parse_mode="HTML",
         reply_markup=main_menu(msg.chat.id),
     )
+
+
+# ================================================================
+# MY ACCOUNT — PROFILE + BALANCE + REFERRAL SUMMARY
+# ================================================================
+
+@bot.message_handler(func=lambda m: m.text == btn_label("account"))
+@safe_handler
+def show_my_account(m):
+    """Show the user's profile, wallet balance, and referral summary in one view."""
+    user = get_user(m.chat.id)
+    if user is None:
+        bot.send_message(m.chat.id, "❌ Account not found. Please tap 🔄 Refresh and try again.")
+        return
+
+    w = get_wallet(m.chat.id)
+    sub_counts = count_submissions_by_status(m.chat.id)
+    referral_link = f"{BOT_LINK}?start={m.chat.id}"
+    referral_status = (
+        f"🎁 Referral Reward: {fmt_amount(get_referral_amount('usdt'), 'usdt')} USDT per successful referral"
+        if is_referral_enabled() else
+        "🎁 Referral rewards are currently disabled."
+    )
+
+    text = (
+        "👤 <b>MY ACCOUNT</b>\n\n"
+        f"🆔 User ID: <code>{html.escape(str(user['user_id']))}</code>\n"
+        f"📛 Name: {html.escape(user['name'] or '—')}\n"
+        f"🔗 Username: {display_username(user)}\n\n"
+        "💰 <b>BALANCE</b>\n"
+        f"🪙 USDT: <b>{w['usdt']:.6f}</b> USDT\n"
+        f"📤 Approved Work: {sub_counts['APPROVED']}\n"
+        f"⏳ Pending Work: {sub_counts['PENDING']}\n\n"
+        "👥 <b>REFERRALS</b>\n"
+        f"👤 Invited: {w['ref_count']} users\n"
+        f"🪙 Earned: {w['ref_usdt']:.6f} USDT\n"
+        f"{referral_status}\n\n"
+        f"🔗 <b>Your Referral Link</b>\n<code>{html.escape(referral_link)}</code>\n\n"
+        "Use the buttons below to manage your account."
+    )
+
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        types.InlineKeyboardButton("🎁 Referral Link", url=referral_link),
+        types.InlineKeyboardButton("💸 Withdraw", callback_data="withdraw_usdt"),
+    )
+    bot.send_message(m.chat.id, text, parse_mode="HTML", reply_markup=kb)
 
 
 # ================================================================
@@ -6646,6 +6771,12 @@ CREATE TABLE IF NOT EXISTS otp_countries (
     profit_active INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS otp_grizzly_countries (
+    code TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    flag TEXT NOT NULL DEFAULT '🌍',
+    updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS otp_price_alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     service_code TEXT NOT NULL,
@@ -6733,8 +6864,13 @@ def _otp_http(action, **params):
     if not GRIZZLY_API_KEY:
         raise RuntimeError('GRIZZLY_API_KEY is not configured')
     q={'api_key':GRIZZLY_API_KEY,'action':action,**params}
+    # Current Grizzly documentation exposes operator-aware catalogue/price
+    # endpoints. Keep the operator configurable because accounts can expose
+    # different operator sets; omit it when the account does not require one.
+    if 'operator' not in q and GRIZZLY_OPERATOR:
+        q['operator']=GRIZZLY_OPERATOR
     url=GRIZZLY_BASE_URL+'?'+urllib.parse.urlencode(q)
-    req=urllib.request.Request(url,headers={'User-Agent':os.environ.get('GRIZZLY_USER_AGENT','MobileDigitalHub-QuickOTP/3.0').strip() or 'MobileDigitalHub-QuickOTP/3.0'})
+    req=urllib.request.Request(url,headers={'User-Agent':os.environ.get('GRIZZLY_USER_AGENT','MobileDigitalHub-QuickOTP/4.0').strip() or 'MobileDigitalHub-QuickOTP/4.0'})
     try:
         with urllib.request.urlopen(req,timeout=30) as r:
             body=r.read().decode('utf-8','replace').strip()
@@ -6750,12 +6886,38 @@ def _otp_http(action, **params):
         otp=sms.get('code') or data.get('code') or data.get('otp')
         if activation_id and phone: return {'status':'ok','raw':body,'activation_id':str(activation_id),'phone':str(phone),'cost':cost}
         if otp: return {'status':'ok','raw':body,'otp':str(otp)}
+        # Catalogue/price endpoints legitimately return a plain JSON object
+        # without a status field, so do not classify those as errors.
         return {'status':str(data.get('status') or 'ok').lower(),'raw':body,'data':data}
     if body.startswith('ACCESS_NUMBER:') or body.startswith('ACCESS_NUMBER_V2:'):
         p=body.split(':',2); return {'status':'ok','raw':body,'activation_id':p[1],'phone':p[2]} if len(p)==3 else {'status':'error','raw':body}
     if body.startswith('STATUS_OK:'): return {'status':'ok','raw':body,'otp':body.split(':',1)[1]}
-    if body in {'STATUS_WAIT_CODE','STATUS_WAIT_RETRY','STATUS_CANCEL','NO_ACTIVATION','ACCESS_CANCEL','ACCESS_ACTIVATION'}: return {'status':body,'raw':body}
+    if body in {'STATUS_WAIT_CODE','STATUS_WAIT_RETRY','STATUS_CANCEL','NO_ACTIVATION','ACCESS_CANCEL','ACCESS_CANCEL_ALREADY','ACCESS_ACTIVATION'}: return {'status':body,'raw':body}
     return {'status':'error','raw':body}
+
+def _otp_http_catalog(action, **params):
+    # Grizzly's current docs list getServices/getCountries and the current
+    # price endpoints. Some accounts/endpoints do not require operator while
+    # others expose it. Try the configured operator first, then a documented
+    # numeric operator fallback, then the legacy no-operator form.
+    attempts=[]
+    if GRIZZLY_OPERATOR: attempts.append(GRIZZLY_OPERATOR)
+    attempts.extend(['1', None])
+    seen=set()
+    last=None
+    for op in attempts:
+        if op in seen: continue
+        seen.add(op)
+        try:
+            p=dict(params)
+            if op is not None: p['operator']=op
+            else: p.pop('operator',None)
+            r=_otp_http(action,**p)
+            if r.get('status')!='error': return r
+            last=r
+        except Exception as exc:
+            last=exc
+    raise RuntimeError(f'Grizzly {action} failed: {last}')
 
 def _otp_flag_from_iso(iso):
     iso=(iso or '').upper()
@@ -6812,21 +6974,89 @@ def _otp_service_emoji(name):
         if key in low: return emoji
     return '🧩'
 
+def _otp_parse_country_list(payload):
+    data=payload.get('countries',payload.get('data',payload)) if isinstance(payload,dict) else payload
+    out=[]
+    if isinstance(data,dict):
+        for code,name in data.items():
+            code=str(code)
+            if not code.isdigit(): continue
+            meta=_GRIZZLY_COUNTRY_META.get(code,(str(name or ('Country '+code)),''))
+            cname=str(name or meta[0])
+            iso=meta[1]
+            out.append((code,cname,_otp_flag_from_iso(iso) if iso else '🌍'))
+    elif isinstance(data,list):
+        for node in data:
+            if not isinstance(node,dict): continue
+            code=node.get('code') or node.get('id') or node.get('country')
+            name=node.get('name') or node.get('title')
+            if code is None: continue
+            code=str(code)
+            if not code.isdigit(): continue
+            meta=_GRIZZLY_COUNTRY_META.get(code,(str(name or ('Country '+code)),''))
+            out.append((code,str(name or meta[0]),_otp_flag_from_iso(meta[1]) if meta[1] else '🌍'))
+    return list({c:(c,n,f) for c,n,f in out}.values())
+
+def otp_sync_countries():
+    r=_otp_http_catalog('getCountries')
+    rows=_otp_parse_country_list(r.get('data',r))
+    if not rows: raise RuntimeError(f'Grizzly returned no countries: {r}')
+    with db_tx() as conn:
+        for code,name,flag in rows:
+            conn.execute('INSERT INTO otp_grizzly_countries(code,name,flag,updated_at) VALUES(?,?,?,?) ON CONFLICT(code) DO UPDATE SET name=excluded.name,flag=excluded.flag,updated_at=excluded.updated_at',(code,name,flag,_otp_now()))
+    return len(rows)
+
+def _otp_ensure_service_countries(service_code):
+    rows=fetchall('SELECT code,name,flag FROM otp_grizzly_countries ORDER BY name')
+    if not rows: return 0
+    with db_tx() as conn:
+        for r in rows:
+            conn.execute('INSERT OR IGNORE INTO otp_service_countries(service_code,country_code,name,flag,grizzly_cost,explicit_price,markup_percent,markup_fixed,available_count,enabled,profit_active,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(service_code,r['code'],r['name'],r['flag'],None,None,0,0,0,0,0,_otp_now()))
+    return len(rows)
+
+def _otp_services_from_price_payload(payload):
+    data=payload.get('data',payload) if isinstance(payload,dict) else payload
+    found={}
+    if isinstance(data,dict):
+        for country_node in data.values():
+            if not isinstance(country_node,dict): continue
+            for code,node in country_node.items():
+                if not isinstance(node,dict): continue
+                name=node.get('name') or node.get('title') or code
+                found[str(code)]=str(name)
+    return list(found.items())
+
 def otp_sync_services():
     last=None
-    for action in ('getServices','get_services'):
-        try:
-            r=_otp_http(action)
-            if r.get('status')=='error': last=r; continue
-            rows=_otp_parse_services(r.get('data',r))
-            if not rows: last=r; continue
+    try:
+        r=_otp_http_catalog('getServices')
+        rows=_otp_parse_services(r.get('data',r))
+        if rows:
             with db_tx() as conn:
                 for code,name in rows:
                     conn.execute("""INSERT INTO otp_services(service_code,service_name,emoji,enabled,updated_at)
-                                    VALUES(?,?,?,?,?) ON CONFLICT(service_code) DO UPDATE SET service_name=excluded.service_name,emoji=excluded.emoji,updated_at=excluded.updated_at""",
-                                 (code,name,_otp_service_emoji(name),1,_otp_now()))
+                                    VALUES(?,?,?,?,?) ON CONFLICT(service_code) DO UPDATE SET service_name=excluded.service_name,emoji=excluded.emoji,updated_at=excluded.updated_at""",(code,name,_otp_service_emoji(name),1,_otp_now()))
             return len(rows)
-        except Exception as exc: last=exc
+        last=r
+    except Exception as exc: last=exc
+    # If the catalogue action is unavailable on an account, fall back to the
+    # documented full-price endpoint for a small set of live countries. This
+    # still discovers real Grizzly service codes rather than hard-coding apps.
+    try:
+        otp_sync_countries()
+        countries=fetchall('SELECT code FROM otp_grizzly_countries ORDER BY CAST(code AS INTEGER) LIMIT 8')
+        found={}
+        for c in countries:
+            try:
+                r=_otp_http_catalog('getPricesV3',country=str(c['code']))
+                for code,name in _otp_services_from_price_payload(r.get('data',r)): found[code]=name
+            except Exception as exc: last=exc
+        if found:
+            with db_tx() as conn:
+                for code,name in found.items():
+                    conn.execute("INSERT INTO otp_services(service_code,service_name,emoji,enabled,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(service_code) DO UPDATE SET service_name=excluded.service_name,emoji=excluded.emoji,updated_at=excluded.updated_at",(code,name,_otp_service_emoji(name),1,_otp_now()))
+            return len(found)
+    except Exception as exc: last=exc
     raise RuntimeError(f'Grizzly service sync failed: {last}')
 
 def _otp_notify_price_alerts(service_code, alerts):
@@ -6848,34 +7078,73 @@ def _otp_notify_price_alerts(service_code, alerts):
             conn.execute('UPDATE otp_price_alerts SET notified=1 WHERE service_code=? AND notified=0 AND id IN (SELECT id FROM otp_price_alerts WHERE service_code=? ORDER BY id DESC LIMIT ?)',(service_code,service_code,len(alerts)))
     except Exception: pass
 
-def otp_sync_service_stock(service_code):
-    last=None
-    for action in ('getPricesV3','getPricesV2','getPrices'):
+def _otp_parse_single_price(payload, service_code, country_code):
+    data=payload.get('data',payload) if isinstance(payload,dict) else payload
+    if not isinstance(data,dict): return None
+    node=data.get(str(country_code)) or data.get(country_code)
+    if not isinstance(node,dict): return None
+    svc=node.get(service_code)
+    if not isinstance(svc,dict): return None
+    cost=svc.get('price',svc.get('cost',svc.get('activationCost')))
+    count=svc.get('count',svc.get('available',svc.get('stock',svc.get('qty',0))))
+    try: cost=float(cost) if cost is not None else None
+    except Exception: cost=None
+    try: count=int(count or 0)
+    except Exception: count=0
+    return cost,count
+
+def otp_sync_service_stock(service_code, country_codes=None):
+    # The current Grizzly docs require country for getPricesV3. The previous
+    # implementation called getPricesV3 with only service, which is why the
+    # provider returned BAD_ACTION and the catalogue stayed empty.
+    try: otp_sync_countries()
+    except Exception as exc: logger.warning('Grizzly country sync failed: %s',exc)
+    _otp_ensure_service_countries(service_code)
+    if country_codes is None:
+        rows=fetchall('SELECT country_code FROM otp_service_countries WHERE service_code=? AND (enabled=1 OR profit_active=1 OR explicit_price IS NOT NULL) ORDER BY name',(service_code,))
+        country_codes=[r['country_code'] for r in rows]
+    country_codes=[str(x) for x in country_codes if str(x).isdigit()]
+    if not country_codes:
+        return 0
+    alerts=[]; updated=0; last=None
+    for code in country_codes:
         try:
-            r=_otp_http(action,service=service_code)
-            if r.get('status')=='error': last=r; continue
-            rows=_otp_parse_rows(r,service=service_code)
-            if not rows: last=r; continue
-            alerts=[]
+            r=_otp_http_catalog('getPricesV3',country=code,service=service_code)
+            parsed=_otp_parse_single_price(r,service_code,code)
+            if not parsed:
+                # V2 is a documented fallback and can expose price/count as
+                # price->count buckets. Use the cheapest live bucket.
+                r2=_otp_http_catalog('getPricesV2',country=code,service=service_code)
+                data=r2.get('data',r2); node=data.get(code) if isinstance(data,dict) else None
+                svc=node.get(service_code) if isinstance(node,dict) else None
+                if isinstance(svc,dict) and svc:
+                    pairs=[]
+                    for price,count in svc.items():
+                        try: pairs.append((float(price),int(count or 0)))
+                        except Exception: pass
+                    if pairs: parsed=min(pairs,key=lambda x:x[0])
+            if not parsed: continue
+            cost,count=parsed
+            old=fetchone('SELECT name,flag,grizzly_cost FROM otp_service_countries WHERE service_code=? AND country_code=?',(service_code,code))
+            if not old: continue
+            old_cost=float(old['grizzly_cost']) if old['grizzly_cost'] is not None else None
+            if cost is None: continue
+            if old_cost is not None and abs(old_cost-cost)>1e-9:
+                direction='increased' if cost>old_cost else 'decreased'
+                conn_alert=(code,old['name'],old_cost,cost,direction,old['flag'])
+                alerts.append(conn_alert)
+                with db_tx() as conn:
+                    conn.execute('INSERT INTO otp_price_alerts(service_code,country_code,country_name,old_cost,new_cost,direction,created_at,notified) VALUES(?,?,?,?,?,?,?,0)',(service_code,code,old['name'],old_cost,cost,direction,_otp_now()))
             with db_tx() as conn:
-                svc=conn.execute('SELECT service_name FROM otp_services WHERE service_code=?',(service_code,)).fetchone()
-                if not svc: conn.execute('INSERT OR IGNORE INTO otp_services(service_code,service_name,emoji,enabled,updated_at) VALUES(?,?,?,?,?)',(service_code,service_code,_otp_service_emoji(service_code),1,_otp_now()))
-                for x in rows:
-                    old=conn.execute('SELECT name,grizzly_cost FROM otp_service_countries WHERE service_code=? AND country_code=?',(service_code,x['code'])).fetchone()
-                    old_cost=float(old['grizzly_cost']) if old and old['grizzly_cost'] is not None else None
-                    new_cost=float(x['cost'] or 0)
-                    if old_cost is not None and abs(old_cost-new_cost) > 1e-9:
-                        direction='increased' if new_cost > old_cost else 'decreased'
-                        conn.execute('INSERT INTO otp_price_alerts(service_code,country_code,country_name,old_cost,new_cost,direction,created_at,notified) VALUES(?,?,?,?,?,?,?,0)',(service_code,x['code'],x['name'],old_cost,new_cost,direction,_otp_now()))
-                        alerts.append((x['code'],x['name'],old_cost,new_cost,direction,x['flag']))
-                    conn.execute("""INSERT INTO otp_service_countries(service_code,country_code,name,flag,grizzly_cost,explicit_price,markup_percent,markup_fixed,available_count,enabled,profit_active,updated_at)
-                                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-                                    ON CONFLICT(service_code,country_code) DO UPDATE SET name=excluded.name,flag=excluded.flag,grizzly_cost=excluded.grizzly_cost,available_count=excluded.available_count,updated_at=excluded.updated_at""",
-                                 (service_code,x['code'],x['name'],x['flag'] or _otp_flag_from_iso(x.get('iso2')),x['cost'],None,0,0,x['count'],0,0,_otp_now()))
-            if alerts: _otp_notify_price_alerts(service_code, alerts)
-            return len(rows)
-        except Exception as exc: last=exc
-    raise RuntimeError(f'Grizzly stock sync failed for {service_code}: {last}')
+                conn.execute('UPDATE otp_service_countries SET grizzly_cost=?,available_count=?,updated_at=? WHERE service_code=? AND country_code=?',(cost,count,_otp_now(),service_code,code))
+            updated+=1
+        except Exception as exc:
+            last=exc
+            logger.warning('Grizzly price refresh failed for service=%s country=%s: %s',service_code,code,exc)
+    if alerts: _otp_notify_price_alerts(service_code,alerts)
+    if updated==0 and last and not alerts:
+        raise RuntimeError(f'Grizzly price refresh failed for {service_code}: {last}')
+    return updated
 
 def otp_sync_stock():
     # Backward-compatible alias: sync services and WhatsApp stock only.
@@ -6931,7 +7200,7 @@ def _otp_create_activation(user_id,service_code,country_code,source_chat_id):
         if not w or float(w['usdt'])+1e-9<price: return None,f'💰 Insufficient balance.\nRequired: {price:.2f} USDT\nBalance: {float(w["usdt"]):.2f} USDT'
         adjust_balance(conn,user_id,'usdt',-price,'OTP_PURCHASE',reason=f'Quick OTP {service_name} purchase {order_id}',related_txn=order_id,processed_by=user_id)
         conn.execute('INSERT INTO otp_orders(order_id,user_id,country_code,country_name,service_code,status,selling_price,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',(order_id,str(user_id),row['country_code'],row['name'],service_code,'processing',price,now,now))
-    try: result=_otp_http('getNumberV2',service=service_code,country=str(row['country_code']),maxPrice=str(row['grizzly_cost']))
+    try: result=_otp_http('getNumberV2',service=service_code,country=str(row['country_code']),maxPrice=str(price))
     except Exception:
         with db_tx() as conn: conn.execute('UPDATE otp_orders SET status="manual_reconciliation",updated_at=? WHERE order_id=? AND status="processing"',(_otp_now(),order_id))
         return None,f'⚠️ Grizzly did not confirm the request. Order <code>{order_id}</code> is under safe reconciliation; balance was not auto-refunded.'
@@ -7118,8 +7387,9 @@ def otp_admin_svc(c):
     if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
     service=c.data.split(':',1)[1]; svc=fetchone('SELECT * FROM otp_services WHERE service_code=?',(service,))
     if not svc: return bot.answer_callback_query(c.id,'Service not found.',show_alert=True)
-    try: otp_sync_service_stock(service)
-    except Exception as exc: logger.warning('Admin stock sync failed for %s: %s',service,exc)
+    try:
+        otp_sync_countries(); _otp_ensure_service_countries(service)
+    except Exception as exc: logger.warning('Admin country catalogue sync failed for %s: %s',service,exc)
     _otp_admin_show_countries(c.from_user.id,service,0,svc)
     bot.answer_callback_query(c.id)
 
@@ -7144,8 +7414,9 @@ def otp_admin_countries_page(c):
     if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
     _,service,page=c.data.split(':',2); svc=fetchone('SELECT service_name,emoji FROM otp_services WHERE service_code=?',(service,))
     if not svc: return bot.answer_callback_query(c.id,'Service not found.',show_alert=True)
-    try: otp_sync_service_stock(service)
-    except Exception as exc: logger.warning('Admin stock sync failed for %s: %s',service,exc)
+    try:
+        otp_sync_countries(); _otp_ensure_service_countries(service)
+    except Exception as exc: logger.warning('Admin country catalogue sync failed for %s: %s',service,exc)
     _otp_admin_show_countries(c.from_user.id,service,int(page),svc); bot.answer_callback_query(c.id)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_admin_sc:'))
@@ -7154,6 +7425,9 @@ def otp_admin_sc(c):
     if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
     _,service,code=c.data.split(':',2); r=fetchone('SELECT * FROM otp_service_countries WHERE service_code=? AND country_code=?',(service,code)); svc=fetchone('SELECT service_name,emoji FROM otp_services WHERE service_code=?',(service,))
     if not r: return bot.answer_callback_query(c.id,'Country not found.',show_alert=True)
+    try: otp_sync_service_stock(service,[code])
+    except Exception as exc: logger.warning('Admin country price refresh failed for %s/%s: %s',service,code,exc)
+    r=fetchone('SELECT * FROM otp_service_countries WHERE service_code=? AND country_code=?',(service,code)) or r
     kb=types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton('💵 Manual Price',callback_data=f'otp_set_price:{service}:{code}'))
     if r['explicit_price'] is not None:
