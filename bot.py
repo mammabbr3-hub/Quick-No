@@ -2324,6 +2324,37 @@ def _maintenance_allowed(update, chat_id) -> bool:
     return False
 
 
+def _show_wait_notice(chat_id):
+    """Show a short-lived, clear waiting message while a button action runs.
+
+    Telegram's native callback popup (answerCallbackQuery with show_alert=True)
+    is available only for inline callback buttons. The main menu uses reply
+    keyboard buttons, so those cannot display that native popup. This temporary
+    message gives both button types the same visible "Please wait" feedback and
+    is removed automatically when the action finishes.
+    """
+    try:
+        return bot.send_message(
+            chat_id,
+            "⏳ <b>Please wait...</b>\n\nYour request is being processed.",
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.exception("Could not send Please wait notice to %s", chat_id)
+        return None
+
+
+def _remove_wait_notice(chat_id, message):
+    if not message:
+        return
+    try:
+        bot.delete_message(chat_id, message.message_id)
+    except Exception:
+        # The message may already have been deleted or Telegram may reject a
+        # very fast cleanup. Never let cleanup hide the real handler result.
+        logger.debug("Could not remove wait notice %s for %s", getattr(message, "message_id", None), chat_id, exc_info=True)
+
+
 def safe_handler(func):
     @functools.wraps(func)
     def wrapper(update, *args, **kwargs):
@@ -2353,6 +2384,8 @@ def safe_handler(func):
             else:
                 bot.send_message(chat_id, _double_action_message(chat_id), parse_mode="HTML")
             return
+
+        wait_notice = _show_wait_notice(chat_id)
         try:
             return func(update, *args, **kwargs)
         except InsufficientFundsError as e:
@@ -2377,6 +2410,8 @@ def safe_handler(func):
                 )
             except Exception:
                 logger.exception("Failed to notify admin of error")
+        finally:
+            _remove_wait_notice(chat_id, wait_notice)
     return wrapper
 
 
@@ -2807,7 +2842,7 @@ def start(msg):
             except Exception:
                 logger.exception("Could not notify referrer %s", ref_id)
 
-    referral_link = f"{BOT_LINK}?start={user_id}"
+    referral_link = _safe_referral_link(user_id)
     referral_line = (
         f"🎁 Referral Reward: Earn {fmt_amount(get_referral_amount('usdt'), 'usdt')} for every friend you invite!\n\n"
         if is_referral_enabled() else ""
@@ -2871,9 +2906,13 @@ def _safe_referral_link(user_id):
     Telegram rejects as an invalid inline-button URL and surfaced to users
     as the unhelpful generic "Something went wrong" message.
     """
-    base = (BOT_LINK or "").strip().rstrip("/")
-    if base.startswith("https://t.me/") or base.startswith("http://t.me/"):
-        return base + ("&" if "?" in base else "?") + f"start={user_id}"
+    base = (get_setting("bot_public_link") or BOT_LINK or "").strip().rstrip("/")
+    if base.startswith("@"):
+        base = "https://t.me/" + base[1:].strip()
+    elif re.match(r"^t\.me/", base, re.I):
+        base = "https://" + base
+    if re.match(r"^https?://t\.me/[A-Za-z0-9_]{4,64}$", base, re.I):
+        return base + f"?start={user_id}"
     try:
         me = bot.get_me()
         username = getattr(me, "username", None)
@@ -2938,10 +2977,10 @@ def show_referrals(m):
     if feature_blocked_message(m, "referrals"):
         return
     w = get_wallet(m.chat.id)
-    referral_link = f"{BOT_LINK}?start={m.chat.id}"
+    referral_link = _safe_referral_link(m.chat.id)
     text = (
         "👥 YOUR REFERRAL STATISTICS\n\n"
-        f"🔗 Your Referral Link:\n{referral_link}\n\n"
+        f"🔗 Your Referral Link:\n{referral_link or 'Not available yet — please set the Bot Public Link in Admin → Settings.'}\n\n"
         f"👤 Total Invited: {w['ref_count']} users\n"
         f"🪙 Total Earned (USDT): {w['ref_usdt']:.6f} USDT\n\n"
         "🚀 Share your link with friends to earn more!"
@@ -5131,6 +5170,7 @@ def _handle_admin_withdraw_method(m,state):
 _SETTING_LABELS = {
     "min_withdrawal_usdt": ("Minimum Withdrawal (USDT)", "usdt"),
     "referral_amount_usdt": ("Referral Amount (USDT)", "usdt"),
+    "bot_public_link": ("Bot Public Link (for Referral)", "url"),
 }
 
 
@@ -5141,16 +5181,19 @@ def admin_settings_menu(m):
         return
     clear_state(m.chat.id)
     ref_on = is_referral_enabled()
+    bot_link = get_setting("bot_public_link", "")
     text = (
         "⚙️ SETTINGS\n\n"
         f"💰 Min Withdrawal (USDT): {fmt_amount(get_min_withdrawal('usdt'), 'usdt')}\n"
         f"🎁 Referral Amount (USDT): {fmt_amount(get_referral_amount('usdt'), 'usdt')}\n"
-        f"🔘 Referral Status: {'✅ ON' if ref_on else '⛔ OFF'}\n\n"
-        "Default minimum withdrawal is 2.00 USDT. You can change it below at any time.\n\nTap a value below to change it:"
+        f"🔘 Referral Status: {'✅ ON' if ref_on else '⛔ OFF'}\n"
+        f"🤖 Bot Public Link: {html.escape(bot_link or 'Not set — Telegram auto-detect will be used')}\n\n"
+        "Default minimum withdrawal is 2.00 USDT. The Bot Public Link is used to build valid referral links.\n\nTap a value below to change it:"
     )
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("✏️ Min Withdrawal (USDT)", callback_data="setedit_min_withdrawal_usdt"))
     kb.add(types.InlineKeyboardButton("✏️ Referral Amount (USDT)", callback_data="setedit_referral_amount_usdt"))
+    kb.add(types.InlineKeyboardButton("🔗 Set Bot Public Link", callback_data="setedit_bot_public_link"))
     kb.add(types.InlineKeyboardButton(
         "⛔ Turn Referral OFF" if ref_on else "✅ Turn Referral ON",
         callback_data="reftoggle_off" if ref_on else "reftoggle_on",
@@ -5177,17 +5220,24 @@ def admin_settings_edit_cb(c):
         bot.answer_callback_query(c.id)
         return
     key = c.data[len("setedit_"):]
-    label, currency = _SETTING_LABELS.get(key, (key, "usdt"))
+    label, value_type = _SETTING_LABELS.get(key, (key, "usdt"))
     clear_state(c.message.chat.id)
     update_state(c.message.chat.id, flow="admin_setting", key=key)
     bot.answer_callback_query(c.id)
-    extra = ""
-    bot.send_message(
-        c.message.chat.id,
-        f"✏️ Enter the new value for {label} ({currency.upper()}):\n\n"
-        f"Send a plain number (e.g. 500 or 0.5).{extra}",
-        reply_markup=back_kb(),
-    )
+    if value_type == "url":
+        prompt = (
+            "🔗 Send your bot's public Telegram link.\n\n"
+            "Examples:\n"
+            "https://t.me/YourBotUsername\n"
+            "or simply @YourBotUsername\n\n"
+            "This link will be used automatically when generating referral links."
+        )
+    else:
+        prompt = (
+            f"✏️ Enter the new value for {label} ({value_type.upper()}):\n\n"
+            "Send a plain number (e.g. 500 or 0.5)."
+        )
+    bot.send_message(c.message.chat.id, prompt, reply_markup=back_kb())
 
 
 def _handle_admin_setting(m, state):
@@ -5195,7 +5245,31 @@ def _handle_admin_setting(m, state):
         clear_state(m.chat.id)
         return
     key = state["key"]
-    label, currency = _SETTING_LABELS.get(key, (key, "usdt"))
+    label, value_type = _SETTING_LABELS.get(key, (key, "usdt"))
+
+    if value_type == "url":
+        raw = (m.text or "").strip()
+        if raw.startswith("@"):
+            raw = "https://t.me/" + raw[1:].strip()
+        elif re.match(r"^t\.me/", raw, re.I):
+            raw = "https://" + raw
+        if not re.match(r"^https?://t\.me/[A-Za-z0-9_]{4,64}$", raw, re.I):
+            bot.send_message(
+                m.chat.id,
+                "❌ Invalid bot link. Send a Telegram bot link like:\nhttps://t.me/YourBotUsername\n\nOr send @YourBotUsername.",
+                reply_markup=back_kb(),
+            )
+            return
+        clear_state(m.chat.id)
+        set_setting(key, raw.rstrip("/"), m.chat.id)
+        bot.send_message(
+            m.chat.id,
+            f"✅ {label} saved.\n\n🔗 {html.escape(raw)}\n\nNew referral links will use this bot link.",
+            parse_mode="HTML",
+            reply_markup=main_menu(m.chat.id),
+        )
+        return
+
     try:
         value = float(m.text.strip())
     except (TypeError, ValueError):
@@ -5207,7 +5281,7 @@ def _handle_admin_setting(m, state):
     clear_state(m.chat.id)
 
     set_setting(key, value, m.chat.id)
-    bot.send_message(m.chat.id, f"✅ {label} updated to {value} {currency.upper()}.", reply_markup=main_menu(m.chat.id))
+    bot.send_message(m.chat.id, f"✅ {label} updated to {value} {value_type.upper()}.", reply_markup=main_menu(m.chat.id))
 
 
 # ================================================================
