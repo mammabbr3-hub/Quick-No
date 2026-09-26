@@ -31,6 +31,10 @@ import threading
 import time
 import urllib.request
 import urllib.parse
+try:
+    import pycountry
+except Exception:
+    pycountry = None
 
 from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
@@ -132,7 +136,7 @@ if _admin_list_ordered:
 VALID_CURRENCIES = ("usdt",)
 CURRENCY_LABELS = {"usdt": "USDT"}
 
-MIN_WITHDRAWAL = {"usdt": 0.50}
+MIN_WITHDRAWAL = {"usdt": 2.00}
 
 
 def is_admin(chat_id) -> bool:
@@ -504,6 +508,16 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_by  TEXT
 );
 
+CREATE TABLE IF NOT EXISTS withdrawal_methods (
+    method_id   TEXT PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    prompt      TEXT NOT NULL,
+    active      INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_withdrawal_methods_active ON withdrawal_methods(active);
+
 -- Scheduled/recurring broadcast messages the admin manages from the
 -- "⏰ Auto Messages" panel: each has a title (for the admin's own
 -- reference), the message body, and a daily send time.
@@ -621,6 +635,19 @@ def init_db():
                 if "duplicate column" not in str(e).lower():
                     logger.exception("Migration failed: %s", stmt)
         _migrate_legacy_finance_schema(conn)
+        # Seed the requested default minimum withdrawal only when the admin
+        # has never configured it. Existing admin choices are preserved.
+        try:
+            if conn.execute("SELECT 1 FROM settings WHERE key='min_withdrawal_usdt'").fetchone() is None:
+                conn.execute("INSERT INTO settings(key,value,updated_at,updated_by) VALUES('min_withdrawal_usdt','2.0',?, 'SYSTEM')", (now_iso(),))
+                conn.commit()
+        except Exception:
+            logger.exception("Could not seed default minimum withdrawal")
+        try:
+            _seed_withdrawal_methods(conn)
+            conn.commit()
+        except Exception:
+            logger.exception("Could not seed withdrawal payment methods")
         # Existing audit history predates the Audit Channel dispatcher.
         # Mark that old history as archived exactly once; future unsent rows
         # remain durable and will be retried if Telegram delivery fails.
@@ -1305,6 +1332,76 @@ def delete_setting(key):
         conn.execute("DELETE FROM settings WHERE key=?", (key,))
 
 
+def list_withdrawal_methods(active_only=False):
+    q = "SELECT * FROM withdrawal_methods"
+    if active_only:
+        q += " WHERE active=1"
+    q += " ORDER BY name COLLATE NOCASE"
+    return fetchall(q)
+
+
+def get_withdrawal_method(method_id):
+    return fetchone("SELECT * FROM withdrawal_methods WHERE method_id=?", (method_id,))
+
+
+def create_withdrawal_method(method_id, name, prompt, admin_id, active=1):
+    with db_tx() as conn:
+        conn.execute(
+            "INSERT INTO withdrawal_methods(method_id,name,prompt,active,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            (method_id, name.strip(), prompt.strip(), int(active), now_iso(), now_iso()),
+        )
+        conn.execute(
+            "INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",
+            (str(admin_id), "WITHDRAWAL_METHOD_CREATED", None, None, method_id, f"{name.strip()} / {prompt.strip()}", now_iso()),
+        )
+
+
+def update_withdrawal_method(method_id, name=None, prompt=None, admin_id=None):
+    row = get_withdrawal_method(method_id)
+    if not row:
+        raise ValueError("Withdrawal method not found.")
+    new_name = row["name"] if name is None else name.strip()
+    new_prompt = row["prompt"] if prompt is None else prompt.strip()
+    with db_tx() as conn:
+        conn.execute("UPDATE withdrawal_methods SET name=?, prompt=?, updated_at=? WHERE method_id=?", (new_name, new_prompt, now_iso(), method_id))
+        if admin_id is not None:
+            conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)", (str(admin_id), "WITHDRAWAL_METHOD_UPDATED", None, None, method_id, f"{new_name} / {new_prompt}", now_iso()))
+
+
+def toggle_withdrawal_method(method_id, admin_id):
+    with db_tx() as conn:
+        row = conn.execute("SELECT active FROM withdrawal_methods WHERE method_id=?", (method_id,)).fetchone()
+        if not row:
+            raise ValueError("Withdrawal method not found.")
+        new = 0 if int(row["active"]) else 1
+        conn.execute("UPDATE withdrawal_methods SET active=?, updated_at=? WHERE method_id=?", (new, now_iso(), method_id))
+        conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)", (str(admin_id), "WITHDRAWAL_METHOD_TOGGLED", None, None, method_id, f"active={new}", now_iso()))
+    return new
+
+
+def delete_withdrawal_method(method_id, admin_id):
+    row = get_withdrawal_method(method_id)
+    if not row:
+        raise ValueError("Withdrawal method not found.")
+    with db_tx() as conn:
+        conn.execute("DELETE FROM withdrawal_methods WHERE method_id=?", (method_id,))
+        conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)", (str(admin_id), "WITHDRAWAL_METHOD_DELETED", None, None, method_id, row["name"], now_iso()))
+
+
+def _seed_withdrawal_methods(conn):
+    defaults = [
+        ("Binance ID", "Please send your Binance ID only."),
+        ("USDT BEP20 Address", "Please send your USDT BEP20 address only."),
+        ("OPay", "Please send your OPay account number and account name."),
+        ("PalmPay", "Please send your PalmPay account number and account name."),
+    ]
+    if conn.execute("SELECT 1 FROM withdrawal_methods LIMIT 1").fetchone():
+        return
+    for name, prompt in defaults:
+        mid = "WDM-" + re.sub(r"[^A-Z0-9]+", "-", name.upper()).strip("-")[:32]
+        conn.execute("INSERT OR IGNORE INTO withdrawal_methods(method_id,name,prompt,active,created_at,updated_at) VALUES(?,?,?,?,?,?)", (mid, name, prompt, 1, now_iso(), now_iso()))
+
+
 # ---------------------------------------------------------------
 # FUND WALLET — admin-configured payment methods, local-currency input,
 # USDT-only credit, photo proof, admin approval/decline.
@@ -1655,15 +1752,23 @@ TEXT_TEMPLATES = {
 # is needed on Railway.
 
 FEATURES = {
-    "submit_work":   ("📤 Submit Work", "📤 Submit Work"),
-    "balance":       ("💰 My Balance", "💰 My Balance"),
-    "withdraw":      ("💸 Withdraw", "💸 Withdraw"),
-    "referrals":     ("👥 My Referrals", "👥 My Referrals"),
-    "history":       ("📜 Transaction History", "📜 Transaction History"),
-    "bank_details":  ("🏦 Bank Details", "🏦 Bank Details"),
+    # Every built-in user-facing main-menu handle is individually controllable.
+    "quick_otp":     ("📱 Quick OTP", "📱 Quick OTP"),
+    "account":       ("👤 My Account", "👤 My Account"),
     "support":       ("📞 Support", "📞 Support"),
+    "manual":        ("📘 Manual", "📘 Manual"),
+    "fund_wallet":   ("💳 Fund Wallet", "💳 Fund Wallet"),
+    "submit_work":   ("📤 Submit Work", "📤 Submit Work"),
+    "history":       ("📜 History", "📜 History"),
+    "withdraw":      ("💸 Withdrawal", "💸 Withdrawal"),
     "buy_sell_mail": ("🛒 BUY OR SELL MAIL", "🛒 BUY OR SELL MAIL"),
+    "refresh":       ("🔄 Refresh", "🔄 Refresh"),
+    # Account sub-actions / legacy handles remain controllable too.
+    "balance":       ("💰 My Balance", "💰 My Balance"),
+    "referrals":     ("👥 My Referrals", "👥 My Referrals"),
     "profile":       ("👤 My Profile", "👤 My Profile"),
+    "withdrawal_payment_details": ("🏦 Withdrawal Payment Details", "🏦 Withdrawal Payment Details"),
+    "bank_details": ("🏦 Bank Details (legacy)", "🏦 Bank Details (legacy)"),
 }
 
 
@@ -1683,12 +1788,13 @@ BUTTON_LABELS = {
     "profile":       "👤 My Profile",
     "submit_work":   "📤 Submit Work",
     "balance":       "💰 My Balance",
-    "withdraw":      "💸 Withdraw",
+    "withdraw":      "💸 Withdrawal",
     "referrals":     "👥 My Referrals",
-    "history":       "📜 Transaction History",
+    "history":       "📜 History",
     "bank_details":  "🏦 Bank Details",
     "support":       "📞 Support",
     "buy_sell_mail": "🛒 BUY OR SELL MAIL",
+    "manual":        "📘 Manual",
 }
 
 
@@ -1720,7 +1826,7 @@ def reserved_labels_now() -> set:
         "💵 Withdrawal ID Search", "📊 Total Users Balance",
         "📋 Banned Users", "📋 Manage Custom Handles", "📋 Pending Approvals",
         "📝 Edit Bot Text", "📝 Submission ID Search", "📢 Broadcast",
-        "🔍 Search", "🔎 Track User",
+        "🔍 Search", "🔎 Track User", "🔎 Search Any ID",
         "🔙 Back", "🚫 Ban User", "🛠 Feature Control", "🛠 Maintenance Mode", "🧩 Menu Editor", "📱 Quick OTP", "📱 Quick OTP Settings", "⚙️ Community Settings", "/start",
     }
     try:
@@ -2111,7 +2217,7 @@ def _chat_id_of(update):
 # back, /start, opening/using Support (including finishing an
 # in-progress complaint), and Support. Every other
 # action is blocked for a banned user with a clear restriction notice.
-BAN_EXEMPT_HANDLERS = {"universal_back", "start", "support"}
+BAN_EXEMPT_HANDLERS = {"universal_back", "start", "support", "show_manual"}
 
 
 def _send_ban_notice(chat_id):
@@ -2469,10 +2575,12 @@ def _admin_group_keyboard(chat_id, group):
         ],
         "finance": [
             ["➕ Add/Minus Funds", "📊 Total Users Balance"],
-            ["⚙️ Settings", "💳 Fund Wallet Settings"],
+            ["⚙️ Settings", "💸 Withdrawal Methods"],
+            ["💳 Fund Wallet Settings"],
         ],
         "system": [
             ["🛠 Feature Control", "🛠 Maintenance Mode"],
+            ["👮 Admin Roles", "🛡️ Control Audit"],
         ],
         "communications": [
             ["📢 Broadcast", "✉️ Message User"],
@@ -2519,18 +2627,28 @@ def main_menu(chat_id=None):
             kb.row(ADMIN_GROUP_LABELS["community"])
         kb.row("🔍 Search")
     else:
-        # Quick OTP is intentionally the only button on the first row.
-        kb.row("📱 Quick OTP")
-        # Account-related items are intentionally consolidated into one button.
-        # My Account contains profile, balance, and referral information so the
-        # main user keyboard stays compact without removing any functionality.
-        user_labels = [
-            btn_label("account"), btn_label("withdraw"),
-            btn_label("bank_details"), btn_label("submit_work"), btn_label("history"),
-            "💳 Fund Wallet", btn_label("support"),
-            btn_label("buy_sell_mail"),
-        ]
-        for row in _user_menu_rows(user_labels):
+        # User menu layout requested by the owner:
+        # 1) Quick OTP
+        # 2) My Account / Support / Manual
+        # 3) Fund Wallet
+        # 4) Submit Work / History
+        # 5) Withdrawal / BUY OR SELL MAIL
+        # 6) Refresh (kept as the universal recovery button)
+        #
+        # Payment/Bank Details are intentionally NOT a separate main-menu
+        # button. They are collected and managed from inside Withdrawal.
+        if is_feature_enabled("quick_otp", chat_id):
+            kb.row("📱 Quick OTP")
+        row = [x for key, x in (("account", btn_label("account")), ("support", btn_label("support")), ("manual", btn_label("manual"))) if is_feature_enabled(key, chat_id)]
+        if row:
+            kb.row(*row)
+        if is_feature_enabled("fund_wallet", chat_id):
+            kb.row("💳 Fund Wallet")
+        row = [x for key, x in (("submit_work", btn_label("submit_work")), ("history", btn_label("history"))) if is_feature_enabled(key, chat_id)]
+        if row:
+            kb.row(*row)
+        row = [x for key, x in (("withdraw", btn_label("withdraw")), ("buy_sell_mail", btn_label("buy_sell_mail"))) if is_feature_enabled(key, chat_id)]
+        if row:
             kb.row(*row)
     try:
         custom_labels = [h["label"] for h in list_custom_handles_for_user(chat_id)]
@@ -2538,7 +2656,8 @@ def main_menu(chat_id=None):
             kb.row(*row)
     except Exception:
         logger.exception("Failed to load custom handles for menu (chat_id=%s)", chat_id)
-    kb.row("🔄 Refresh")
+    if is_feature_enabled("refresh", chat_id):
+        kb.row("🔄 Refresh")
     return kb
 
 
@@ -2578,6 +2697,9 @@ def fmt_amount(amount, currency="usdt"):
 @bot.message_handler(func=lambda m: m.text == "🔄 Refresh")
 @safe_handler
 def universal_refresh(m):
+    if not is_feature_enabled("refresh", m.chat.id):
+        bot.send_message(m.chat.id, "🚫 Refresh is currently unavailable. Please use the available menu options or contact Support.")
+        return
     # Reset any active conversation flow and rebuild the current menu from
     # fresh database/configuration state. This is a safe UI recovery action:
     # it never creates an order, charges the wallet, or changes account data.
@@ -2663,12 +2785,146 @@ def start(msg):
 
 
 # ================================================================
+# USER MANUAL / BOT GUIDE
+# ================================================================
+
+_BOT_PUBLIC_HANDLE_CACHE = None
+
+def _bot_public_identity():
+    """Return the live bot username/link when Telegram can provide it."""
+    global _BOT_PUBLIC_HANDLE_CACHE
+    if _BOT_PUBLIC_HANDLE_CACHE:
+        return _BOT_PUBLIC_HANDLE_CACHE
+
+    # BOT_LINK is the preferred configured public link.
+    link = BOT_LINK.rstrip("/") if BOT_LINK else ""
+    handle = ""
+    if link:
+        tail = link.rsplit("/", 1)[-1]
+        if tail and not tail.startswith("+"):
+            handle = "@" + tail.lstrip("@").split("?")[0]
+
+    # If BOT_LINK is not configured, ask Telegram for the actual username.
+    try:
+        me = bot.get_me()
+        if getattr(me, "username", None):
+            handle = "@" + me.username
+            link = f"https://t.me/{me.username}"
+    except Exception:
+        logger.exception("Could not resolve the bot public username for Manual")
+
+    _BOT_PUBLIC_HANDLE_CACHE = (handle or "Not configured", link or "")
+    return _BOT_PUBLIC_HANDLE_CACHE
+
+
+@bot.message_handler(func=lambda m: m.text == btn_label("manual"))
+@safe_handler
+def show_manual(m):
+    if feature_blocked_message(m, "manual"):
+        return
+    """Complete user guide for every main user feature."""
+    handle, bot_link = _bot_public_identity()
+    bot_line = f"🤖 Bot Handle: <b>{html.escape(handle)}</b>"
+    if bot_link:
+        bot_line += f"\n🔗 Bot Link: <a href=\"{html.escape(bot_link, quote=True)}\">{html.escape(bot_link)}</a>"
+
+    support_line = (
+        f"🔗 Support Group/Channel: <a href=\"{html.escape(SUPPORT_GROUP_LINK, quote=True)}\">{html.escape(SUPPORT_GROUP_LINK)}</a>"
+        if SUPPORT_GROUP_LINK else
+        "🔗 Support: Open the 📞 Support button in this bot."
+    )
+    work_line = (
+        f"🔗 Approved Work Channel: <a href=\"{html.escape(WORK_CHANNEL_LINK, quote=True)}\">{html.escape(WORK_CHANNEL_LINK)}</a>"
+        if WORK_CHANNEL_LINK else
+        "📤 Approved Work: Results are handled through the Submit Work flow and the configured work destination."
+    )
+
+    text = (
+        "📘 <b>MOBILE BUSINESS HUB — USER MANUAL</b>\n\n"
+        "Welcome 👋 This guide explains how to use every main feature of the bot.\n\n"
+        f"{bot_line}\n"
+        f"{support_line}\n"
+        f"{work_line}\n\n"
+
+        "━━━━━━━━━━━━━━━━━━\n"
+        "📱 <b>1. QUICK OTP</b>\n"
+        "• Tap 📱 Quick OTP.\n"
+        "• Choose the service you need, such as WhatsApp or Telegram.\n"
+        "• Choose a country that is currently enabled and available.\n"
+        "• Review the country, selling price and availability.\n"
+        "• Confirm <b>Buy Number</b> to purchase a number.\n"
+        "• The bot gives you the activation details and waits for the SMS code.\n"
+        "• Follow the activation status shown by the bot.\n"
+        "• Your wallet is charged only when the purchase is successfully created; failed purchases are handled by the bot's refund/reconciliation flow.\n\n"
+
+        "👤 <b>2. MY ACCOUNT</b>\n"
+        "Your account page combines your profile, balance and referral information. You can see your Telegram ID, name, username, USDT balance, approved/pending work and referral statistics.\n"
+        "• Your personal referral link is shown there when referrals are enabled.\n"
+        "• Share your referral link with friends to earn the configured referral reward.\n\n"
+
+        "📞 <b>3. SUPPORT</b>\n"
+        "Use Support when you have a problem, payment issue, work issue, OTP issue or any question that needs the team. Provide your User ID and a clear explanation so the team can investigate faster.\n\n"
+
+        "📘 <b>4. MANUAL</b>\n"
+        "This button opens this complete guide. You can return to the main menu at any time with 🔙 Back.\n\n"
+
+        "💳 <b>5. FUND WALLET</b>\n"
+        "• Tap 💳 Fund Wallet.\n"
+        "• Select an available funding method.\n"
+        "• Follow the instructions shown by the bot.\n"
+        "• If proof/payment evidence is requested, submit it exactly as instructed.\n"
+        "• Wait for admin review/approval when the selected method requires approval.\n"
+        "• Your approved amount is added to your USDT wallet balance and recorded in the transaction ledger.\n\n"
+
+        "💳 <b>6. PAYMENT DETAILS (INSIDE WITHDRAWAL)</b>\n"
+        "Payment details are now managed directly from 💸 Withdrawal. You do not need a separate Bank Details menu. The first time you withdraw, the bot will ask you to choose your crypto exchange/wallet and submit the required payment ID or wallet details.\n"
+        "• If payment details are already saved, Withdrawal will show the saved destination and ask whether you want to use it or change it.\n"
+        "• If you choose to change it, submit the new details and wait for admin approval.\n"
+        "• For USDT withdrawals, make sure the destination details are correct before requesting payment.\n\n"
+
+        "📤 <b>7. SUBMIT WORK</b>\n"
+        "Use Submit Work to send completed digital work according to the available work categories and instructions. Submit the required information or files, then wait for the team to review the submission. Approved work is recorded in your account.\n\n"
+
+        "📜 <b>8. HISTORY</b>\n"
+        "History shows your recorded transactions/activity so you can check previous wallet movements and relevant references.\n\n"
+
+        "💸 <b>9. WITHDRAWAL</b>\n"
+        "• Tap 💸 Withdrawal.\n"
+        "• If you have no saved payment details, the bot will ask you to set them up immediately.\n"
+        "• If details are already saved, the bot will show them and ask whether you want to use them or change them.\n"
+        "• After choosing the payment destination, enter the withdrawal amount.\n"
+        "• The minimum withdrawal is shown before submission.\n"
+        "• After submitting, the request becomes <b>PENDING</b> until the team reviews it.\n\n"
+
+        "🛒 <b>10. BUY OR SELL MAIL</b>\n"
+        "Open this section to view the currently configured mail buying/selling options. Follow the exact instructions shown for the selected option and submit any required details.\n\n"
+
+        "🔄 <b>11. REFRESH</b>\n"
+        "Use 🔄 Refresh if a screen gets stuck, an old step remains active, or you want to reset the current session. Refresh does not create an order or change your balance; it simply clears the active conversation state and rebuilds the menu.\n\n"
+
+        "🔙 <b>12. BACK</b>\n"
+        "Use 🔙 Back to leave the current flow and return to the main menu.\n\n"
+
+        "⚠️ <b>IMPORTANT</b>\n"
+        "• Never share your Telegram login code, password or private recovery information with anyone.\n"
+        "• Check the amount and destination before confirming any financial action.\n"
+        "• If something looks wrong, stop and contact Support rather than repeating a payment.\n"
+        "• During maintenance, some services may temporarily be unavailable. Follow the maintenance message and try again later.\n\n"
+        "💙 Thank you for using Mobile Business Hub."
+    )
+    clear_state(m.chat.id)
+    bot.send_message(m.chat.id, text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=back_kb())
+
+
+# ================================================================
 # MY ACCOUNT — PROFILE + BALANCE + REFERRAL SUMMARY
 # ================================================================
 
 @bot.message_handler(func=lambda m: m.text == btn_label("account"))
 @safe_handler
 def show_my_account(m):
+    if feature_blocked_message(m, "account"):
+        return
     """Show the user's profile, wallet balance, and referral summary in one view."""
     user = get_user(m.chat.id)
     if user is None:
@@ -2786,53 +3042,156 @@ def show_balance(m):
 def show_withdraw_menu(m):
     if feature_blocked_message(m, "withdraw"):
         return
-    w = get_wallet(m.chat.id)
-    text = (
-        "💸 WITHDRAW FUNDS\n\n"
-        f"🪙 USDT available: {w['usdt']:.6f} USDT\n\n"
-        "👉 Choose your withdrawal amount:"
+    clear_state(m.chat.id)
+    bank = get_bank_details(m.chat.id)
+
+    if bank is None:
+        bot.send_message(
+            m.chat.id,
+            "💸 WITHDRAW FUNDS\n\n"
+            "No payment details are saved yet.\n\n"
+            "🪙 USDT withdrawals are paid to a crypto exchange/wallet. "
+            "Please set your payment destination now.",
+        )
+        _show_withdraw_payment_setup(m.chat.id)
+        return
+
+    _show_saved_withdrawal_details(m.chat.id, bank)
+
+
+def _show_withdraw_payment_setup(chat_id):
+    if not is_feature_enabled("withdrawal_payment_details", chat_id) or not is_feature_enabled("bank_details", chat_id):
+        bot.send_message(chat_id, "🚫 Withdrawal payment-details setup is currently unavailable. Please contact Support.", reply_markup=main_menu(chat_id))
+        return
+    methods = list_withdrawal_methods(active_only=True)
+    if not methods:
+        bot.send_message(chat_id, "💳 PAYMENT DETAILS\n\nThe administrator has not enabled a payment method yet. Please contact Support.", reply_markup=main_menu(chat_id))
+        return
+    kb = types.InlineKeyboardMarkup()
+    for row in methods:
+        kb.add(types.InlineKeyboardButton(f"💳 {row['name']}", callback_data=f"withdraw_method:{row['method_id']}"))
+    kb.add(types.InlineKeyboardButton("🔙 Back", callback_data="withdraw_payment_back"))
+    bot.send_message(chat_id, "💳 PAYMENT DETAILS\n\nSelect a payment method enabled by the administrator.\n\nYou will then be asked for the exact detail required for that method.\nYour new details will be sent to the admin for approval and cannot be used until approved.", reply_markup=kb)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("withdraw_method:"))
+@safe_handler
+def withdraw_method_select_cb(c):
+    if not is_feature_enabled("withdraw", c.from_user.id) or not is_feature_enabled("withdrawal_payment_details", c.from_user.id):
+        bot.answer_callback_query(c.id, "Withdrawal payment details are unavailable.", show_alert=True)
+        return
+    method_id = c.data.split(":", 1)[1]
+    row = get_withdrawal_method(method_id)
+    if not row or not int(row["active"]):
+        bot.answer_callback_query(c.id, "This payment method is no longer available.", show_alert=True)
+        return
+    update_state(c.from_user.id, flow="bank", step="write", category="custom", method=row["name"], withdrawal_method_id=method_id)
+    bot.answer_callback_query(c.id)
+    bot.send_message(c.from_user.id, f"✍️ {html.escape(row['prompt'])}", parse_mode="HTML", reply_markup=back_kb())
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "withdraw_payment_back")
+@safe_handler
+def withdraw_payment_back_cb(c):
+    clear_state(c.from_user.id)
+    bot.answer_callback_query(c.id)
+    bot.send_message(c.from_user.id, "🏠 Main Menu", reply_markup=main_menu(c.from_user.id))
+
+
+def _withdraw_amount_prompt(chat_id):
+    currency = "usdt"
+    update_state(chat_id, flow="withdraw", currency=currency)
+    min_amt = fmt_amount(get_min_withdrawal(currency), currency)
+    w = get_wallet(chat_id)
+    bot.send_message(
+        chat_id,
+        "💸 WITHDRAW USDT\n\n"
+        f"🪙 Available balance: {w['usdt']:.6f} USDT\n\n"
+        f"📝 Enter the amount of {CURRENCY_LABELS[currency]} you want to withdraw:\n"
+        f"(Minimum: {min_amt})",
+        reply_markup=back_kb(),
     )
-    bot.send_message(m.chat.id, text, reply_markup=withdraw_kb())
+
+
+def _show_saved_withdrawal_details(chat_id, bank):
+    method = bank["method"] or "Not set"
+    details = bank["details"] or "Not set"
+    category = bank["category"] or "crypto"
+    w = get_wallet(chat_id)
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("💸 Withdraw Now", callback_data="withdraw_use_saved"),
+        types.InlineKeyboardButton("✏️ Change Details", callback_data="withdraw_change_payment"),
+    )
+    bot.send_message(
+        chat_id,
+        "💸 WITHDRAW FUNDS\n\n"
+        f"🪙 Available balance: {w['usdt']:.6f} USDT\n\n"
+        "💳 SAVED PAYMENT DETAILS\n"
+        f"🏷️ Type: {html.escape(str(category).capitalize())}\n"
+        f"🏦 Method: {html.escape(str(method))}\n"
+        f"📝 Details: <code>{html.escape(str(details))}</code>\n\n"
+        "Do you want to use these details for your withdrawal, or change them?",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "withdraw_use_saved")
+@safe_handler
+def withdraw_use_saved_cb(c):
+    if not is_feature_enabled("withdraw", c.from_user.id):
+        return bot.answer_callback_query(c.id, "Withdrawal is currently unavailable.", show_alert=True)
+    if not is_feature_enabled("withdrawal_payment_details", c.from_user.id):
+        return bot.answer_callback_query(c.id, "Payment details are currently unavailable.", show_alert=True)
+    # bank_details is the approved-only table; users cannot write to it directly.
+    bank = get_bank_details(c.from_user.id)
+    if bank is None:
+        bot.answer_callback_query(c.id, "Payment details are not saved yet.", show_alert=True)
+        _show_withdraw_payment_setup(c.from_user.id)
+        return
+    if bank["category"] != "crypto":
+        bot.answer_callback_query(c.id, "USDT withdrawals require a crypto destination.", show_alert=True)
+        _show_withdraw_payment_setup(c.from_user.id)
+        return
+    bot.answer_callback_query(c.id, "Payment details selected.")
+    _withdraw_amount_prompt(c.from_user.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "withdraw_change_payment")
+@safe_handler
+def withdraw_change_payment_cb(c):
+    if not is_feature_enabled("withdraw", c.from_user.id) or not is_feature_enabled("withdrawal_payment_details", c.from_user.id):
+        return bot.answer_callback_query(c.id, "Withdrawal payment details are currently unavailable.", show_alert=True)
+    bot.answer_callback_query(c.id, "Choose your new payment destination.")
+    _show_withdraw_payment_setup(c.from_user.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "withdraw_add_payment")
+@safe_handler
+def withdraw_add_payment_cb(c):
+    if not is_feature_enabled("withdraw", c.from_user.id) or not is_feature_enabled("withdrawal_payment_details", c.from_user.id):
+        return bot.answer_callback_query(c.id, "Withdrawal payment details are currently unavailable.", show_alert=True)
+    bot.answer_callback_query(c.id)
+    _show_withdraw_payment_setup(c.from_user.id)
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "withdraw_usdt")
 @safe_handler
 def handle_withdraw_click(c):
-    currency = "usdt"
-    chat_id = c.message.chat.id
-
-    bank = get_bank_details(chat_id)
+    if not is_feature_enabled("withdraw", c.from_user.id):
+        return bot.answer_callback_query(c.id, "Withdrawal is currently unavailable.", show_alert=True)
+    bank = get_bank_details(c.message.chat.id)
     if bank is None:
         bot.answer_callback_query(c.id)
-        bot.send_message(
-            chat_id,
-            "🏦 You need to save your payout details before requesting a withdrawal.\n\n"
-            "👉 Please go to 🏦 Bank Details first, then try again.",
-            reply_markup=main_menu(chat_id),
-        )
+        _show_withdraw_payment_setup(c.message.chat.id)
         return
-
-    if currency == "usdt" and bank["category"] != "crypto":
-        bot.answer_callback_query(c.id)
-        bot.send_message(
-            chat_id,
-            "🪙 USDT withdrawals can only be paid out to a Crypto wallet.\n\n"
-            "👉 Please go to 🏦 Bank Details, select 💱 Crypto, and set/update your crypto "
-            "wallet, then try again.",
-            reply_markup=main_menu(chat_id),
-        )
+    if bank["category"] != "crypto":
+        bot.answer_callback_query(c.id, "USDT withdrawals require a crypto destination.", show_alert=True)
+        _show_withdraw_payment_setup(c.message.chat.id)
         return
-
-
-    update_state(chat_id, flow="withdraw", currency=currency)
-    min_amt = fmt_amount(get_min_withdrawal(currency), currency)
     bot.answer_callback_query(c.id)
-    bot.send_message(
-        chat_id,
-        f"📝 Enter the amount of {CURRENCY_LABELS[currency]} you want to withdraw:\n"
-        f"(Minimum: {min_amt})",
-        reply_markup=back_kb(),
-    )
+    _show_saved_withdrawal_details(c.message.chat.id, bank)
 
 
 def _handle_withdraw_amount(m, state):
@@ -2897,6 +3256,8 @@ def _handle_withdraw_amount(m, state):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("wd_approve_"))
 @safe_handler
 def wd_approve_cb(c):
+    if not is_admin(c.from_user.id):
+        return bot.answer_callback_query(c.id, "Admin only", show_alert=True)
     wd_id = c.data[len("wd_approve_"):]
     try:
         row = approve_withdrawal(wd_id, c.from_user.id)
@@ -2923,6 +3284,8 @@ def wd_approve_cb(c):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("wd_decline_"))
 @safe_handler
 def wd_decline_cb(c):
+    if not is_admin(c.from_user.id):
+        return bot.answer_callback_query(c.id, "Admin only", show_alert=True)
     wd_id = c.data[len("wd_decline_"):]
     row = get_withdrawal(wd_id)
     if row is None:
@@ -3109,6 +3472,8 @@ def admin_pending_dashboard(m):
 @bot.callback_query_handler(func=lambda c: c.data == "dash_open_withdrawals")
 @safe_handler
 def dash_open_withdrawals(c):
+    if not is_admin(c.from_user.id):
+        return bot.answer_callback_query(c.id, "Admin only", show_alert=True)
     bot.answer_callback_query(c.id)
     list_pending_withdrawals(c.message)
 
@@ -3116,6 +3481,8 @@ def dash_open_withdrawals(c):
 @bot.callback_query_handler(func=lambda c: c.data == "dash_open_submissions")
 @safe_handler
 def dash_open_submissions(c):
+    if not is_admin(c.from_user.id):
+        return bot.answer_callback_query(c.id, "Admin only", show_alert=True)
     bot.answer_callback_query(c.id)
     rows = fetchall(
         "SELECT * FROM submissions WHERE status='PENDING' ORDER BY created_at ASC LIMIT 15"
@@ -3132,6 +3499,8 @@ def dash_open_submissions(c):
 @bot.callback_query_handler(func=lambda c: c.data == "dash_open_bank")
 @safe_handler
 def dash_open_bank(c):
+    if not is_admin(c.from_user.id):
+        return bot.answer_callback_query(c.id, "Admin only", show_alert=True)
     bot.answer_callback_query(c.id)
     rows = fetchall(
         "SELECT * FROM bank_submissions WHERE status='PENDING' ORDER BY created_at ASC LIMIT 15"
@@ -3239,14 +3608,82 @@ def _feature_control_kb():
         on = is_feature_enabled(key)
         icon = "🟢" if on else "🔴"
         kb.row(
-            types.InlineKeyboardButton(f"{icon} {label}", callback_data=f"noop"),
+            types.InlineKeyboardButton(f"{icon} {label}", callback_data="noop"),
             types.InlineKeyboardButton(
-                "🔴 Turn OFF (all users)" if on else "🟢 Turn ON (all users)",
+                "🔴 OFF" if on else "🟢 ON",
                 callback_data=f"featoggle_{key}",
             ),
         )
         kb.row(types.InlineKeyboardButton(f"🔒 Restrict one user — {label}", callback_data=f"restrictuser_{key}"))
+    kb.row(types.InlineKeyboardButton("🧩 Custom Handles Control", callback_data="feat_custom_panel"))
+    kb.row(types.InlineKeyboardButton("📋 Work/Mail Options Control", callback_data="feat_menu_panel"))
+    kb.row(types.InlineKeyboardButton("🛡️ Role & Permission Audit", callback_data="feat_role_audit"))
     return kb
+
+
+def _dynamic_feature_label(prefix, row):
+    return f"{row['label']}" if prefix == "custom" else f"{row['label']}"
+
+
+def _dynamic_feature_panel(kind):
+    kb = types.InlineKeyboardMarkup()
+    if kind == "custom":
+        rows = list_custom_handles(active_only=False)
+        title = "🧩 CUSTOM HANDLES CONTROL"
+        if not rows:
+            return title + "\n\nNo custom handles have been created yet.", kb
+        for r in rows:
+            key = f"custom_handle:{r['handle_id']}"
+            on = is_feature_enabled(key) and bool(r['active'])
+            icon = "🟢" if on else "🔴"
+            kb.row(
+                types.InlineKeyboardButton(f"{icon} {r['label']}", callback_data="noop"),
+                types.InlineKeyboardButton("🔴 OFF" if on else "🟢 ON", callback_data=f"dynfeat_toggle:{key}"),
+            )
+            kb.row(types.InlineKeyboardButton(f"🔒 Restrict one user — {r['label']}", callback_data=f"dynfeat_restrict:{key}"))
+        kb.row(types.InlineKeyboardButton("⬅️ Feature Control", callback_data="feat_back"))
+        return title + "\n\nEvery custom handle is independently controllable. The existing handle Active/Disabled state and this feature-control state must both allow access.", kb
+
+    rows = list_menu_options("work_category", active_only=False) + list_menu_options("work_subtype", active_only=False) + list_menu_options("mail_option", active_only=False)
+    title = "📋 WORK / MAIL OPTIONS CONTROL"
+    if not rows:
+        return title + "\n\nNo menu options found.", kb
+    for r in rows:
+        key = f"menu_option:{r['option_id']}"
+        on = is_feature_enabled(key) and bool(r['active'])
+        icon = "🟢" if on else "🔴"
+        section = str(r['section']).replace('_', ' ').title()
+        kb.row(
+            types.InlineKeyboardButton(f"{icon} {r['label']} · {section}", callback_data="noop"),
+            types.InlineKeyboardButton("🔴 OFF" if on else "🟢 ON", callback_data=f"dynfeat_toggle:{key}"),
+        )
+        kb.row(types.InlineKeyboardButton(f"🔒 Restrict one user — {r['label']}", callback_data=f"dynfeat_restrict:{key}"))
+    kb.row(types.InlineKeyboardButton("⬅️ Feature Control", callback_data="feat_back"))
+    return title + "\n\nEach old/new work and mail handle has its own control. This does not remove the Menu Editor controls; both controls must allow the option.", kb
+
+
+def _role_control_audit_text():
+    checks = [
+        ("SUPER ADMIN", "System settings, Feature Control, Maintenance, Roles, Text/Menu Editor, Fund Wallet Settings, Quick OTP, Community Settings", is_super_admin),
+        ("ADMIN", "Operational approvals, withdrawals, bank-detail approval, work approval, user management, search", is_admin),
+        ("USER", "Main user features only; no admin controls", lambda uid: not is_admin(uid)),
+    ]
+    lines = ["🛡️ ROLE & PERMISSION AUDIT", "", "The bot uses server-side permission checks; hiding a button is not treated as authorization.", ""]
+    for role, scope, fn in checks:
+        lines.append(f"✅ {role}")
+        lines.append(f"   {scope}")
+    lines += ["", "🔐 SECURITY RULES", "• All admin callback actions are checked again on the server.", "• Super Admin is required for system-wide settings and role changes.", "• Operational Admin can handle operational queues but cannot change global system controls.", "• User/Banned accounts cannot execute admin actions.", "• Feature restrictions are checked at both menu display and handler/callback execution."]
+    return "\n".join(lines)
+
+
+@bot.message_handler(func=lambda m: m.text == "🛡️ Control Audit" and is_super_admin(m.chat.id))
+@safe_handler
+def admin_control_audit_menu(m):
+    clear_state(m.chat.id)
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("👮 Manage Admin Roles", callback_data="admin_roles_panel"))
+    kb.add(types.InlineKeyboardButton("🛠 Feature Control", callback_data="feat_back"))
+    bot.send_message(m.chat.id, _role_control_audit_text(), reply_markup=kb)
 
 
 @bot.message_handler(func=lambda m: m.text == "🛠 Feature Control" and is_super_admin(m.chat.id))
@@ -3256,10 +3693,52 @@ def admin_feature_control(m):
     bot.send_message(
         m.chat.id,
         "🛠 FEATURE CONTROL\n\n"
-        "Turn any handle ON/OFF for everyone, or restrict it for one specific user only.\n"
-        "🟢 = currently on for everyone   🔴 = currently off for everyone",
+        "Every built-in, legacy, custom, work, and mail handle is controlled from this system.\n"
+        "🟢 = ON   🔴 = OFF. User-specific restrictions are checked at runtime even if an old keyboard is still visible.\n\n"
+        "Use the panels below to audit every handle after menu changes.",
         reply_markup=_feature_control_kb(),
     )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "feat_back")
+@safe_handler
+def feature_back_cb(c):
+    if not is_super_admin(c.message.chat.id):
+        return bot.answer_callback_query(c.id, "Super Admin only", show_alert=True)
+    bot.answer_callback_query(c.id)
+    bot.edit_message_text("🛠 FEATURE CONTROL\n\nSelect a handle/control to manage:", c.message.chat.id, c.message.message_id, reply_markup=_feature_control_kb())
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "feat_custom_panel")
+@safe_handler
+def feature_custom_panel_cb(c):
+    if not is_super_admin(c.message.chat.id):
+        return bot.answer_callback_query(c.id, "Super Admin only", show_alert=True)
+    text, kb = _dynamic_feature_panel("custom")
+    bot.answer_callback_query(c.id)
+    bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=kb)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "feat_menu_panel")
+@safe_handler
+def feature_menu_panel_cb(c):
+    if not is_super_admin(c.message.chat.id):
+        return bot.answer_callback_query(c.id, "Super Admin only", show_alert=True)
+    text, kb = _dynamic_feature_panel("menu")
+    bot.answer_callback_query(c.id)
+    bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=kb)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "feat_role_audit")
+@safe_handler
+def feature_role_audit_cb(c):
+    if not is_super_admin(c.message.chat.id):
+        return bot.answer_callback_query(c.id, "Super Admin only", show_alert=True)
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("👮 Manage Admin Roles", callback_data="admin_roles_panel"))
+    kb.add(types.InlineKeyboardButton("⬅️ Feature Control", callback_data="feat_back"))
+    bot.answer_callback_query(c.id)
+    bot.edit_message_text(_role_control_audit_text(), c.message.chat.id, c.message.message_id, reply_markup=kb)
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "noop")
@@ -3285,6 +3764,88 @@ def admin_feature_toggle_cb(c):
         bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=_feature_control_kb())
     except Exception:
         bot.send_message(c.message.chat.id, "🛠 FEATURE CONTROL", reply_markup=_feature_control_kb())
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("dynfeat_toggle:"))
+@safe_handler
+def dynamic_feature_toggle_cb(c):
+    if not is_super_admin(c.message.chat.id):
+        return bot.answer_callback_query(c.id, "Super Admin only", show_alert=True)
+    key = c.data.split(":", 1)[1]
+    if key.startswith("custom_handle:"):
+        handle_id = key.split(":", 1)[1]
+        row = get_custom_handle(handle_id)
+        if row is None:
+            return bot.answer_callback_query(c.id, "Handle not found", show_alert=True)
+        currently_on = is_feature_enabled(key) and bool(row["active"])
+        set_feature_global(key, not currently_on, c.from_user.id)
+        set_custom_handle_active(handle_id, not currently_on)
+        panel_kind = "custom"
+    elif key.startswith("menu_option:"):
+        option_id = key.split(":", 1)[1]
+        row = get_menu_option(option_id)
+        if row is None:
+            return bot.answer_callback_query(c.id, "Menu option not found", show_alert=True)
+        currently_on = is_feature_enabled(key) and bool(row["active"])
+        set_feature_global(key, not currently_on, c.from_user.id)
+        toggle_menu_option(option_id, not currently_on)
+        panel_kind = "menu"
+    else:
+        currently_on = is_feature_enabled(key)
+        set_feature_global(key, not currently_on, c.from_user.id)
+        panel_kind = "custom" if key.startswith("custom_handle:") else "menu"
+    bot.answer_callback_query(c.id, "Updated")
+    text, kb = _dynamic_feature_panel(panel_kind)
+    try:
+        bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=kb)
+    except Exception:
+        bot.send_message(c.message.chat.id, text, reply_markup=kb)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("dynfeat_restrict:"))
+@safe_handler
+def dynamic_feature_restrict_start(c):
+    if not is_super_admin(c.message.chat.id):
+        return bot.answer_callback_query(c.id, "Super Admin only", show_alert=True)
+    key = c.data.split(":", 1)[1]
+    update_state(c.message.chat.id, flow="admin_dynamic_feature_restrict", step="user_id", feature=key)
+    bot.answer_callback_query(c.id)
+    bot.send_message(c.message.chat.id, f"🔒 Enter the User ID or @username to restrict/unrestrict this handle: <code>{html.escape(key)}</code>", parse_mode="HTML", reply_markup=back_kb())
+
+
+def _handle_admin_dynamic_feature_restrict_user_id(m, state):
+    if not is_super_admin(m.chat.id):
+        clear_state(m.chat.id)
+        return
+    user = resolve_user_ref(m.text.strip())
+    if user is None:
+        bot.send_message(m.chat.id, "❌ No user found with that ID/username.")
+        return
+    key = state["feature"]
+    uid = user["user_id"]
+    clear_state(m.chat.id)
+    currently_on = is_feature_enabled(key, uid)
+    kb = types.InlineKeyboardMarkup()
+    kb.add(
+        types.InlineKeyboardButton("🔴 Turn OFF for this user", callback_data=f"dynuserfeat_off:{key}:{uid}"),
+        types.InlineKeyboardButton("🟢 Turn ON for this user", callback_data=f"dynuserfeat_on:{key}:{uid}"),
+    )
+    bot.send_message(m.chat.id, f"👤 {html.escape(user['name'])} (<code>{uid}</code>)\n🛠 Handle: <code>{html.escape(key)}</code>\n📊 Currently: {'🟢 ON' if currently_on else '🔴 OFF'}", parse_mode="HTML", reply_markup=kb)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("dynuserfeat_on:") or c.data.startswith("dynuserfeat_off:"))
+@safe_handler
+def dynamic_user_feature_toggle_cb(c):
+    if not is_super_admin(c.message.chat.id):
+        return bot.answer_callback_query(c.id, "Super Admin only", show_alert=True)
+    enable = c.data.startswith("dynuserfeat_on:")
+    prefix = "dynuserfeat_on:" if enable else "dynuserfeat_off:"
+    rest = c.data[len(prefix):]
+    key, uid = rest.rsplit(":", 1)
+    set_feature_for_user(key, uid, enable, c.from_user.id)
+    bot.answer_callback_query(c.id, "Updated")
+    text, kb = _dynamic_feature_panel("custom" if key.startswith("custom_handle:") else "menu")
+    bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=kb)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("restrictuser_"))
@@ -3350,6 +3911,75 @@ def admin_userfeat_toggle_cb(c):
         parse_mode="HTML",
         reply_markup=main_menu(c.message.chat.id),
     )
+
+
+# ================================================================
+# ADMIN ROLES & PERMISSION CONTROL
+# ================================================================
+
+def _admin_roles_keyboard():
+    kb = types.InlineKeyboardMarkup()
+    extras = fetchall("SELECT * FROM extra_admins ORDER BY added_at")
+    if extras:
+        for r in extras:
+            kb.add(types.InlineKeyboardButton(f"👮 Admin {r['user_id']} — Remove", callback_data=f"admin_role_remove:{r['user_id']}"))
+    else:
+        kb.add(types.InlineKeyboardButton("ℹ️ No extra admins", callback_data="noop"))
+    kb.add(types.InlineKeyboardButton("➕ Add Admin", callback_data="admin_role_add"))
+    kb.add(types.InlineKeyboardButton("⬅️ Role & Permission Audit", callback_data="feat_role_audit"))
+    return kb
+
+
+@bot.message_handler(func=lambda m: m.text == "👮 Admin Roles" and is_super_admin(m.chat.id))
+@safe_handler
+def admin_roles_menu(m):
+    clear_state(m.chat.id)
+    extras = fetchall("SELECT * FROM extra_admins ORDER BY added_at")
+    lines = ["👮 ADMIN ROLES", "", f"👑 Primary/Super Admin: <code>{PRIMARY_ADMIN}</code>", ""]
+    if extras:
+        lines.append("Operational Admins:")
+        lines.extend(f"• <code>{r['user_id']}</code> (added by {r['added_by']})" for r in extras)
+    else:
+        lines.append("No operational admins configured.")
+    lines.append("\nOnly Super Admin can add/remove admin roles or change system controls.")
+    bot.send_message(m.chat.id, "\n".join(lines), parse_mode="HTML", reply_markup=_admin_roles_keyboard())
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_roles_panel")
+@safe_handler
+def admin_roles_panel_cb(c):
+    if not is_super_admin(c.message.chat.id):
+        return bot.answer_callback_query(c.id, "Super Admin only", show_alert=True)
+    bot.answer_callback_query(c.id)
+    extras = fetchall("SELECT * FROM extra_admins ORDER BY added_at")
+    text = f"👮 ADMIN ROLES\n\n👑 Primary/Super Admin: <code>{PRIMARY_ADMIN}</code>\n\n"
+    text += "\n".join(f"• <code>{r['user_id']}</code>" for r in extras) if extras else "No operational admins."
+    bot.edit_message_text(text, c.message.chat.id, c.message.message_id, parse_mode="HTML", reply_markup=_admin_roles_keyboard())
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_role_add")
+@safe_handler
+def admin_role_add_cb(c):
+    if not is_super_admin(c.message.chat.id):
+        return bot.answer_callback_query(c.id, "Super Admin only", show_alert=True)
+    update_state(c.message.chat.id, flow="admin_add_admin", step="user_id")
+    bot.answer_callback_query(c.id)
+    bot.send_message(c.message.chat.id, "🛡️ Send the numeric Telegram User ID of the new operational admin:", reply_markup=back_kb())
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("admin_role_remove:"))
+@safe_handler
+def admin_role_remove_cb(c):
+    if not is_super_admin(c.message.chat.id):
+        return bot.answer_callback_query(c.id, "Super Admin only", show_alert=True)
+    uid = c.data.split(":", 1)[1]
+    with db_tx() as conn:
+        conn.execute("DELETE FROM extra_admins WHERE user_id=?", (uid,))
+    bot.answer_callback_query(c.id, "Admin role removed")
+    extras = fetchall("SELECT * FROM extra_admins ORDER BY added_at")
+    text = f"👮 ADMIN ROLES\n\n👑 Primary/Super Admin: <code>{PRIMARY_ADMIN}</code>\n\n"
+    text += "\n".join(f"• <code>{r['user_id']}</code>" for r in extras) if extras else "No operational admins."
+    bot.edit_message_text(text, c.message.chat.id, parse_mode="HTML", reply_markup=_admin_roles_keyboard())
 
 
 # ================================================================
@@ -3945,11 +4575,209 @@ def admin_search_menu(m):
         return
     clear_state(m.chat.id)
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("🔎 Search Any ID")
     kb.row("🏦 Bank ID Search")
     kb.row("🎫 Support ID Search", "📝 Submission ID Search")
     kb.row("🆔 User ID Search", "💵 Withdrawal ID Search")
     kb.row("🔙 Back")
-    bot.send_message(m.chat.id, "🔍 SEARCH\n\nSelect what you want to look up:", reply_markup=kb)
+    bot.send_message(m.chat.id, "🔍 SEARCH\n\nYou can search any ID/reference generated by the bot, or use a specific search below:", reply_markup=kb)
+
+
+def _search_any_id(query):
+    """Search every persistent ID/reference the bot can generate.
+
+    This deliberately includes customer IDs, funding IDs, transaction IDs,
+    withdrawals, work submissions, support tickets, payout-detail requests,
+    Quick OTP orders, and admin-created object IDs.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    found = []
+
+    def add(kind, table, column, title=None, extra_where="", params=()):
+        try:
+            sql = f"SELECT * FROM {table} WHERE LOWER(CAST({column} AS TEXT))=LOWER(?)"
+            if extra_where:
+                sql += " AND " + extra_where
+            sql += " LIMIT 10"
+            rows = fetchall(sql, (q, *params))
+            for row in rows:
+                found.append((kind, title or kind, row))
+        except Exception:
+            logger.exception("Universal ID search failed for %s.%s", table, column)
+
+    add("User", "users", "user_id")
+    add("Funding Request", "fund_requests", "request_id")
+    add("Funding Request Transaction", "fund_requests", "credited_txn_id")
+    add("Funding Method", "fund_methods", "method_id")
+    add("Transaction", "ledger", "txn_id")
+    add("Withdrawal", "withdrawals", "withdrawal_id")
+    add("Withdrawal Transaction", "withdrawals", "txn_id")
+    add("Bank/Wallet/Crypto", "bank_submissions", "bank_id")
+    add("Support Ticket", "support_tickets", "ticket_id")
+    add("Work Submission", "submissions", "sub_id")
+    add("Quick OTP Order", "otp_orders", "order_id")
+    add("Custom Handle", "custom_handles", "handle_id")
+    add("Auto Message", "auto_messages", "auto_id")
+    add("Menu Option", "menu_options", "option_id")
+    add("Audit Reference", "audit_log", "txn_id")
+    return found
+
+
+def _format_any_id_result(kind, row):
+    if kind == "User":
+        return (
+            "👤 <b>USER</b>\n\n"
+            f"🆔 User ID: <code>{html.escape(str(row['user_id']))}</code>\n"
+            f"📛 Name: {html.escape(row['name'] or '—')}\n"
+            f"🔗 Username: {display_username(row)}\n"
+            f"🚦 Status: {'BANNED' if row['banned'] else 'ACTIVE'}\n"
+            f"📅 Joined: {row['created_at']}"
+        )
+    if kind in ("Funding Request", "Funding Request Transaction"):
+        user = get_user(row['user_id'])
+        return (
+            "💳 <b>FUNDING REQUEST</b>\n\n"
+            f"🧾 Request ID: <code>{row['request_id']}</code>\n"
+            f"📊 Status: {row['status']}\n"
+            f"👤 User: {html.escape(user['name'] if user else 'Unknown')}\n"
+            f"🆔 User ID: <code>{row['user_id']}</code>\n"
+            f"💰 Credit: {float(row['usdt_amount']):.6f} USDT\n"
+            f"📅 Created: {row['created_at']}\n"
+            f"🔖 Credited TXN: <code>{row['credited_txn_id'] or '—'}</code>"
+        )
+    if kind == "Funding Method":
+        return (
+            "💳 <b>FUNDING METHOD</b>\n\n"
+            f"🧾 ID: <code>{row['method_id']}</code>\n"
+            f"🏷️ Name: {html.escape(row['name'])}\n"
+            f"💱 Currency: {html.escape(row['currency_code'])}\n"
+            f"📈 Rate: {float(row['rate_usdt']):.8f} USDT\n"
+            f"🚦 Status: {'ACTIVE' if row['active'] else 'DISABLED'}\n"
+            f"📥 Destination: {html.escape(row['destination'])}"
+        )
+    if kind in ("Transaction", "Audit Reference"):
+        user = get_user(row['user_id']) if 'user_id' in row.keys() and row['user_id'] else None
+        return (
+            f"🧾 <b>{'TRANSACTION' if kind == 'Transaction' else 'AUDIT REFERENCE'}</b>\n\n"
+            f"🔖 ID: <code>{row['txn_id']}</code>\n"
+            + (f"👤 User ID: <code>{row['user_id']}</code>\n" if 'user_id' in row.keys() and row['user_id'] else "")
+            + (f"💰 Amount: {fmt_amount(row['amount'], row['currency'])}\n" if 'amount' in row.keys() and row['amount'] is not None and 'currency' in row.keys() else "")
+            + (f"🏷️ Type: {html.escape(str(row['type']))}\n" if 'type' in row.keys() and row['type'] else "")
+            + (f"📊 Status: {html.escape(str(row['status']))}\n" if 'status' in row.keys() and row['status'] else "")
+            + (f"📝 Reason: {html.escape(str(row['reason']))}\n" if 'reason' in row.keys() and row['reason'] else "")
+            + (f"📅 Created: {row['created_at']}" if 'created_at' in row.keys() else "")
+        )
+    if kind in ("Withdrawal", "Withdrawal Transaction"):
+        user = get_user(row['user_id'])
+        return (
+            "💵 <b>WITHDRAWAL</b>\n\n"
+            f"🧾 Withdrawal ID: <code>{row['withdrawal_id']}</code>\n"
+            f"📊 Status: {row['status']}\n"
+            f"👤 User: {html.escape(user['name'] if user else 'Unknown')}\n"
+            f"🆔 User ID: <code>{row['user_id']}</code>\n"
+            f"💰 Amount: {fmt_amount(row['amount'], row['currency'])}\n"
+            f"🏦 Method: {html.escape(row['method'] or '—')}\n"
+            f"📅 Created: {row['created_at']}\n"
+            f"🔖 TXN ID: <code>{row['txn_id'] or '—'}</code>"
+        )
+    if kind == "Bank/Wallet/Crypto":
+        user = get_user(row['user_id'])
+        return (
+            "🏦 <b>BANK/WALLET/CRYPTO SUBMISSION</b>\n\n"
+            f"🧾 Reference: <code>{row['bank_id']}</code>\n"
+            f"📊 Status: {row['status']}\n"
+            f"👤 User: {html.escape(user['name'] if user else 'Unknown')}\n"
+            f"🆔 User ID: <code>{row['user_id']}</code>\n"
+            f"🏷️ Category: {html.escape(row['category'])}\n"
+            f"🏦 Method: {html.escape(row['method'])}\n"
+            f"📝 Details: {html.escape(row['details'])}\n"
+            f"📅 Created: {row['created_at']}"
+        )
+    if kind == "Support Ticket":
+        user = get_user(row['user_id'])
+        return (
+            "🎫 <b>SUPPORT TICKET</b>\n\n"
+            f"🧾 Reference: <code>{row['ticket_id']}</code>\n"
+            f"📊 Status: {row['status']}\n"
+            f"👤 User: {html.escape(user['name'] if user else 'Unknown')}\n"
+            f"🆔 User ID: <code>{row['user_id']}</code>\n"
+            f"📝 Complaint: {html.escape(row['complaint'] or '(media only)')}\n"
+            f"📅 Created: {row['created_at']}"
+        )
+    if kind == "Work Submission":
+        user = get_user(row['user_id'])
+        return (
+            "📝 <b>WORK SUBMISSION</b>\n\n"
+            f"🧾 Reference: <code>{row['sub_id']}</code>\n"
+            f"📊 Status: {row['status']}\n"
+            f"👤 User: {html.escape(user['name'] if user else 'Unknown')}\n"
+            f"🆔 User ID: <code>{row['user_id']}</code>\n"
+            f"🏷️ Work Type: {html.escape(row['work_type'])}\n"
+            f"📌 Sub Type: {html.escape(row['sub_type'])}\n"
+            f"📅 Created: {row['created_at']}"
+        )
+    if kind == "Quick OTP Order":
+        return (
+            "📱 <b>QUICK OTP ORDER</b>\n\n"
+            f"🧾 Order ID: <code>{row['order_id']}</code>\n"
+            f"👤 User ID: <code>{row['user_id']}</code>\n"
+            f"📱 Service: {html.escape(str(row['service_name'] or row['service_code'])) if 'service_name' in row.keys() else html.escape(str(row['service_code']))}\n"
+            f"🌍 Country: {html.escape(str(row['country_name']))}\n"
+            f"📊 Status: {html.escape(str(row['status']))}\n"
+            f"💰 Price: {float(row['selling_price']):.2f} USDT\n"
+            f"📅 Created: {row['created_at']}"
+        )
+    if kind == "Custom Handle":
+        return f"🧩 <b>CUSTOM HANDLE</b>\n\n🧾 ID: <code>{row['handle_id']}</code>\n🏷️ Label: {html.escape(row['label'])}\n📊 Active: {'YES' if row['active'] else 'NO'}"
+    if kind == "Auto Message":
+        return f"⏰ <b>AUTO MESSAGE</b>\n\n🧾 ID: <code>{row['auto_id']}</code>\n🏷️ Title: {html.escape(row['title'])}\n📊 Active: {'YES' if row['active'] else 'NO'}"
+    if kind == "Menu Option":
+        return f"🧩 <b>MENU OPTION</b>\n\n🧾 ID: <code>{row['option_id']}</code>\n🏷️ Label: {html.escape(row['label'])}\n📂 Section: {html.escape(row['section'])}\n📊 Active: {'YES' if row['active'] else 'NO'}"
+    return f"🔎 <b>{html.escape(kind)}</b>\n\n{html.escape(str(dict(row)))}"
+
+
+@bot.message_handler(func=lambda m: m.text == "🔎 Search Any ID" and is_admin(m.chat.id))
+@safe_handler
+def admin_search_any_id_start(m):
+    clear_state(m.chat.id)
+    update_state(m.chat.id, flow="admin_any_id_search")
+    bot.send_message(
+        m.chat.id,
+        "🔎 <b>SEARCH ANY ID</b>\n\nSend any ID/reference generated by the bot. Examples:\n• FUND-4A24406B\n• WD-XXXXXXXX\n• TXN-XXXXXXXX\n• SUB-XXXXXXXX\n• BANKREQ-XXXXXXXX\n• SUP-XXXXXXXX\n• QOTP-XXXXXXXX\n• Telegram User ID\n\nThe bot will search all supported ID types automatically.",
+        parse_mode="HTML",
+        reply_markup=back_kb(),
+    )
+
+
+def _handle_admin_any_id_search(m, state):
+    if not is_admin(m.chat.id):
+        clear_state(m.chat.id)
+        return
+    query = m.text.strip()
+    clear_state(m.chat.id)
+    results = _search_any_id(query)
+    if not results:
+        bot.send_message(m.chat.id, f"❌ No record found for ID/reference:\n\n<code>{html.escape(query)}</code>", parse_mode="HTML", reply_markup=main_menu(m.chat.id))
+        return
+    # De-duplicate exact same row/ID matches while keeping useful cross-table matches.
+    seen = set()
+    chunks = []
+    for kind, _, row in results:
+        marker = (kind, tuple(row))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        chunks.append(_format_any_id_result(kind, row))
+    text = "🔎 <b>SEARCH RESULTS</b>\n\n" + "\n\n━━━━━━━━━━━━━━━━━━\n\n".join(chunks)
+    # Telegram messages have a size limit; split safely if needed.
+    if len(text) <= 3800:
+        bot.send_message(m.chat.id, text, parse_mode="HTML", reply_markup=main_menu(m.chat.id))
+    else:
+        for i in range(0, len(text), 3800):
+            bot.send_message(m.chat.id, text[i:i+3800], parse_mode="HTML")
+        bot.send_message(m.chat.id, "🏠 Main Menu", reply_markup=main_menu(m.chat.id))
 
 
 @bot.message_handler(func=lambda m: m.text == "🏦 Bank ID Search" and is_admin(m.chat.id))
@@ -4186,6 +5014,152 @@ def _handle_admin_withdrawal_search(m, state):
 
 
 # ================================================================
+# ADMIN: WITHDRAWAL PAYMENT METHODS
+# ================================================================
+@bot.message_handler(func=lambda m: m.text == "💸 Withdrawal Methods" and is_super_admin(m.chat.id))
+@safe_handler
+def admin_withdrawal_methods_menu(m):
+    if not is_super_admin(m.chat.id):
+        return
+    clear_state(m.chat.id)
+    rows = list_withdrawal_methods(False)
+    text = "💸 WITHDRAWAL PAYMENT METHODS\n\n"
+    text += "Users see only ACTIVE methods. Each method has an admin-defined instruction.\n\n" if rows else "No payment methods configured yet.\n\n"
+    kb = types.InlineKeyboardMarkup()
+    for r in rows:
+        status = "✅" if int(r["active"]) else "⛔"
+        kb.add(types.InlineKeyboardButton(f"{status} {r['name']}", callback_data=f"wdm_view:{r['method_id']}"))
+    kb.add(types.InlineKeyboardButton("➕ Add Payment Method", callback_data="wdm_add"))
+    kb.add(types.InlineKeyboardButton("🔄 Refresh", callback_data="wdm_refresh"))
+    bot.send_message(m.chat.id, text, reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data == "wdm_refresh")
+@safe_handler
+def admin_wdm_refresh_cb(c):
+    if not is_super_admin(c.from_user.id):
+        bot.answer_callback_query(c.id); return
+    bot.answer_callback_query(c.id)
+    admin_withdrawal_methods_menu(c.message)
+
+@bot.callback_query_handler(func=lambda c: c.data == "wdm_add")
+@safe_handler
+def admin_wdm_add_cb(c):
+    if not is_super_admin(c.from_user.id):
+        bot.answer_callback_query(c.id); return
+    clear_state(c.from_user.id)
+    update_state(c.from_user.id, flow="admin_withdraw_method", step="name")
+    bot.answer_callback_query(c.id)
+    bot.send_message(c.from_user.id, "➕ ADD WITHDRAWAL PAYMENT METHOD\n\nSend the method name users should see.\n\nExamples: Binance ID, USDT BEP20 Address, OPay, PalmPay, Bank Account, or any custom method.", reply_markup=back_kb())
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("wdm_view:"))
+@safe_handler
+def admin_wdm_view_cb(c):
+    if not is_super_admin(c.from_user.id):
+        bot.answer_callback_query(c.id); return
+    mid=c.data.split(":",1)[1]; row=get_withdrawal_method(mid)
+    if not row:
+        bot.answer_callback_query(c.id,"Method not found.",show_alert=True); return
+    status="ACTIVE" if int(row["active"]) else "OFF"
+    kb=types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("⛔ Turn OFF" if int(row["active"]) else "✅ Turn ON", callback_data=f"wdm_toggle:{mid}"))
+    kb.add(types.InlineKeyboardButton("✏️ Edit Instruction", callback_data=f"wdm_edit_prompt:{mid}"), types.InlineKeyboardButton("✏️ Rename", callback_data=f"wdm_edit_name:{mid}"))
+    kb.add(types.InlineKeyboardButton("🗑 Delete", callback_data=f"wdm_delete:{mid}"), types.InlineKeyboardButton("⬅️ Back", callback_data="wdm_back"))
+    bot.answer_callback_query(c.id)
+    bot.send_message(c.from_user.id, f"💸 <b>{html.escape(row['name'])}</b>\n\nStatus: <b>{status}</b>\nMethod ID: <code>{html.escape(row['method_id'])}</code>\n\nUser instruction:\n<code>{html.escape(row['prompt'])}</code>", parse_mode="HTML", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data == "wdm_back")
+@safe_handler
+def admin_wdm_back_cb(c):
+    if not is_super_admin(c.from_user.id):
+        bot.answer_callback_query(c.id); return
+    bot.answer_callback_query(c.id); admin_withdrawal_methods_menu(c.message)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("wdm_toggle:"))
+@safe_handler
+def admin_wdm_toggle_cb(c):
+    if not is_super_admin(c.from_user.id):
+        bot.answer_callback_query(c.id); return
+    mid=c.data.split(":",1)[1]
+    try: active=toggle_withdrawal_method(mid,c.from_user.id)
+    except Exception as e:
+        bot.answer_callback_query(c.id,str(e),show_alert=True); return
+    bot.answer_callback_query(c.id,"Enabled" if active else "Disabled")
+    row=get_withdrawal_method(mid)
+    if row:
+        # Re-render the detail page without relying on a synthetic callback object.
+        status="ACTIVE" if int(row["active"]) else "OFF"
+        kb=types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("⛔ Turn OFF" if int(row["active"]) else "✅ Turn ON", callback_data=f"wdm_toggle:{mid}"))
+        kb.add(types.InlineKeyboardButton("✏️ Edit Instruction", callback_data=f"wdm_edit_prompt:{mid}"), types.InlineKeyboardButton("✏️ Rename", callback_data=f"wdm_edit_name:{mid}"))
+        kb.add(types.InlineKeyboardButton("🗑 Delete", callback_data=f"wdm_delete:{mid}"), types.InlineKeyboardButton("⬅️ Back", callback_data="wdm_back"))
+        bot.send_message(c.from_user.id, f"💸 <b>{html.escape(row['name'])}</b>\n\nStatus: <b>{status}</b>\nMethod ID: <code>{html.escape(row['method_id'])}</code>\n\nUser instruction:\n<code>{html.escape(row['prompt'])}</code>", parse_mode="HTML", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("wdm_edit_prompt:"))
+@safe_handler
+def admin_wdm_edit_prompt_cb(c):
+    if not is_super_admin(c.from_user.id):
+        bot.answer_callback_query(c.id); return
+    mid=c.data.split(":",1)[1]
+    if not get_withdrawal_method(mid):
+        bot.answer_callback_query(c.id,"Method not found.",show_alert=True); return
+    update_state(c.from_user.id, flow="admin_withdraw_method", step="prompt_edit", method_id=mid)
+    bot.answer_callback_query(c.id)
+    bot.send_message(c.from_user.id,"✏️ Send the exact instruction users should see.\nExample: Please send your USDT BEP20 address only.",reply_markup=back_kb())
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("wdm_edit_name:"))
+@safe_handler
+def admin_wdm_edit_name_cb(c):
+    if not is_super_admin(c.from_user.id):
+        bot.answer_callback_query(c.id); return
+    mid=c.data.split(":",1)[1]
+    if not get_withdrawal_method(mid):
+        bot.answer_callback_query(c.id,"Method not found.",show_alert=True); return
+    update_state(c.from_user.id, flow="admin_withdraw_method", step="name_edit", method_id=mid)
+    bot.answer_callback_query(c.id)
+    bot.send_message(c.from_user.id,"✏️ Send the new payment method name users should see.",reply_markup=back_kb())
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("wdm_delete:"))
+@safe_handler
+def admin_wdm_delete_cb(c):
+    if not is_super_admin(c.from_user.id):
+        bot.answer_callback_query(c.id); return
+    mid=c.data.split(":",1)[1]
+    try: delete_withdrawal_method(mid,c.from_user.id)
+    except Exception as e:
+        bot.answer_callback_query(c.id,str(e),show_alert=True); return
+    bot.answer_callback_query(c.id,"Deleted"); admin_withdrawal_methods_menu(c.message)
+
+def _handle_admin_withdraw_method(m,state):
+    if not is_super_admin(m.chat.id):
+        clear_state(m.chat.id); return
+    step=state.get("step"); value=(m.text or "").strip()
+    if not value:
+        bot.send_message(m.chat.id,"❌ Please send a value."); return
+    if step=="name":
+        if fetchone("SELECT 1 FROM withdrawal_methods WHERE lower(name)=lower(?)",(value,)):
+            bot.send_message(m.chat.id,"❌ That payment method already exists. Send a different name."); return
+        update_state(m.chat.id,flow="admin_withdraw_method",step="prompt",name=value)
+        bot.send_message(m.chat.id,"✍️ Now send the exact instruction users should receive.\nExample: Please send your Binance ID only.",reply_markup=back_kb()); return
+    if step=="prompt":
+        name=state.get("name"); mid=gen_id("WDM")
+        create_withdrawal_method(mid,name,value,m.chat.id,active=1)
+        clear_state(m.chat.id)
+        bot.send_message(m.chat.id,f"✅ Payment method created and ACTIVE.\n\n💳 {html.escape(name)}\n📝 {html.escape(value)}",parse_mode="HTML",reply_markup=admin_menu(m.chat.id)); return
+    mid=state.get("method_id"); row=get_withdrawal_method(mid)
+    if not row:
+        clear_state(m.chat.id); bot.send_message(m.chat.id,"❌ Payment method no longer exists.",reply_markup=admin_menu(m.chat.id)); return
+    if step=="prompt_edit":
+        update_withdrawal_method(mid,prompt=value,admin_id=m.chat.id)
+    elif step=="name_edit":
+        if fetchone("SELECT 1 FROM withdrawal_methods WHERE lower(name)=lower(?) AND method_id<>?",(value,mid)):
+            bot.send_message(m.chat.id,"❌ Another payment method already uses that name. Send a different name."); return
+        update_withdrawal_method(mid,name=value,admin_id=m.chat.id)
+    else:
+        clear_state(m.chat.id); return
+    clear_state(m.chat.id); bot.send_message(m.chat.id,"✅ Withdrawal payment method updated.",reply_markup=admin_menu(m.chat.id))
+
+
+# ================================================================
 # ADMIN: SETTINGS (USDT minimum withdrawal/referral settings — anytime)
 # ================================================================
 
@@ -4207,7 +5181,7 @@ def admin_settings_menu(m):
         f"💰 Min Withdrawal (USDT): {fmt_amount(get_min_withdrawal('usdt'), 'usdt')}\n"
         f"🎁 Referral Amount (USDT): {fmt_amount(get_referral_amount('usdt'), 'usdt')}\n"
         f"🔘 Referral Status: {'✅ ON' if ref_on else '⛔ OFF'}\n\n"
-        "Tap a value below to change it:"
+        "Default minimum withdrawal is 2.00 USDT. You can change it below at any time.\n\nTap a value below to change it:"
     )
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("✏️ Min Withdrawal (USDT)", callback_data="setedit_min_withdrawal_usdt"))
@@ -4951,9 +5925,9 @@ FEATURE_LINK_LABELS = {
     "submit_work":   "📤 Submit Work",
     "buy_sell_mail": "🛒 Buy or Sell Mail",
     "balance":       "💰 My Balance",
-    "withdraw":      "💸 Withdraw",
+    "withdraw":      "💸 Withdrawal",
     "referrals":     "👥 My Referrals",
-    "history":       "📜 Transaction History",
+    "history":       "📜 History",
     "bank_details":  "🏦 Bank Details",
     "support":       "📞 Support",
     "profile":       "👤 My Profile",
@@ -5699,6 +6673,12 @@ def _mail_option_labels():
 @bot.message_handler(func=lambda m: m.text in _mail_option_labels())
 @safe_handler
 def contact_for_purchase(m):
+    if feature_blocked_message(m, "buy_sell_mail"):
+        return
+    option = get_menu_option_by_label("mail_option", m.text.strip())
+    if option is not None and not is_feature_enabled(f"menu_option:{option['option_id']}", m.chat.id):
+        bot.send_message(m.chat.id, "🚫 This option is currently unavailable.", reply_markup=main_menu(m.chat.id))
+        return
     contact_info = (
         f"To purchase {m.text}, please contact our official agent:\n\n"
         "👤 Telegram Agent: https://t.me/ahmerdeebbr\n"
@@ -5739,11 +6719,16 @@ def _work_category_labels():
 @bot.message_handler(func=lambda m: m.text in _work_category_labels())
 @safe_handler
 def work_category_selected(m):
+    if feature_blocked_message(m, "submit_work"):
+        return
     state = get_state(m.chat.id)
     if state.get("flow") != "work":
         return
     cat = get_menu_option_by_label("work_category", m.text.strip())
     if cat is None:
+        return
+    if not is_feature_enabled(f"menu_option:{cat['option_id']}", m.chat.id):
+        bot.send_message(m.chat.id, "🚫 This work option is currently unavailable.", reply_markup=main_menu(m.chat.id))
         return
     update_state(m.chat.id, flow="work", work_type=cat["label"], work_category_id=cat["option_id"])
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -5760,8 +6745,14 @@ def _work_subtype_labels():
 @bot.message_handler(func=lambda m: m.text in _work_subtype_labels())
 @safe_handler
 def fb_subtype(m):
+    if feature_blocked_message(m, "submit_work"):
+        return
     state = get_state(m.chat.id)
     if state.get("flow") != "work":
+        return
+    sub = get_menu_option_by_label("work_subtype", m.text.strip(), parent_key=state.get("work_category_id"))
+    if sub is not None and not is_feature_enabled(f"menu_option:{sub['option_id']}", m.chat.id):
+        bot.send_message(m.chat.id, "🚫 This work option is currently unavailable.", reply_markup=main_menu(m.chat.id))
         return
     update_state(m.chat.id, sub_type=m.text)
     bot.send_message(m.chat.id, "📤 Please upload proof (Sheet File / Photo):", reply_markup=back_kb())
@@ -5872,6 +6863,8 @@ def _delete_submission_admin_messages(sub_id):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("sub_approve_"))
 @safe_handler
 def sub_approve_cb(c):
+    if not is_admin(c.from_user.id):
+        return bot.answer_callback_query(c.id, "Admin only", show_alert=True)
     sub_id = c.data[len("sub_approve_"):]
     try:
         row = approve_submission(sub_id, c.from_user.id)
@@ -5940,6 +6933,8 @@ def sub_approve_cb(c):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("sub_reject_"))
 @safe_handler
 def sub_reject_cb(c):
+    if not is_admin(c.from_user.id):
+        return bot.answer_callback_query(c.id, "Admin only", show_alert=True)
     sub_id = c.data[len("sub_reject_"):]
     row = fetchone("SELECT * FROM submissions WHERE sub_id=?", (sub_id,))
     if row is None:
@@ -6030,13 +7025,19 @@ def _list_kb(items):
 @bot.message_handler(func=lambda m: m.text == btn_label("bank_details"))
 @safe_handler
 def bank_menu(m):
-    if feature_blocked_message(m, "bank_details"):
+    if not is_feature_enabled("bank_details", m.chat.id) or not is_feature_enabled("withdrawal_payment_details", m.chat.id):
+        bot.send_message(m.chat.id, "🚫 Withdrawal payment-details setup is currently unavailable. Please contact Support.", reply_markup=main_menu(m.chat.id))
+        return
+    # Backwards compatibility for an old/custom keyboard. Payment details
+    # are now managed from inside Withdrawal.
+    if feature_blocked_message(m, "withdraw"):
         return
     clear_state(m.chat.id)
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("💱 Crypto")
-    kb.row("🔙 Back")
-    bot.send_message(m.chat.id, "Select your USDT withdrawal destination:", reply_markup=kb)
+    bank = get_bank_details(m.chat.id)
+    if bank is None:
+        _show_withdraw_payment_setup(m.chat.id)
+    else:
+        _show_saved_withdrawal_details(m.chat.id, bank)
 
 
 @bot.message_handler(func=lambda m: False)
@@ -6056,14 +7057,21 @@ def bank_category_wallet(m):
 @bot.message_handler(func=lambda m: m.text == "💱 Crypto")
 @safe_handler
 def bank_category_crypto(m):
-    update_state(m.chat.id, flow="bank", step="choose_method", category="crypto")
-    bot.send_message(m.chat.id, "Select your crypto exchange/wallet:", reply_markup=_list_kb(CRYPTO_LIST))
+    # Legacy keyboards may still contain this button. Never expose the old
+    # hard-coded list: payment methods are now entirely admin-controlled.
+    if not is_feature_enabled("withdraw", m.chat.id) or not is_feature_enabled("withdrawal_payment_details", m.chat.id):
+        return bot.send_message(m.chat.id, "🚫 Withdrawal payment details are currently unavailable.", reply_markup=main_menu(m.chat.id))
+    _show_withdraw_payment_setup(m.chat.id)
 
 
 @bot.message_handler(func=lambda m: get_state(m.chat.id).get("flow") == "bank"
                       and get_state(m.chat.id).get("step") == "choose_method")
 @safe_handler
 def choose_bank_method(m):
+    if not is_feature_enabled("withdraw", m.chat.id) or not is_feature_enabled("withdrawal_payment_details", m.chat.id):
+        clear_state(m.chat.id)
+        bot.send_message(m.chat.id, "🚫 Withdrawal payment details are currently unavailable.", reply_markup=main_menu(m.chat.id))
+        return
     state = get_state(m.chat.id)
     category = state.get("category")
     method = m.text.strip()
@@ -6155,6 +7163,8 @@ def _delete_bank_admin_messages(bank_id):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("bank_approve_"))
 @safe_handler
 def bank_approve_cb(c):
+    if not is_admin(c.from_user.id):
+        return bot.answer_callback_query(c.id, "Admin only", show_alert=True)
     bank_id = c.data[len("bank_approve_"):]
     try:
         row = approve_bank_submission(bank_id, c.from_user.id)
@@ -6204,6 +7214,8 @@ def bank_approve_cb(c):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("bank_decline_"))
 @safe_handler
 def bank_decline_cb(c):
+    if not is_admin(c.from_user.id):
+        return bot.answer_callback_query(c.id, "Admin only", show_alert=True)
     bank_id = c.data[len("bank_decline_"):]
     row = get_bank_submission(bank_id)
     if row is None:
@@ -6258,6 +7270,8 @@ def _handle_bank_decline_reason(m, state):
 @bot.message_handler(func=lambda m: m.text == "💳 Fund Wallet")
 @safe_handler
 def fund_wallet_menu(m):
+    if feature_blocked_message(m, "fund_wallet"):
+        return
     methods = list_fund_methods(active_only=True)
     if not methods:
         bot.send_message(m.chat.id, "💳 Funding is currently unavailable. Please try again later.", reply_markup=main_menu(m.chat.id))
@@ -6482,6 +7496,9 @@ def fund_admin_delete_cb(c):
 @bot.callback_query_handler(func=lambda c: c.data == "fund_admin_back")
 @safe_handler
 def fund_admin_back_cb(c):
+    if not is_super_admin(c.from_user.id):
+        return bot.answer_callback_query(c.id, "Super Admin only", show_alert=True)
+    bot.answer_callback_query(c.id)
     fund_admin_menu(c.message)
 
 # ================================================================
@@ -6635,6 +7652,9 @@ def custom_handle_dispatch(m):
     handle = get_custom_handle_by_label(m.text.strip())
     if handle is None:
         return
+    if not is_feature_enabled(f"custom_handle:{handle['handle_id']}", m.chat.id):
+        bot.send_message(m.chat.id, "🚫 This handle is currently unavailable.", reply_markup=main_menu(m.chat.id))
+        return
     try:
         cfg = json.loads(handle["config_json"])
     except Exception:
@@ -6684,6 +7704,7 @@ _FLOW_ROUTES = {
     ("admin_fund", "action"): _handle_admin_fund_action,
     ("admin_fund", "amount"): _handle_admin_fund_amount,
     ("admin_fund", "reason"): _handle_admin_fund_reason,
+    ("admin_dynamic_feature_restrict", "user_id"): _handle_admin_dynamic_feature_restrict_user_id,
     ("admin_broadcast", "text"): _handle_admin_broadcast_text,
     ("admin_msg", "user_id"): _handle_admin_msg_user_id,
     ("admin_msg", "body"): _handle_admin_msg_body,
@@ -6696,11 +7717,13 @@ _FLOW_ROUTES = {
     ("admin_unban", "user_id"): _handle_admin_unban_user_id,
     ("admin_add_user", "user_id"): _handle_admin_add_user_id,
     ("admin_add_admin", "user_id"): _handle_admin_add_admin,
+    ("admin_any_id_search", None): _handle_admin_any_id_search,
     ("admin_bank_search", None): _handle_admin_bank_search,
     ("admin_support_search", None): _handle_admin_support_search,
     ("admin_submission_search", None): _handle_admin_submission_search,
     ("admin_user_search", None): _handle_admin_user_search,
     ("admin_withdrawal_search", None): _handle_admin_withdrawal_search,
+    ("admin_withdraw_method", None): _handle_admin_withdraw_method,
     ("admin_setting", None): _handle_admin_setting,
     ("community_set", "value"): _handle_community_set,
     ("text_edit", None): _handle_text_edit,
@@ -6814,6 +7837,63 @@ CREATE INDEX IF NOT EXISTS idx_otp_orders_status ON otp_orders(status);
 
 _GRIZZLY_COUNTRY_META = {'1': ('Ukraine', 'UA'), '2': ('Kazakhstan', 'KZ'), '3': ('China', 'CN'), '4': ('Philippines', 'PH'), '6': ('Indonesia', 'ID'), '7': ('Malaysia', 'MY'), '8': ('Kenya', 'KE'), '9': ('Tanzania', 'TZ'), '10': ('Vietnam', 'VN'), '11': ('Kyrgyzstan', 'KG'), '12': ('USA (virtual)', 'US'), '13': ('Israel', 'IL'), '14': ('Hong Kong', 'HK'), '15': ('Poland', 'PL'), '16': ('United Kingdom', 'GB'), '17': ('Madagascar', 'MG'), '18': ('DR Congo', 'CD'), '19': ('Nigeria', 'NG'), '20': ('Macao', 'MO'), '21': ('Egypt', 'EG'), '22': ('India', 'IN'), '23': ('Ireland', 'IE'), '24': ('Cambodia', 'KH'), '25': ('Laos', 'LA'), '26': ('Haiti', 'HT'), '27': ('Ivory Coast', 'CI'), '28': ('Gambia', 'GM'), '29': ('Serbia', 'RS'), '30': ('Yemen', 'YE'), '31': ('South Africa', 'ZA'), '32': ('Romania', 'RO'), '33': ('Colombia', 'CO'), '34': ('Estonia', 'EE'), '35': ('Azerbaijan', 'AZ'), '36': ('Canada', 'CA'), '37': ('Morocco', 'MA'), '38': ('Ghana', 'GH'), '39': ('Argentina', 'AR'), '40': ('Uzbekistan', 'UZ'), '41': ('Cameroon', 'CM'), '42': ('Chad', 'TD'), '43': ('Germany', 'DE'), '44': ('Lithuania', 'LT'), '45': ('Croatia', 'HR'), '46': ('Sweden', 'SE'), '48': ('Netherlands', 'NL'), '49': ('Latvia', 'LV'), '50': ('Austria', 'AT'), '52': ('Thailand', 'TH'), '53': ('Saudi Arabia', 'SA'), '55': ('Taiwan', 'TW'), '56': ('Spain', 'ES'), '58': ('Algeria', 'DZ'), '59': ('Slovenia', 'SI'), '60': ('Bangladesh', 'BD'), '61': ('Senegal', 'SN'), '62': ('Turkey', 'TR'), '63': ('Czech Republic', 'CZ'), '64': ('Sri Lanka', 'LK'), '65': ('Peru', 'PE'), '66': ('Pakistan', 'PK'), '67': ('New Zealand', 'NZ'), '68': ('Guinea', 'GN'), '69': ('Mali', 'ML'), '71': ('Ethiopia', 'ET'), '73': ('Brazil', 'BR'), '74': ('Afghanistan', 'AF'), '75': ('Uganda', 'UG'), '76': ('Angola', 'AO'), '77': ('Cyprus', 'CY'), '78': ('France', 'FR'), '79': ('Papua New Guinea', 'PG'), '80': ('Mozambique', 'MZ'), '81': ('Nepal', 'NP'), '82': ('Belgium', 'BE'), '83': ('Bulgaria', 'BG'), '84': ('Hungary', 'HU'), '86': ('Italy', 'IT'), '87': ('Paraguay', 'PY'), '88': ('Honduras', 'HN'), '89': ('Tunisia', 'TN'), '90': ('Nicaragua', 'NI'), '91': ('Timor-Leste', 'TL'), '92': ('Bolivia', 'BO'), '93': ('Costa Rica', 'CR'), '94': ('Guatemala', 'GT'), '95': ('United Arab Emirates', 'AE'), '96': ('Zimbabwe', 'ZW'), '97': ('Puerto Rico', 'PR'), '99': ('Togo', 'TG'), '100': ('Kuwait', 'KW'), '101': ('El Salvador', 'SV'), '102': ('Tonga', 'TO'), '103': ('Jamaica', 'JM'), '104': ('Trinidad and Tobago', 'TT'), '105': ('Ecuador', 'EC'), '106': ('Eswatini', 'SZ'), '107': ('Oman', 'OM'), '108': ('Bosnia and Herzegovina', 'BA'), '109': ('Dominican Republic', 'DO'), '111': ('Qatar', 'QA'), '112': ('Panama', 'PA'), '114': ('Mauritania', 'MR'), '115': ('Sierra Leone', 'SL'), '116': ('Jordan', 'JO'), '117': ('Portugal', 'PT'), '118': ('Barbados', 'BB'), '119': ('Burundi', 'BI'), '120': ('Benin', 'BJ'), '121': ('Brunei Darussalam', 'BN'), '122': ('Bahamas', 'BS'), '123': ('Botswana', 'BW'), '124': ('Belize', 'BZ'), '125': ('Central African Republic', 'CF'), '128': ('Georgia', 'GE'), '129': ('Greece', 'GR'), '130': ('Guinea-Bissau', 'GW'), '131': ('Guyana', 'GY'), '132': ('Iceland', 'IS'), '133': ('Comoros', 'KM'), '134': ('Saint Kitts and Nevis', 'KN'), '135': ('Liberia', 'LR'), '136': ('Lesotho', 'LS'), '137': ('Malawi', 'MW'), '138': ('Namibia', 'NA'), '139': ('Niger', 'NE'), '140': ('Rwanda', 'RW'), '141': ('Slovakia', 'SK'), '142': ('Suriname', 'SR'), '143': ('Tajikistan', 'TJ'), '145': ('Bahrain', 'BH'), '146': ('Reunion', 'RE'), '147': ('Zambia', 'ZM'), '148': ('Armenia', 'AM'), '149': ('Somalia', 'SO'), '150': ('Republic of the Congo', 'CG'), '151': ('Chile', 'CL'), '152': ('Burkina Faso', 'BF'), '154': ('Gabon', 'GA'), '155': ('Albania', 'AL'), '156': ('Uruguay', 'UY'), '157': ('Mauritius', 'MU'), '158': ('Bhutan', 'BT'), '159': ('Maldives', 'MV'), '161': ('Turkmenistan', 'TM'), '162': ('French Guiana', 'GF'), '163': ('Finland', 'FI'), '164': ('Saint Lucia', 'LC'), '165': ('Luxembourg', 'LU'), '166': ('Saint Vincent', 'VC'), '167': ('Equatorial Guinea', 'GQ'), '168': ('Djibouti', 'DJ'), '169': ('Antigua and Barbuda', 'AG'), '170': ('Cayman Islands', 'KY'), '171': ('Montenegro', 'ME'), '172': ('Denmark', 'DK'), '173': ('Switzerland', 'CH'), '174': ('Norway', 'NO'), '175': ('Australia', 'AU'), '176': ('Eritrea', 'ER'), '177': ('South Sudan', 'SS'), '178': ('Sao Tome and Principe', 'ST'), '179': ('Aruba', 'AW'), '180': ('Montserrat', 'MS'), '181': ('Anguilla', 'AI'), '182': ('Japan', 'JP'), '183': ('North Macedonia', 'MK'), '184': ('Seychelles', 'SC'), '185': ('New Caledonia', 'NC'), '186': ('Cape Verde', 'CV'), '187': ('USA', 'US'), '188': ('Palestine', 'PS'), '189': ('Fiji', 'FJ'), '199': ('Malta', 'MT'), '201': ('Gibraltar', 'GI'), '203': ('Kosovo', 'XK'), '204': ('Niue', 'NU'), '1003': ('Bermuda', 'BM'), '1007': ('Vanuatu', 'VU'), '1008': ('Greenland', 'GL'), '1011': ('Martinique', 'MQ'), '1012': ('French Polynesia', 'PF'), '10161': ('American Samoa', 'AS'), '10348': ('Liechtenstein', 'LI'), '10349': ('Sint Maarten', 'SX'), '10350': ('South Korea', 'KR'), '10351': ('Singapore', 'SG')}
 
+# Human-readable Grizzly/SMS-Activate-compatible service labels.
+_OTP_SERVICE_LABELS = {
+    'tg':'Telegram','wa':'WhatsApp','ig':'Instagram','fb':'Facebook','go':'Google / YouTube / Gmail',
+    'tw':'Twitter / X','mm':'Microsoft','hw':'Alipay / Alibaba / 1688','am':'Amazon','oi':'Tinder',
+    'ma':'Mail.ru','ds':'Discord','mt':'Steam','lf':'TikTok / Douyin','me':'LINE','dr':'OpenAI',
+    'tn':'LinkedIn','vk':'VK','mb':'Yahoo','ya':'Yandex','dh':'eBay','pm':'AOL','ts':'PayPal',
+    'dl':'Lazada','ok':'OK.ru','ka':'Shopee','nz':'Foodpanda','ub':'Uber','wb':'WeChat','yw':'Grindr',
+    'acz':'Claude','bw':'Signal','vi':'Viber','xd':'Tokopedia','kt':'KakaoTalk','sn':'OLX','kc':'Vinted',
+    'pf':'pof.com','qf':'RedBook','ll':'888casino','wx':'Apple','yl':'Yalla','mj':'Zalo','fu':'Snapchat',
+    'xk':'DiDi','pd':'iFood','ni':'Gojek','xh':'OVO','vm':'OkCupid','fr':'Dana','df':'Happn','bc':'GCash',
+    'jg':'Grab','mv':'Fruitz','im':'imo','gf':'Google Voice','sg':'OZON','act':'Maxis','ly':'Olacabs',
+    'vz':'Hinge','nf':'Netflix','cq':'Mercado','mo':'Bumble','yy':'Venmo','bz':'Blizzard','uk':'Airbnb',
+    'bv':'Metro','do':'Leboncoin','cb':'Bazos','zp':'Pinduoduo','wh':'TanTan','ac':'DoorDash','ev':'PicPay',
+    'ado':'SmartyPig','gx':'Hepsiburada','kf':'Weibo','tx':'Bolt','acp':'BonusLink','qq':'Tencent QQ',
+    'rr':'Wolt','cp':'Uklon','aav':'Alchemy','yr':'Miravia','ie':'bet365','acy':'Airtime','fo':'MobiKwik',
+    'ep':'Temu','ns':'Oldubil','em':'ZéDelivery','zk':'Deliveroo','dt':'Delivery Club','acb':'Spark Driver',
+    'et':'Clubhouse','tu':'Lyft','ah':'Escape From Tarkov','gp':'Ticketmaster','ad':'Iti','xq':'MPL',
+    'abx':'Kaching','abk':'GMX','ze':'Shpock','pu':'Justdating','ada':'Truth Social','zb':'FreeNow',
+    'gj':'Carousell','ib':'Immowelt','qv':'Badoo','ls':'Careem','hu':'Ukrnet','fd':'Mamba','zu':'BigC',
+    'hs':'ASDA','fk':'Blibli','aaa':'Nubank','rd':'Lenta','yu':'Xiaomi','ua':'BlaBlaCar','xy':'Depop',
+    'bn':'Alfagift','kj':'YAPPY','nc':'Payoneer','jr':'Samokat','mg':'Magnit','nt':'Sravni','abq':'Upwork',
+    'abt':'ArenaPlus','kl':'kolesa.kz','ge':'Paytm','wv':'AIS','aec':'JinJiang','zs':'Bilibili','lx':'Dewu',
+    'ae':'myGLO','acc':'LuckyLand Slots','za':'JD.com','yk':'SportMaster','gu':'Fora','adc':'PlayOJO',
+    'hx':'AliExpress','vd':'Betfair','zh':'Zoho','zo':'Kaggle','bd':'X5ID','mx':'SoulApp','ov':'Beget',
+    'lj':'Santander','qz':'Faceit','gq':'Freelancer','bl':'BIGO LIVE','bm':'MarketGuru','vg':'ShellBox',
+    'fz':'KFC','ff':'AVON','rl':'inDriver','lc':'Subito','bo':'Wise','at':'Perfluence','jx':'Swiggy',
+    'wc':'Craigslist','ue':'Onet','km':'Rozetka','gr':'AstroPay','jl':'Hopi','cm':'Prom','ex':'Linode',
+    'tl':'Truecaller','ps':'Zdorov','rt':'hily','acn':'Radium','xu':'RecargaPay','jq':'Paysafecard','gk':'AptekaRU',
+    'ng':'FunPay','acj':'Meituan','li':'Baidu','mi':'Zupee','rn':'Neftm','abc':'Taptap Send','cn':'Fiverr',
+    'ta':'Wink','sh':'Vkusvill','sm':'YoWin','qy':'Zhihu','hb':'Twitch','kx':'Vivo','nl':'Myntra','vp':'Kwai',
+    'dp':'ProtonMail','re':'Coinbase','gi':'Hotline','rc':'Skype','ys':'ZCity','yj':'eWallet','co':'Rediffmail',
+    'ye':'ZaleyCash','yx':'JTExpress','th':'WestStein','vy':'Meta','cr':'TenChat','bh':'Uteka','ix':'Celcoin',
+    'zm':'OfferUp','hy':'Ininal','ml':'ApostaGanha','mz':'Zolushka','hz':'Drom','po':'premium.one','bb':'LazyPay',
+    'hp':'Meesho','aau':'RocketReach','ip':'Burger King','acw':'YouDo','oj':'LoveRu','aq':'Glovo','wg':'Skout',
+    'cj':'Dotz','xt':'Flipkart','rk':'Fotka','fh':'Lalamove','vc':'Banqi','my':'CAIXA','ky':'Spaten Oktoberfest',
+    'sd':'Dodo Pizza','ln':'Grofers','kh':'Bukalapak','zd':'Zilch','ve':'Dream11','xz':'Paycell','ul':'Getir',
+    'aeb':'GoPayz','oz':'Poshmark','ao':'UU163','wd':'CasinoPlus','aba':'Rappi','kk':'Idealista','adp':'Cabify',
+    'uz':'OffGamers','oe':'Codashop','adr':'Boosty','ck':'BeReal','sr':'Starbucks','il':'IQOS','fj':'Potato Chat',
+    'sy':'Brahma','yi':'Yemeksepeti','aby':'Coupons.com','ax':'CrefisaMais','dn':'Paxful','no':'Virgo','wr':'Walmart',
+    'ko':'AdaKami','acs':'Tata CLiQ Palette','rm':'Faberlic','aaq':'NetEase','jc':'IVI','fa':'XadrezFeliz',
+    'mc':'MiChat','ow':'Reg.ru','an':'Adidas','kq':'FotoCasa','tm':'Akulaku','gw':'CallApp','fl':'RummyLoot',
+    'jd':'GiraBank','ld':'Cashmine','adl':'EarnEasy','kb':'Kufar','abo':'WEBDE','dd':'CloudChat','ks':'Hirect',
+    'lt':'BitClout','zr':'Papara','je':'Nanovest','rf':'Akudo','cg':'Gemgala','sc':'Crypto','xg':'Dzen',
+    'uwc':'Odobrenie','lsq':'Spoiler','syg':'JustDates','twm':'Solana','kd':'IviNews','lp':'Crypto Mining',
+    'dx':'CubeTV','atq':'Avto2Ru','adq':'ACMarket','ijd':'INTENCITY','iud':'AdGuard','adw':'Wolt','fp':'Buy+',
+    'liq':'Limpkin','fpq':'YouZik','adk':'Odnoklassniki','abp':'Youzik','kn':'Kinopoisk','lxq':'LMZ',
+    'fwq':'Nova Poshta','ffq':'Tanuki','fq':'Rozetka','flq':'GuaiGuai','fn':'Shopee','fzq':'Smart Finance',
+    'qfq':'Amedia','fqq':'BlockParty','bf':'OLX'
+}
+
+def _otp_service_display_name(code, candidate=None):
+    code=str(code or '').strip()
+    candidate=str(candidate or '').strip()
+    if candidate and candidate.lower() != code.lower() and candidate.lower() not in {'unknown','none','null'}:
+        return candidate
+    return _OTP_SERVICE_LABELS.get(code.lower()) or (f'Grizzly Service ({code})' if code else 'Grizzly Service')
+
 _OTP_SERVICE_EMOJIS = {
     'whatsapp':'🟢','facebook':'🔵','telegram':'✈️','instagram':'📸','google':'🔎','gmail':'✉️','youtube':'▶️',
     'tiktok':'🎵','twitter':'🐦','x':'❎','discord':'🎮','signal':'🔐','snapchat':'👻','viber':'📞','line':'💚',
@@ -6829,6 +7909,34 @@ def _otp_flag_from_iso(code):
     code=str(code or '').upper().strip()
     if len(code) != 2 or not code.isalpha(): return '🌍'
     return ''.join(chr(127397 + ord(ch)) for ch in code)
+
+def _otp_iso_from_country_name(name):
+    if not pycountry: return ''
+    raw=' '.join(str(name or '').strip().split())
+    if not raw: return ''
+    aliases={
+        'USA':'US','United States':'US','United States of America':'US','USA (virtual)':'US',
+        'UK':'GB','England':'GB','United Kingdom':'GB','Southafrica':'ZA','South Africa':'ZA',
+        'Uae':'AE','UAE':'AE','United Arab Emirates':'AE','Salvador':'SV','Czech':'CZ','Czech Republic':'CZ',
+        'Srilanka':'LK','Sri Lanka':'LK','Saudiarabia':'SA','Saudi Arabia':'SA','Newzealand':'NZ','New Zealand':'NZ',
+        'HongKong':'HK','Hong Kong':'HK','Macao':'MO','Macau':'MO','DCongo':'CD','DR Congo':'CD',
+        'Congo':'CG','Republic of the Congo':'CG','Ivory':'CI','Ivory Coast':'CI','Timorleste':'TL','Timor-Leste':'TL',
+        'Costarica':'CR','Costa Rica':'CR','Puertorico':'PR','Puerto Rico':'PR','Papua':'PG','Papua New Guinea':'PG',
+        'Bosnia':'BA','Bosnia and Herzegovina':'BA','Guineabissau':'GW','Guinea-Bissau':'GW',
+        'Saintkitts':'KN','Saint Kitts and Nevis':'KN','Saintlucia':'LC','Saint Lucia':'LC',
+        'Saintvincentgrenadines':'VC','Saint Vincent and the Grenadines':'VC','Antiguabarbuda':'AG','Antigua and Barbuda':'AG',
+        'Caymanislands':'KY','Cayman Islands':'KY','Northmacedonia':'MK','North Macedonia':'MK',
+        'Newcaledonia':'NC','New Caledonia':'NC','Capeverde':'CV','Cape Verde':'CV','Equatorialguinea':'GQ',
+        'Equatorial Guinea':'GQ','Saotomeandprincipe':'ST','Sao Tome and Principe':'ST','Southsudan':'SS','South Sudan':'SS',
+        'Frenchguiana':'GF','French Guiana':'GF','Puertorico':'PR','Reunion':'RE','Greenland':'GL','Martinique':'MQ',
+        'French Polynesia':'PF','American Samoa':'AS','Liechtenstein':'LI','Sint Maarten':'SX','South Korea':'KR'
+    }
+    if raw in aliases: return aliases[raw]
+    try:
+        c=pycountry.countries.lookup(raw)
+        return c.alpha_2.upper()
+    except Exception:
+        return ''
 
 def _otp_price(row, service_row=None):
     cost=float(row['grizzly_cost'] or 0)
@@ -6850,6 +7958,12 @@ def otp_db_init():
         # SQLite migrations for existing installations.
         try: conn.execute('ALTER TABLE otp_services ADD COLUMN global_profit_percent REAL')
         except Exception: pass
+        # Refresh human-readable service labels for existing installations.
+        existing_services=conn.execute('SELECT service_code,service_name FROM otp_services').fetchall()
+        for sr in existing_services:
+            display=_otp_service_display_name(sr['service_code'],sr['service_name'])
+            if display != sr['service_name']:
+                conn.execute('UPDATE otp_services SET service_name=?,emoji=?,updated_at=? WHERE service_code=?',(display,_otp_service_emoji(display),_otp_now(),sr['service_code']))
         # Backward-compatible migration: keep old WA settings usable in the new composite table.
         old=conn.execute('SELECT * FROM otp_countries').fetchall()
         for r in old:
@@ -6955,16 +8069,21 @@ def _otp_parse_services(payload):
     out=[]
     if isinstance(data,dict):
         for code,node in data.items():
-            if isinstance(node,dict): name=node.get('name') or node.get('title') or node.get('service') or str(code)
-            else: name=str(node or code)
-            out.append((str(code),str(name)))
+            code=str(code)
+            if isinstance(node,dict):
+                name=(node.get('name') or node.get('title') or node.get('service_name') or
+                      node.get('eng') or node.get('en') or node.get('label'))
+            else:
+                name=node if isinstance(node,str) else None
+            out.append((code,_otp_service_display_name(code,name)))
     elif isinstance(data,list):
         for node in data:
             if isinstance(node,dict):
-                code=node.get('code') or node.get('id') or node.get('service')
-                name=node.get('name') or node.get('title') or node.get('service_name') or code
-                if code: out.append((str(code),str(name)))
-    # Some providers expose a list of {service_code: ..., service_name: ...} under data.
+                code=node.get('code') or node.get('id') or node.get('service') or node.get('short_name')
+                name=node.get('name') or node.get('title') or node.get('service_name') or node.get('eng') or node.get('en') or node.get('label')
+                if code: out.append((str(code),_otp_service_display_name(code,name)))
+            elif node:
+                code=str(node); out.append((code,_otp_service_display_name(code)))
     unique={c:n for c,n in out if c}
     return list(unique.items())
 
@@ -6977,24 +8096,33 @@ def _otp_service_emoji(name):
 def _otp_parse_country_list(payload):
     data=payload.get('countries',payload.get('data',payload)) if isinstance(payload,dict) else payload
     out=[]
+    def parse_node(code,node):
+        code=str(code)
+        if not code.isdigit(): return None
+        meta=_GRIZZLY_COUNTRY_META.get(code,('', ''))
+        if isinstance(node,dict):
+            name=(node.get('name') or node.get('title') or node.get('eng') or node.get('en') or
+                  node.get('countryName') or node.get('country_name') or meta[0] or ('Country '+code))
+            iso=node.get('iso') or node.get('iso2') or node.get('country_iso') or meta[1] or _otp_iso_from_country_name(name)
+            flag=node.get('flag') or (_otp_flag_from_iso(iso) if iso else '🌍')
+        else:
+            name=str(node or meta[0] or ('Country '+code))
+            flag=_otp_flag_from_iso(meta[1] or _otp_iso_from_country_name(name)) if (meta[1] or _otp_iso_from_country_name(name)) else '🌍'
+        return code,str(name),flag
     if isinstance(data,dict):
-        for code,name in data.items():
-            code=str(code)
-            if not code.isdigit(): continue
-            meta=_GRIZZLY_COUNTRY_META.get(code,(str(name or ('Country '+code)),''))
-            cname=str(name or meta[0])
-            iso=meta[1]
-            out.append((code,cname,_otp_flag_from_iso(iso) if iso else '🌍'))
+        for code,node in data.items():
+            item=parse_node(code,node)
+            if item: out.append(item)
     elif isinstance(data,list):
         for node in data:
-            if not isinstance(node,dict): continue
-            code=node.get('code') or node.get('id') or node.get('country')
-            name=node.get('name') or node.get('title')
-            if code is None: continue
-            code=str(code)
-            if not code.isdigit(): continue
-            meta=_GRIZZLY_COUNTRY_META.get(code,(str(name or ('Country '+code)),''))
-            out.append((code,str(name or meta[0]),_otp_flag_from_iso(meta[1]) if meta[1] else '🌍'))
+            if isinstance(node,dict):
+                code=node.get('code') or node.get('id') or node.get('country') or node.get('countryCode')
+                if code is not None:
+                    item=parse_node(code,node)
+                    if item: out.append(item)
+            elif node:
+                item=parse_node(node,node)
+                if item: out.append(item)
     return list({c:(c,n,f) for c,n,f in out}.values())
 
 def otp_sync_countries():
@@ -7030,12 +8158,13 @@ def otp_sync_services():
     last=None
     try:
         r=_otp_http_catalog('getServices')
-        rows=_otp_parse_services(r.get('data',r))
+        rows=_otp_parse_services(r)
         if rows:
             with db_tx() as conn:
                 for code,name in rows:
+                    display=_otp_service_display_name(code,name)
                     conn.execute("""INSERT INTO otp_services(service_code,service_name,emoji,enabled,updated_at)
-                                    VALUES(?,?,?,?,?) ON CONFLICT(service_code) DO UPDATE SET service_name=excluded.service_name,emoji=excluded.emoji,updated_at=excluded.updated_at""",(code,name,_otp_service_emoji(name),1,_otp_now()))
+                                    VALUES(?,?,?,?,?) ON CONFLICT(service_code) DO UPDATE SET service_name=excluded.service_name,emoji=excluded.emoji,updated_at=excluded.updated_at""",(code,display,_otp_service_emoji(display),1,_otp_now()))
             return len(rows)
         last=r
     except Exception as exc: last=exc
@@ -7049,7 +8178,7 @@ def otp_sync_services():
         for c in countries:
             try:
                 r=_otp_http_catalog('getPricesV3',country=str(c['code']))
-                for code,name in _otp_services_from_price_payload(r.get('data',r)): found[code]=name
+                for code,name in _otp_services_from_price_payload(r.get('data',r)): found[code]=_otp_service_display_name(code,name)
             except Exception as exc: last=exc
         if found:
             with db_tx() as conn:
@@ -7244,6 +8373,8 @@ def _otp_show_services(chat_id, page=0, edit=None):
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_services_page:'))
 @safe_handler
 def otp_services_page_cb(c):
+    if not is_feature_enabled("quick_otp", c.from_user.id):
+        return bot.answer_callback_query(c.id, "Quick OTP is currently unavailable.", show_alert=True)
     bot.answer_callback_query(c.id); _otp_show_services(c.message.chat.id,int(c.data.split(':',1)[1]),edit=c.message.message_id)
 
 @bot.message_handler(func=lambda m: m.text == '📱 Quick OTP')
@@ -7257,6 +8388,8 @@ def otp_entry(m):
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_service:'))
 @safe_handler
 def otp_service_cb(c):
+    if not is_feature_enabled("quick_otp", c.from_user.id):
+        return bot.answer_callback_query(c.id, "Quick OTP is currently unavailable.", show_alert=True)
     service=c.data.split(':',1)[1]; svc=fetchone('SELECT * FROM otp_services WHERE service_code=? AND enabled=1',(service,))
     if not svc: return bot.answer_callback_query(c.id,'Service unavailable.',show_alert=True)
     try: otp_sync_service_stock(service)
@@ -7288,6 +8421,8 @@ def _otp_show_countries(chat_id, service, page, svc, edit=None):
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_countries_page:'))
 @safe_handler
 def otp_countries_page_cb(c):
+    if not is_feature_enabled("quick_otp", c.from_user.id):
+        return bot.answer_callback_query(c.id, "Quick OTP is currently unavailable.", show_alert=True)
     _,service,page=c.data.split(':',2); svc=fetchone('SELECT service_name,emoji FROM otp_services WHERE service_code=? AND enabled=1',(service,))
     if not svc: return bot.answer_callback_query(c.id,'Service unavailable.',show_alert=True)
     try: otp_sync_service_stock(service)
@@ -7296,11 +8431,16 @@ def otp_countries_page_cb(c):
 
 @bot.callback_query_handler(func=lambda c: c.data=='otp_services_back')
 @safe_handler
-def otp_services_back_cb(c): bot.answer_callback_query(c.id); _otp_show_services(c.message.chat.id,0,edit=c.message.message_id)
+def otp_services_back_cb(c):
+    if not is_feature_enabled("quick_otp", c.from_user.id):
+        return bot.answer_callback_query(c.id, "Quick OTP is currently unavailable.", show_alert=True)
+    bot.answer_callback_query(c.id); _otp_show_services(c.message.chat.id,0,edit=c.message.message_id)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_country:'))
 @safe_handler
 def otp_country_cb(c):
+    if not is_feature_enabled("quick_otp", c.from_user.id):
+        return bot.answer_callback_query(c.id, "Quick OTP is currently unavailable.", show_alert=True)
     _,service,code=c.data.split(':',2); row=fetchone('SELECT * FROM otp_service_countries WHERE service_code=? AND country_code=? AND enabled=1 AND profit_active=1',(service,code))
     svc=fetchone('SELECT service_name,emoji FROM otp_services WHERE service_code=?',(service,))
     if not row: return bot.answer_callback_query(c.id,'Country unavailable.',show_alert=True)
@@ -7310,6 +8450,8 @@ def otp_country_cb(c):
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_buy:'))
 @safe_handler
 def otp_buy_cb(c):
+    if not is_feature_enabled("quick_otp", c.from_user.id):
+        return bot.answer_callback_query(c.id, "Quick OTP is currently unavailable.", show_alert=True)
     _,service,code=c.data.split(':',2); bot.answer_callback_query(c.id,'Processing…')
     result,msg=_otp_create_activation(c.from_user.id,service,code,c.message.chat.id)
     if not result: return bot.send_message(c.message.chat.id,msg,parse_mode='HTML')
@@ -7321,6 +8463,8 @@ def otp_buy_cb(c):
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_new:'))
 @safe_handler
 def otp_new_cb(c):
+    if not is_feature_enabled("quick_otp", c.from_user.id):
+        return bot.answer_callback_query(c.id, "Quick OTP is currently unavailable.", show_alert=True)
     _,service,code=c.data.split(':',2); bot.answer_callback_query(c.id,'Getting a new number…')
     result,msg=_otp_create_activation(c.from_user.id,service,code,c.message.chat.id)
     if not result: return bot.send_message(c.message.chat.id,msg,parse_mode='HTML')
@@ -7331,6 +8475,8 @@ def otp_new_cb(c):
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_cancel:'))
 @safe_handler
 def otp_cancel_cb(c):
+    if not is_feature_enabled("quick_otp", c.from_user.id):
+        return bot.answer_callback_query(c.id, "Quick OTP is currently unavailable.", show_alert=True)
     order_id=c.data.split(':',1)[1]; o=fetchone('SELECT * FROM otp_orders WHERE order_id=? AND user_id=?',(order_id,str(c.from_user.id)))
     if not o or o['status']!='waiting': return bot.answer_callback_query(c.id,'This order is no longer cancellable.',show_alert=True)
     elapsed=(datetime.now(timezone.utc)-datetime.fromisoformat(o['created_at'])).total_seconds(); remaining=300-elapsed
@@ -7354,6 +8500,7 @@ def otp_admin_menu(m):
     kb=types.InlineKeyboardMarkup()
     kb.row(types.InlineKeyboardButton('🔄 Sync All Services',callback_data='otp_admin_sync_services'))
     kb.row(types.InlineKeyboardButton('🧩 Services & Pricing',callback_data='otp_admin_services:0'))
+    kb.row(types.InlineKeyboardButton('🔎 Find a Service',callback_data='otp_admin_find_service'))
     kb.row(types.InlineKeyboardButton('📊 Active Services',callback_data='otp_admin_active'))
     kb.row(types.InlineKeyboardButton('🔔 Price Change Alerts',callback_data='otp_admin_alerts'))
     bot.send_message(m.chat.id,'📱 <b>QUICK OTP SETTINGS</b>\n\n🧩 Services → 🌍 Countries → 💹 Profit → 🟢 Active\n\nOnly Super Admins can control these settings.',parse_mode='HTML',reply_markup=kb)
@@ -7364,6 +8511,48 @@ def otp_admin_sync_services(c):
     if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
     try: n=otp_sync_services(); bot.answer_callback_query(c.id,f'✅ Synced {n:,} Grizzly services.')
     except Exception as exc: bot.answer_callback_query(c.id,f'❌ Sync failed: {str(exc)[:180]}',show_alert=True)
+
+@bot.callback_query_handler(func=lambda c: c.data=='otp_admin_active')
+@safe_handler
+def otp_admin_active(c):
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
+    rows=fetchall("""SELECT s.service_code,s.service_name,s.emoji,s.enabled,s.global_profit_percent,
+              SUM(CASE WHEN sc.enabled=1 AND sc.profit_active=1 AND sc.grizzly_cost IS NOT NULL AND sc.available_count>0 AND
+                    (CASE WHEN sc.explicit_price IS NOT NULL THEN sc.explicit_price ELSE sc.grizzly_cost + sc.grizzly_cost*COALESCE(s.global_profit_percent,sc.markup_percent,0)/100 + COALESCE(sc.markup_fixed,0) END) > sc.grizzly_cost
+                   THEN 1 ELSE 0 END) AS live_countries
+              FROM otp_services s LEFT JOIN otp_service_countries sc ON sc.service_code=s.service_code
+              WHERE s.enabled=1 GROUP BY s.service_code ORDER BY s.service_name""")
+    live=[r for r in rows if int(r['live_countries'] or 0)>0]
+    kb=types.InlineKeyboardMarkup()
+    for r in live[:100]:
+        kb.add(types.InlineKeyboardButton(f"{r['emoji']} {r['service_name']} • {int(r['live_countries'])} countries",callback_data=f"otp_admin_svc:{r['service_code']}"))
+    kb.row(types.InlineKeyboardButton('⬅️ Back to Quick OTP Settings',callback_data='otp_admin_back'))
+    text='📊 <b>ACTIVE SERVICES</b>\n\nOnly services with at least one country that is configured, profitable, and currently in stock are listed here.\n\n' + (f'🟢 {len(live)} active service(s).' if live else '⚪ No service is currently live for users.')
+    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,text,parse_mode='HTML',reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data=='otp_admin_back')
+@safe_handler
+def otp_admin_back(c):
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
+    bot.answer_callback_query(c.id); otp_admin_menu(c.message)
+
+@bot.callback_query_handler(func=lambda c: c.data=='otp_admin_find_service')
+@safe_handler
+def otp_admin_find_service(c):
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
+    clear_state(c.from_user.id); update_state(c.from_user.id,flow='otp_find_service',step=None)
+    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,'🔎 <b>FIND GRIZZLY SERVICE</b>\n\nSend the service name or code.\nExamples: <code>WhatsApp</code>, <code>Telegram</code>, <code>wa</code>, <code>tg</code>',parse_mode='HTML',reply_markup=back_kb())
+
+def _handle_otp_find_service(m,state):
+    if not is_super_admin(m.chat.id): clear_state(m.chat.id); return
+    q=m.text.strip().lower()
+    rows=fetchall('SELECT * FROM otp_services WHERE lower(service_name) LIKE ? OR lower(service_code) LIKE ? ORDER BY service_name LIMIT 30',(f'%{q}%',f'%{q}%'))
+    if not rows: return bot.send_message(m.chat.id,'❌ No matching service found. Try the exact Grizzly service code or a shorter name.')
+    kb=types.InlineKeyboardMarkup()
+    for r in rows: kb.add(types.InlineKeyboardButton(f"{r['emoji']} {r['service_name']}",callback_data=f"otp_admin_svc:{r['service_code']}"))
+    clear_state(m.chat.id); bot.send_message(m.chat.id,f'🔎 <b>Matches for:</b> {html.escape(m.text.strip())}\n\nSelect a service:',parse_mode='HTML',reply_markup=kb)
+
+_FLOW_ROUTES[('otp_find_service',None)] = _handle_otp_find_service
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_admin_services:'))
 @safe_handler
@@ -7433,10 +8622,24 @@ def otp_admin_sc(c):
     if r['explicit_price'] is not None:
         kb.add(types.InlineKeyboardButton('🧹 Remove Manual Price',callback_data=f'otp_clear_price:{service}:{code}'))
     kb.add(types.InlineKeyboardButton('📈 Service Global %',callback_data=f'otp_global_profit:{service}'))
-    kb.add(types.InlineKeyboardButton('🔴 OFF' if r['enabled'] else '🟢 ACTIVE',callback_data=f'otp_toggle:{service}:{code}'))
+    kb.add(types.InlineKeyboardButton('🔴 Turn OFF Service' if svc and int(svc['enabled']) else '🟢 Turn ON Service',callback_data=f'otp_service_toggle:{service}'))
+    kb.add(types.InlineKeyboardButton('🔴 Hide Country' if r['enabled'] else '🟢 Activate Country',callback_data=f'otp_toggle:{service}:{code}'))
     kb.add(types.InlineKeyboardButton('⬅️ Countries',callback_data=f'otp_admin_svc:{service}'))
     status='🟢 LIVE FOR USERS' if _otp_profit_active(r,svc) else '⚪ Hidden from users'
     bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,f'{svc["emoji"] if svc else "🧩"} <b>{html.escape(str(svc["service_name"] if svc else service))}</b>\n🌍 {r["flag"]} <b>{html.escape(r["name"])}</b>\n\n🏷 Grizzly cost: {float(r["grizzly_cost"] or 0):.4f}\n💰 User price: <b>{_otp_price(r,svc):.2f} USDT</b>\n📈 Global profit: <b>{(str(svc["global_profit_percent"]) + "%") if svc["global_profit_percent"] is not None else "OFF"}</b>\n✍️ Manual country price: <b>{(f"{float(r["explicit_price"]):.2f} USDT") if r["explicit_price"] is not None else "OFF"}</b>\n📦 Available: <b>{int(r["available_count"]):,}</b>\n🔘 Status: {status}',parse_mode='HTML',reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('otp_service_toggle:'))
+@safe_handler
+def otp_service_toggle(c):
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
+    service=c.data.split(':',1)[1]
+    svc=fetchone('SELECT enabled FROM otp_services WHERE service_code=?',(service,))
+    if not svc: return bot.answer_callback_query(c.id,'Service not found.',show_alert=True)
+    new=0 if int(svc['enabled']) else 1
+    with db_tx() as conn:
+        conn.execute('UPDATE otp_services SET enabled=?,updated_at=? WHERE service_code=?',(new,_otp_now(),service))
+    bot.answer_callback_query(c.id,'Service enabled.' if new else 'Service disabled.')
+    otp_admin_svc(c)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_toggle:'))
 @safe_handler
@@ -7659,6 +8862,21 @@ def generic_state_router(m):
     if not flow:
         return  # No active flow and no menu button matched — nothing to do.
 
+    flow_feature = {
+        "fund_wallet": "fund_wallet",
+        "withdraw": "withdraw",
+        "bank": "withdrawal_payment_details",
+        "support": "support",
+        "work": "submit_work",
+        "custom_handle_input": None,
+    }.get(flow, "__admin__" if flow and (flow.startswith("admin_") or flow.startswith("otp_find_service")) else None)
+    if flow_feature and flow_feature != "__admin__" and not is_feature_enabled(flow_feature, m.chat.id):
+        clear_state(m.chat.id)
+        bot.send_message(m.chat.id, "🚫 This feature is currently unavailable. Please choose another option.", reply_markup=main_menu(m.chat.id))
+        return
+    if flow_feature == "__admin__" and not is_admin(m.chat.id):
+        clear_state(m.chat.id)
+        return
     handler = _FLOW_ROUTES.get((flow, step))
     if handler is None:
         bot.send_message(

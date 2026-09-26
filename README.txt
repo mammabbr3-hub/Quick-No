@@ -120,3 +120,11 @@ GRIZZLY INTEGRATION NOTES
 - GRIZZLY_API_KEY is NEVER embedded in source code and must remain in Railway Variables.
 - BOT_TOKEN and ADMIN_IDS are also environment variables.
 - No real credentials are included in the final ZIP.
+
+SECURITY / CONTROL AUDIT UPDATE
+- Feature Control now covers built-in and legacy user handles, custom handles, and editable Work/Mail menu options.
+- Custom handles and Work/Mail options can be globally enabled/disabled and restricted per user from Feature Control.
+- Feature restrictions are enforced at runtime, including stale inline keyboards and active conversation flows.
+- Added Admin Roles and Control Audit panels. Super Admin controls role changes and system-wide settings.
+- Added server-side authorization checks to sensitive admin callback actions for withdrawals, work approvals/rejections, dashboard queues, and admin funding controls.
+- Legacy Bank Details is retained only as a compatibility handle; withdrawal remains the primary payment-details workflow.
