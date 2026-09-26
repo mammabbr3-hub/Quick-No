@@ -3,7 +3,7 @@ from datetime import datetime, timezone, timedelta
 from sqlalchemy import select
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from app.db.session import SessionLocal
-from app.db.models import Order, Deposit, GrizzlyActivation, User, DailyReport, ScheduledMessage, MaintenanceState
+from app.db.models import Order, Deposit, GrizzlyActivation, User, Wallet, DailyReport, ScheduledMessage, MaintenanceState
 from app.grizzly.client import GrizzlyClient
 from app.services.orders import refund_order
 from app.services.reports import snapshot, format_report
@@ -12,6 +12,75 @@ from app.services.scheduler import claim_due
 from app.config import settings
 
 log=logging.getLogger(__name__)
+
+async def update_waiting_countdowns(bot):
+    """Refresh waiting cards every second so countdowns visibly tick MM:SS."""
+    AUTO_CANCEL_TIMEOUT = timedelta(minutes=20)
+    MANUAL_CANCEL_WINDOW = timedelta(minutes=5)
+    OrderEvent = __import__('app.db.models', fromlist=['OrderEvent']).OrderEvent
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            async with SessionLocal() as s:
+                ids = (await s.scalars(select(Order.id).where(
+                    Order.status == 'waiting_for_otp', Order.activation_id.is_not(None)
+                ).limit(200))).all()
+            for oid in ids:
+                async with SessionLocal() as s:
+                    o = await s.scalar(select(Order).where(Order.id == oid))
+                    if not o or o.status != 'waiting_for_otp':
+                        continue
+                    ui = await s.scalar(select(OrderEvent).where(
+                        OrderEvent.order_id == oid, OrderEvent.event_type == 'waiting_ui'
+                    ).order_by(OrderEvent.created_at.desc()))
+                    if not ui:
+                        continue
+                    prompt = await s.scalar(select(OrderEvent).where(
+                        OrderEvent.order_id == oid, OrderEvent.event_type == 'cancel_prompt'
+                    ).order_by(OrderEvent.created_at.desc()))
+                    cleared = await s.scalar(select(OrderEvent).where(
+                        OrderEvent.order_id == oid, OrderEvent.event_type == 'cancel_prompt_cleared'
+                    ).order_by(OrderEvent.created_at.desc()))
+                    if prompt and (not cleared or cleared.created_at < prompt.created_at):
+                        continue
+                    try: data = json.loads(ui.data or '{}')
+                    except Exception: continue
+                    created = o.created_at
+                    if created and created.tzinfo is None: created = created.replace(tzinfo=timezone.utc)
+                    elapsed = now - (created or now)
+                    auto_left = max(0, int((AUTO_CANCEL_TIMEOUT - elapsed).total_seconds()))
+                    manual_left = max(0, int((MANUAL_CANCEL_WINDOW - elapsed).total_seconds()))
+                    amm, ass = divmod(auto_left, 60)
+                    if manual_left > 0:
+                        mmm, mss = divmod(manual_left, 60)
+                        cancel_label = f'✋ Cancel available {mmm:02d}:{mss:02d}'
+                        cancel_line = f'✋ <b>Cancel available in {mmm:02d}:{mss:02d}</b>'
+                    else:
+                        cancel_label = '❌ Cancel'
+                        cancel_line = '✋ <b>Manual cancel: Available</b>'
+                    wallet = await s.scalar(select(Wallet).where(Wallet.user_id == o.user_id))
+                    main_balance = float(wallet.balance) if wallet else 0.0
+                    kb = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text='🆕 Get New Number', callback_data=f'get_new:{o.country_code}')],
+                        [InlineKeyboardButton(text=cancel_label, callback_data=f'cancel_ask:{o.id}')]
+                    ])
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=data['chat_id'], message_id=data['message_id'],
+                            text=(f'📱 <b>Number received</b>\n\n'
+                                  f'Phone no: <code>{o.phone_number or "—"}</code>\n\n'
+                                  f'💰 <b>Price 🪙</b>: {o.selling_price:.2f} USDT\n'
+                                  f'📦 <b>Order (available)#</b> <code>{o.order_id}</code>\n'
+                                  f'⚖️ <b>Main balance</b>: {main_balance:.2f} USDT\n\n'
+                                  f'⏳ <b>Waiting for OTP</b>\n⏱ Auto cancel: <b>{amm:02d}:{ass:02d}</b>\n'
+                                  f'{cancel_line}'),
+                            parse_mode='HTML', reply_markup=kb
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            log.exception('countdown worker error')
+        await asyncio.sleep(1)
 
 async def poll_orders(bot=None):
     client = GrizzlyClient()
@@ -43,7 +112,7 @@ async def poll_orders(bot=None):
                 async with SessionLocal() as s:
                     o=await s.scalar(select(Order).where(Order.id==oid))
                     if not o or o.status!='waiting_for_otp' or not o.activation_id: continue
-                    activation_id=o.activation_id; started_at=(o.updated_at or o.created_at); ui=await get_ui(s,oid)
+                    activation_id=o.activation_id; started_at=o.created_at; ui=await get_ui(s,oid)
                 remaining=OTP_TIMEOUT-(now-started_at)
                 manual_remaining=MANUAL_CANCEL_WINDOW-(now-started_at)
 
@@ -68,28 +137,6 @@ async def poll_orders(bot=None):
                         except Exception: pass
                         await asyncio.sleep(4); await delete_ui(ui['chat_id'],ui['message_id'])
                     continue
-
-                if ui and bot:
-                    auto_total=max(0,int(remaining.total_seconds())); amm,ass=divmod(auto_total,60)
-                    manual_total=max(0,int(manual_remaining.total_seconds())); mmm,mss=divmod(manual_total,60)
-                    try:
-                        async with SessionLocal() as s:
-                            o=await s.scalar(select(Order).where(Order.id==oid))
-                            if not o or o.status!='waiting_for_otp': continue
-                            buttons=[InlineKeyboardButton(text='🆕 Get New Number',callback_data=f'get_new:{o.country_code}')]
-                            if manual_total <= 0:
-                                buttons.append(InlineKeyboardButton(text='❌ Cancel',callback_data=f'cancel_ask:{oid}'))
-                                manual_line='✋ Manual cancel: <b>Available</b>'
-                            else:
-                                manual_line=f'✋ Manual cancel: <b>{mmm:02d}:{mss:02d}</b>'
-                            await bot.edit_message_text(chat_id=ui['chat_id'],message_id=ui['message_id'],
-                                text=(f'📱 <b>Number received</b>\n\nOrder: <code>{o.order_id}</code>\n'
-                                      f'Country: {o.country_name}\nPhone no: <code>{o.phone_number or "—"}</code>\n'
-                                      f'Price: <b>{o.selling_price:.2f} USDT</b>\n\n'
-                                      f'⏳ <b>Waiting for OTP</b>\n⏱ Auto cancel: <b>{amm:02d}:{ass:02d}</b>\n'
-                                      f'{manual_line}'),
-                                parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=[buttons]))
-                    except Exception: pass
 
                 try: r=await client.get_status(activation_id)
                 except Exception as e:
@@ -278,4 +325,4 @@ async def daily_reports(bot):
 
 async def main(bot=None):
     if not bot: return
-    await asyncio.gather(poll_orders(bot),expire_deposits(),scheduled_messages(bot),daily_reports(bot))
+    await asyncio.gather(poll_orders(bot),update_waiting_countdowns(bot),expire_deposits(),scheduled_messages(bot),daily_reports(bot))
