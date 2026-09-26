@@ -64,7 +64,7 @@ async def _is_admin_id(tg_id: int) -> bool:
         return await is_admin(s, tg_id)
 
 
-@router.message(F.text)
+@router.message(F.text, ~F.text.startswith("/"))
 async def pending_input(m: Message):
     state = _pending.get(m.from_user.id)
     if not state or m.text.startswith('/'):
