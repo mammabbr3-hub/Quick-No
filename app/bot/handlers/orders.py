@@ -258,53 +258,9 @@ async def confirm_buy(c: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith('cancel_ask:'))
 async def cancel_ask(c: CallbackQuery, bot: Bot):
-    oid = int(c.data.split(':', 1)[1])
-    async with SessionLocal() as s:
-        u = await s.scalar(select(User).where(User.telegram_id == c.from_user.id))
-        ok, msg = await allowed(bot, s, u, financial=True)
-        if not ok:
-            return await c.answer(msg, show_alert=True)
-        o = await s.scalar(select(Order).where(Order.id == oid, Order.user_id == u.id))
-        if not o or o.status != 'waiting_for_otp':
-            return await c.answer('This order is no longer cancellable.', show_alert=True)
-        started = o.created_at
-        if started and datetime.now(timezone.utc) - started < MANUAL_CANCEL_WINDOW:
-            left = MANUAL_CANCEL_WINDOW - (datetime.now(timezone.utc) - started)
-            secs = max(0, int(left.total_seconds()))
-            mm, ss = divmod(secs, 60)
-            return await c.answer(f'⏱ Cancel will be available in {mm:02d}:{ss:02d}.', show_alert=True)
-    async with SessionLocal() as s:
-        s.add(OrderEvent(order_id=oid, event_type='cancel_prompt', data='{}'))
-        await s.commit()
-    await c.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text='✅ Yes, Cancel', callback_data=f'cancel_order:{oid}')
-    ],[
-        InlineKeyboardButton(text='↩️ Keep Waiting', callback_data=f'cancel_back:{oid}')
-    ]]))
-    await c.answer('Confirm cancellation.', show_alert=True)
-
-@router.callback_query(F.data.startswith('cancel_back:'))
-async def cancel_back(c: CallbackQuery, bot: Bot):
-    oid = int(c.data.split(':', 1)[1])
-    async with SessionLocal() as s:
-        u = await s.scalar(select(User).where(User.telegram_id == c.from_user.id))
-        ok, msg = await allowed(bot, s, u, financial=True)
-        if not ok:
-            return await c.answer(msg, show_alert=True)
-        o = await s.scalar(select(Order).where(Order.id == oid, Order.user_id == u.id))
-        if not o or o.status != 'waiting_for_otp':
-            return await c.answer('This order is no longer waiting.', show_alert=True)
-        cid = await s.scalar(select(Country.id).where(Country.code == o.country_code, Country.service_code == 'wa', Country.enabled.is_(True)))
-    if cid is None:
-        return await c.answer('Country is no longer available.', show_alert=True)
-    async with SessionLocal() as s:
-        s.add(OrderEvent(order_id=oid, event_type='cancel_prompt_cleared', data='{}'))
-        await s.commit()
-    await c.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='🆕 Get New Number', callback_data=f'get_new:{cid}')],
-        [InlineKeyboardButton(text='❌ Cancel', callback_data=f'cancel_ask:{oid}')]
-    ]))
-    await c.answer('Order is still waiting for OTP.')
+    # One-tap cancellation: no confirmation/prompt. The 5-minute backend
+    # guard is still enforced inside cancel_order().
+    return await cancel_order(c, bot)
 
 @router.callback_query(F.data.startswith('cancel_order:'))
 async def cancel_order(c: CallbackQuery, bot: Bot):
