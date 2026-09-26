@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 from aiogram import Router, F, Bot
+from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from sqlalchemy import select, func, desc
 
@@ -68,7 +69,11 @@ async def _is_admin_id(tg_id: int) -> bool:
 async def pending_input(m: Message):
     state = _pending.get(m.from_user.id)
     if not state or m.text.startswith('/'):
-        return
+        # IMPORTANT: this handler is registered before the normal user router.
+        # Without SkipHandler, it matches every non-command text (including
+        # ReplyKeyboard buttons such as "💰 My Balance") and prevents the user
+        # handlers from receiving those messages.
+        raise SkipHandler
     action, target = state
     _pending.pop(m.from_user.id, None)
     if not await _is_admin_id(m.from_user.id):
