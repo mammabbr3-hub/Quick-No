@@ -16,6 +16,7 @@ log=logging.getLogger(__name__)
 async def poll_orders(bot=None):
     client = GrizzlyClient()
     OTP_TIMEOUT = timedelta(minutes=20)
+    MANUAL_CANCEL_WINDOW = timedelta(minutes=5)
 
     async def get_ui(session, order_id):
         OrderEvent = __import__('app.db.models', fromlist=['OrderEvent']).OrderEvent
@@ -42,8 +43,9 @@ async def poll_orders(bot=None):
                 async with SessionLocal() as s:
                     o=await s.scalar(select(Order).where(Order.id==oid))
                     if not o or o.status!='waiting_for_otp' or not o.activation_id: continue
-                    activation_id=o.activation_id; created_at=o.created_at; ui=await get_ui(s,oid)
-                remaining=OTP_TIMEOUT-(now-created_at)
+                    activation_id=o.activation_id; started_at=(o.updated_at or o.created_at); ui=await get_ui(s,oid)
+                remaining=OTP_TIMEOUT-(now-started_at)
+                manual_remaining=MANUAL_CANCEL_WINDOW-(now-started_at)
 
                 if remaining.total_seconds() <= 0:
                     try: r=await client.set_status(activation_id,8)
@@ -68,18 +70,25 @@ async def poll_orders(bot=None):
                     continue
 
                 if ui and bot:
-                    total=max(0,int(remaining.total_seconds())); mm,ss=divmod(total,60)
+                    auto_total=max(0,int(remaining.total_seconds())); amm,ass=divmod(auto_total,60)
+                    manual_total=max(0,int(manual_remaining.total_seconds())); mmm,mss=divmod(manual_total,60)
                     try:
                         async with SessionLocal() as s:
                             o=await s.scalar(select(Order).where(Order.id==oid))
                             if not o or o.status!='waiting_for_otp': continue
+                            buttons=[InlineKeyboardButton(text='🆕 Get New Number',callback_data=f'get_new:{o.country_code}')]
+                            if manual_total <= 0:
+                                buttons.append(InlineKeyboardButton(text='❌ Cancel',callback_data=f'cancel_ask:{oid}'))
+                                manual_line='✋ Manual cancel: <b>Available</b>'
+                            else:
+                                manual_line=f'✋ Manual cancel: <b>{mmm:02d}:{mss:02d}</b>'
                             await bot.edit_message_text(chat_id=ui['chat_id'],message_id=ui['message_id'],
                                 text=(f'📱 <b>Number received</b>\n\nOrder: <code>{o.order_id}</code>\n'
-                                      f'Country: {o.country_name}\nNumber: <code>{o.phone_number or "—"}</code>\n'
+                                      f'Country: {o.country_name}\nPhone no: <code>{o.phone_number or "—"}</code>\n'
                                       f'Price: <b>{o.selling_price:.2f} USDT</b>\n\n'
-                                      f'⏳ <b>Waiting for OTP</b>\n⏱ Time remaining: <b>{mm:02d}:{ss:02d}</b>\n\n'
-                                      f'You can buy another number from the same country while this one is waiting.'),
-                                parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='❌ Cancel & Refund',callback_data=f'cancel_order:{oid}')]]))
+                                      f'⏳ <b>Waiting for OTP</b>\n⏱ Auto cancel: <b>{amm:02d}:{ass:02d}</b>\n'
+                                      f'{manual_line}'),
+                                parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=[buttons]))
                     except Exception: pass
 
                 try: r=await client.get_status(activation_id)
@@ -104,10 +113,19 @@ async def poll_orders(bot=None):
                         o.status='cancelled'
                     await s.commit()
                 if notify_tg and bot:
-                    try: await bot.send_message(notify_tg,f'🔐 <b>OTP received</b>\n\nOrder: <code>{notify_order}</code>\nOTP: <code>{notify_otp}</code>',parse_mode='HTML')
+                    try:
+                        # The old waiting card disappears as soon as an OTP arrives.
+                        # The user gets a clean OTP message with only Get New Number;
+                        # there is no Cancel button after a successful OTP.
+                        cid = None
+                        async with SessionLocal() as sx:
+                            oo = await sx.scalar(select(Order).where(Order.id == oid))
+                            if oo:
+                                cid = oo.country_code
+                        await bot.send_message(notify_tg, f'🔐 <b>OTP received</b>\n\nOrder: <code>{notify_order}</code>\n🔑 OTP: <code>{notify_otp}</code>\n\n✅ Activation completed.', parse_mode='HTML', reply_markup=(InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🆕 Get New Number', callback_data=f'get_new:{cid}')]]) if cid else None))
                     except Exception: pass
                     if ui_after:
-                        try: await bot.edit_message_text(chat_id=ui_after['chat_id'],message_id=ui_after['message_id'],text=(f'🔐 <b>OTP received</b>\n\nOrder: <code>{notify_order}</code>\n🔑 OTP: <code>{notify_otp}</code>\n\n✅ Activation completed.'),parse_mode='HTML')
+                        try: await bot.delete_message(chat_id=ui_after['chat_id'], message_id=ui_after['message_id'])
                         except Exception: pass
 
             if processing_ids:
