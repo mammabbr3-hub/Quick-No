@@ -2216,19 +2216,55 @@ def _track_option_message(message, reply_markup=None):
             _AUTO_OPTION_MESSAGES[str(message.chat.id)] = message.message_id
     return message
 
-def _delete_previous_option_message(chat_id, keep_message_id=None):
+def _get_tracked_option_message_id(chat_id):
     if not _AUTO_DELETE_OPTION_MESSAGES:
-        return
+        return None
+    with _AUTO_OPTION_MESSAGES_LOCK:
+        return _AUTO_OPTION_MESSAGES.get(str(chat_id))
+
+def _forget_tracked_option_message(chat_id, message_id=None):
     key = str(chat_id)
     with _AUTO_OPTION_MESSAGES_LOCK:
-        message_id = _AUTO_OPTION_MESSAGES.get(key)
-        if not message_id or (keep_message_id is not None and message_id == keep_message_id):
-            return
-        _AUTO_OPTION_MESSAGES.pop(key, None)
+        current = _AUTO_OPTION_MESSAGES.get(key)
+        if message_id is None or current == message_id:
+            _AUTO_OPTION_MESSAGES.pop(key, None)
+
+def _delete_previous_option_message(chat_id, keep_message_id=None):
+    """Delete an old navigation message only when explicitly safe to do so.
+
+    This helper is intentionally NOT called before a handler runs. Deleting a
+    reply-keyboard message before the replacement menu is successfully sent can
+    leave the user/admin with no usable keyboard.
+    """
+    if not _AUTO_DELETE_OPTION_MESSAGES:
+        return
+    message_id = _get_tracked_option_message_id(chat_id)
+    if not message_id or (keep_message_id is not None and message_id == keep_message_id):
+        return
+    _forget_tracked_option_message(chat_id, message_id)
     try:
         bot.delete_message(chat_id, message_id)
     except Exception:
         logger.debug("Could not auto-delete option message %s for %s", message_id, chat_id, exc_info=True)
+
+def _delete_old_option_after_success(chat_id, old_message_id, keep_message_id=None):
+    """Delete the previous menu only after a replacement menu was created.
+
+    If the action failed, or produced no replacement keyboard, the old menu is
+    deliberately retained so the user/admin is never left without navigation.
+    """
+    if not old_message_id or not _AUTO_DELETE_OPTION_MESSAGES:
+        return
+    new_message_id = _get_tracked_option_message_id(chat_id)
+    if not new_message_id or new_message_id == old_message_id:
+        return
+    if keep_message_id is not None and old_message_id == keep_message_id:
+        return
+    _forget_tracked_option_message(chat_id, old_message_id)
+    try:
+        bot.delete_message(chat_id, old_message_id)
+    except Exception:
+        logger.debug("Could not auto-delete old option message %s for %s", old_message_id, chat_id, exc_info=True)
 
 # Wrap send_message so every Reply Keyboard menu is automatically registered.
 # This covers main menu, Back/Refresh menus, admin menus, and other navigation
@@ -2436,17 +2472,23 @@ def safe_handler(func):
                 bot.send_message(chat_id, _double_action_message(chat_id), parse_mode="HTML")
             return
 
-        # Remove the previous navigation/menu message before processing the
-        # next action. For inline callbacks, keep the clicked message alive
-        # because many handlers edit that exact message in place.
+        # IMPORTANT: do NOT delete the current navigation keyboard yet.
+        # First let the handler complete and create its replacement menu.
+        # Otherwise a failed action could leave the user/admin with no menu.
+        old_option_message_id = _get_tracked_option_message_id(chat_id)
         keep_message_id = None
         if hasattr(update, "message") and getattr(update, "message", None):
             keep_message_id = getattr(update.message, "message_id", None)
-        _delete_previous_option_message(chat_id, keep_message_id=keep_message_id)
 
         wait_notice = _show_wait_notice(chat_id)
+        succeeded = False
         try:
-            return func(update, *args, **kwargs)
+            result = func(update, *args, **kwargs)
+            succeeded = True
+            _delete_old_option_after_success(
+                chat_id, old_option_message_id, keep_message_id=keep_message_id
+            )
+            return result
         except InsufficientFundsError as e:
             bot.send_message(
                 chat_id,
@@ -2528,6 +2570,7 @@ COMMUNITY_KEYS = {
     "user_group": "community:user_group",
     "user_channel": "community:user_channel",
     "submission_channel": "community:submission_channel",
+    "approved_work_channel": "community:approved_work_channel",
     "bank_store_channel": "community:bank_store_channel",
     "support_channel": "community:support_channel",
     "audit_channel": "community:audit_channel",
@@ -2536,6 +2579,7 @@ COMMUNITY_LABELS = {
     "user_group": "👥 User Group",
     "user_channel": "📢 User Channel",
     "submission_channel": "🔐 Submission Channel",
+    "approved_work_channel": "✅ Approved Work Channel",
     "bank_store_channel": "🏦 Bank Store Channel",
     "support_channel": "🎧 Support Channel",
     "audit_channel": "🔐 Audit Channel",
@@ -2564,12 +2608,12 @@ def _community_link(kind):
     return str(_community_get(kind).get("link") or "").strip()
 
 def _community_settings_text():
-    lines=["⚙️ <b>COMMUNITY SETTINGS</b>", "", "Configure where users must join and where internal business records are delivered.", ""]
+    lines=["⚙️ <b>COMMUNITY SETTINGS</b>", "", "Configure where users must join, where public broadcasts/prices are posted, and where internal business records are delivered.", ""]
     for k in COMMUNITY_KEYS:
         d=_community_get(k); cid=d.get("id") or "Not set"; link=d.get("link") or "—"
         lines.append(f"{COMMUNITY_LABELS[k]}\n🆔 <code>{html.escape(str(cid))}</code>\n🔗 {html.escape(str(link))}")
         lines.append("")
-    lines.append("ℹ️ User Group + User Channel are the required join points. Internal channels are admin/business destinations and are never shown as join requirements.")
+    lines.append("ℹ️ User Group + User Channel are the required join points. User Channel is reserved for public Broadcast + Price/Stock announcements. Approved Work has its own destination. Internal channels are never shown as join requirements.")
     lines.append("🔐 Audit Channel: create a private Telegram channel, add this bot as an administrator, then save its -100… chat ID above. SQLite remains the source of truth; the bot automatically delivers every new audit event to this channel and retries failed deliveries.")
     return "\n".join(lines)
 
@@ -7010,7 +7054,7 @@ def sub_approve_cb(c):
         parse_mode="HTML",
     )
 
-    work_channel_id = _community_id("user_channel") or WORK_CHANNEL_ID
+    work_channel_id = _community_id("approved_work_channel") or WORK_CHANNEL_ID
     if work_channel_id:
         submitter = get_user(row["user_id"])
         uname = display_username(submitter)
@@ -7045,7 +7089,7 @@ def sub_approve_cb(c):
             _delete_submission_admin_messages(sub_id)
         except Exception:
             logger.exception("Failed to post approved work %s to work channel", sub_id)
-            notify_admins(f"⚠️ Could not publish approved work {sub_id} to the work channel. Check WORK_CHANNEL_ID / bot membership.")
+            notify_admins(f"⚠️ Could not publish approved work {sub_id} to the work channel. Check Approved Work Channel / WORK_CHANNEL_ID and bot membership.")
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("sub_reject_"))
@@ -8314,6 +8358,60 @@ def otp_sync_services():
     except Exception as exc: last=exc
     raise RuntimeError(f'Grizzly service sync failed: {last}')
 
+def _otp_public_channel_id():
+    return _community_id("user_channel")
+
+def _otp_post_public_update(text):
+    """Post public Quick OTP price/stock updates to the configured User Channel."""
+    cid=_otp_public_channel_id()
+    if not cid:
+        return False
+    try:
+        bot.send_message(cid, text, parse_mode="HTML", disable_web_page_preview=True)
+        return True
+    except Exception as exc:
+        logger.warning("OTP public channel update failed for %s: %s", cid, exc)
+        return False
+
+def _otp_post_universal_price_update(service_code, pct):
+    svc=fetchone('SELECT * FROM otp_services WHERE service_code=?',(service_code,))
+    if not svc:
+        return
+    rows=fetchall('SELECT * FROM otp_service_countries WHERE service_code=? AND enabled=1 AND profit_active=1 ORDER BY name',(service_code,))
+    lines=['📢 <b>QUICK OTP • PRICE UPDATE</b>','',f'🧩 Service: <b>{html.escape(str(svc["service_name"]))}</b>',f'📈 Universal Profit: <b>{float(pct):g}%</b>','','💰 <b>NEW SELLING PRICES</b>']
+    shown=0
+    for r in rows:
+        if r['explicit_price'] is not None:
+            continue
+        price=_otp_price(r,svc)
+        if price <= 0:
+            continue
+        lines.append(f'{r["flag"]} {html.escape(str(r["name"]))}: <b>${price:.2f}</b> USDT • 📦 {int(r["available_count"] or 0):,}')
+        shown += 1
+        if shown>=40:
+            break
+    if shown:
+        if len(rows)>40:
+            lines.append('… and more countries are available in the bot.')
+        lines += ['', '⚡ <b>Updated automatically</b>', f'🚀 {html.escape(BRAND)}']
+        _otp_post_public_update('\n'.join(lines))
+
+def _otp_post_country_price_update(service_code, country_code, reason='PRICE UPDATE'):
+    svc=fetchone('SELECT * FROM otp_services WHERE service_code=?',(service_code,))
+    row=fetchone('SELECT * FROM otp_service_countries WHERE service_code=? AND country_code=?',(service_code,country_code))
+    if not svc or not row:
+        return
+    price=_otp_price(row,svc)
+    if price <= 0:
+        return
+    text=(f'📢 <b>QUICK OTP • {html.escape(reason)}</b>\n\n'
+          f'🧩 Service: <b>{html.escape(str(svc["service_name"]))}</b>\n'
+          f'{row["flag"]} Country: <b>{html.escape(str(row["name"]))}</b>\n'
+          f'💰 Price: <b>${price:.2f} USDT</b>\n'
+          f'📦 Available: <b>{int(row["available_count"] or 0):,}</b>\n\n'
+          '⚡ <b>Updated automatically</b>')
+    _otp_post_public_update(text)
+
 def _otp_notify_price_alerts(service_code, alerts):
     if not alerts: return
     svc=fetchone('SELECT service_name FROM otp_services WHERE service_code=?',(service_code,))
@@ -8327,6 +8425,15 @@ def _otp_notify_price_alerts(service_code, alerts):
     for admin_id in ADMIN_IDS:
         try: bot.send_message(int(admin_id),text,parse_mode='HTML')
         except Exception as exc: logger.warning('OTP price alert send failed to %s: %s',admin_id,exc)
+    public_lines=['📢 <b>QUICK OTP • PRICE UPDATE</b>','',f'🧩 Service: <b>{html.escape(str(sname))}</b>','','💰 <b>NEW SELLING PRICES</b>']
+    for code,name,old_cost,new_cost,direction,flag in alerts[:40]:
+        row=fetchone('SELECT * FROM otp_service_countries WHERE service_code=? AND country_code=?',(service_code,code))
+        svcrow=fetchone('SELECT * FROM otp_services WHERE service_code=?',(service_code,))
+        price=_otp_price(row,svcrow) if row and svcrow else new_cost
+        stock=int(row['available_count'] or 0) if row else 0
+        public_lines.append(f'{flag} {html.escape(str(name))}: <b>${price:.2f} USDT</b> • 📦 {stock:,}')
+    public_lines += ['', '⚡ <b>Updated automatically</b>', f'🚀 {html.escape(BRAND)}']
+    _otp_post_public_update('\n'.join(public_lines))
     try:
         ids=','.join(str(x[0]) for x in alerts)
         with db_tx() as conn:
@@ -8383,7 +8490,7 @@ def otp_sync_service_stock(service_code, country_codes=None):
                     if pairs: parsed=min(pairs,key=lambda x:x[0])
             if not parsed: continue
             cost,count=parsed
-            old=fetchone('SELECT name,flag,grizzly_cost FROM otp_service_countries WHERE service_code=? AND country_code=?',(service_code,code))
+            old=fetchone('SELECT name,flag,grizzly_cost,available_count FROM otp_service_countries WHERE service_code=? AND country_code=?',(service_code,code))
             if not old: continue
             old_cost=float(old['grizzly_cost']) if old['grizzly_cost'] is not None else None
             if cost is None: continue
@@ -8393,9 +8500,12 @@ def otp_sync_service_stock(service_code, country_codes=None):
                 alerts.append(conn_alert)
                 with db_tx() as conn:
                     conn.execute('INSERT INTO otp_price_alerts(service_code,country_code,country_name,old_cost,new_cost,direction,created_at,notified) VALUES(?,?,?,?,?,?,?,0)',(service_code,code,old['name'],old_cost,cost,direction,_otp_now()))
+            old_count=int(old['available_count'] or 0) if old else 0
             with db_tx() as conn:
                 conn.execute('UPDATE otp_service_countries SET grizzly_cost=?,available_count=?,updated_at=? WHERE service_code=? AND country_code=?',(cost,count,_otp_now(),service_code,code))
             updated+=1
+            if old and old_count <= 0 and count > 0:
+                _otp_post_country_price_update(service_code,code,'NUMBERS AVAILABLE')
         except Exception as exc:
             last=exc
             logger.warning('Grizzly price refresh failed for service=%s country=%s: %s',service_code,code,exc)
@@ -8960,6 +9070,7 @@ def otp_global_adjust_cb(c):
     with db_tx() as conn:
         conn.execute('UPDATE otp_services SET global_profit_percent=?,updated_at=? WHERE service_code=?',(new,_otp_now(),service))
         conn.execute('UPDATE otp_service_countries SET enabled=1,profit_active=1,updated_at=? WHERE service_code=? AND explicit_price IS NULL',(_otp_now(),service))
+    _otp_post_universal_price_update(service,new)
     bot.answer_callback_query(c.id,f'Global profit: {new:g}%'); otp_global_profit_cb(c)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_global_clear:'))
@@ -8988,6 +9099,7 @@ def _handle_otp_global_manual(m,state):
     with db_tx() as conn:
         conn.execute('UPDATE otp_services SET global_profit_percent=?,updated_at=? WHERE service_code=?',(pct,_otp_now(),service))
         conn.execute('UPDATE otp_service_countries SET enabled=1,profit_active=1,updated_at=? WHERE service_code=? AND explicit_price IS NULL',(_otp_now(),service))
+    _otp_post_universal_price_update(service,pct)
     clear_state(m.chat.id); bot.send_message(m.chat.id,f'✅ Global profit set to {pct:g}% for this service. Manual-price countries remain excluded from this rule.',reply_markup=main_menu(m.chat.id))
 
 _FLOW_ROUTES[('otp_global_manual',None)] = _handle_otp_global_manual
@@ -9019,6 +9131,7 @@ def _handle_otp_set_price(m,state):
     if not r: return bot.send_message(m.chat.id,'❌ Country not found.')
     if price<=float(r['grizzly_cost'] or 0): return bot.send_message(m.chat.id,f'❌ User price must be above Grizzly cost ({float(r["grizzly_cost"] or 0):.4f} USDT).')
     with db_tx() as conn: conn.execute('UPDATE otp_service_countries SET explicit_price=?,markup_percent=0,markup_fixed=0,profit_active=1,enabled=1,updated_at=? WHERE service_code=? AND country_code=?',(price,_otp_now(),service,code))
+    _otp_post_country_price_update(service,code,'PRICE UPDATED')
     clear_state(m.chat.id); bot.send_message(m.chat.id,f'✅ Final user price updated to {price:.2f} USDT. 🟢 Active.',reply_markup=main_menu(m.chat.id))
 
 _FLOW_ROUTES[('otp_set_price',None)] = _handle_otp_set_price
