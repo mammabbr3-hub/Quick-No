@@ -8148,11 +8148,10 @@ def _otp_http(action, **params):
     if not GRIZZLY_API_KEY:
         raise RuntimeError('GRIZZLY_API_KEY is not configured')
     q={'api_key':GRIZZLY_API_KEY,'action':action,**params}
-    # Current Grizzly documentation exposes operator-aware catalogue/price
-    # endpoints. Keep the operator configurable because accounts can expose
-    # different operator sets; omit it when the account does not require one.
-    if 'operator' not in q and GRIZZLY_OPERATOR:
-        q['operator']=GRIZZLY_OPERATOR
+    # Keep the generic activation endpoint clean. `operator` is only a
+    # catalogue/account-specific option; it must NOT be blindly appended to
+    # activation status/finish requests such as getStatusV2/setStatus.
+    # Catalogue calls that need an operator use _otp_http_catalog().
     url=GRIZZLY_BASE_URL+'?'+urllib.parse.urlencode(q)
     req=urllib.request.Request(url,headers={'User-Agent':os.environ.get('GRIZZLY_USER_AGENT','MobileDigitalHub-QuickOTP/4.0').strip() or 'MobileDigitalHub-QuickOTP/4.0'})
     try:
@@ -8776,23 +8775,11 @@ def otp_new_cb(c):
         return bot.answer_callback_query(c.id,'This OTP request is no longer available.',show_alert=True)
     service,code=old['service_code'],old['country_code']
 
-    # If the current activation is still waiting, release it first. Grizzly
-    # supports early cancellation; this lets Get New Number work immediately
-    # instead of waiting for the 5-minute manual-cancel window or the 20-minute
-    # automatic expiry. The old activation is refunded before a new purchase.
-    if old['status']=='waiting':
-        try:
-            r=_otp_http('setStatus',id=old['activation_id'],status='8')
-        except Exception:
-            return bot.answer_callback_query(c.id,'Unable to release the current number. Please try again.',show_alert=True)
-        if r.get('raw') not in {'ACCESS_CANCEL','STATUS_CANCEL','NO_ACTIVATION'}:
-            return bot.answer_callback_query(c.id,'Grizzly has not released the current number yet. Please try again.',show_alert=True)
-        with db_tx() as conn:
-            cur=conn.execute('SELECT * FROM otp_orders WHERE order_id=? AND status="waiting" AND refunded=0',(order_id,)).fetchone()
-            if cur:
-                adjust_balance(conn,cur['user_id'],'usdt',float(cur['selling_price']),'OTP_REFUND',reason=f'Quick OTP replace number {order_id}',related_txn=order_id,processed_by=cur['user_id'])
-                conn.execute('UPDATE otp_orders SET status="cancelled",refunded=1,updated_at=? WHERE order_id=?',(_otp_now(),order_id))
-
+    # IMPORTANT: Get New Number does NOT cancel the previous activation.
+    # Every requested number gets its own independent 5-minute manual-cancel
+    # window and 20-minute automatic expiry window. The previous number remains
+    # active until its own OTP arrives, the user cancels it after 5 minutes, or
+    # its 20-minute expiry is reached.
     bot.answer_callback_query(c.id,'Getting a new number…')
     result,msg=_otp_create_activation(c.from_user.id,service,code,c.message.chat.id)
     if not result:
@@ -9205,8 +9192,18 @@ def _otp_worker():
                             updated_order['otp_code']=otp
                             kb=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{o["order_id"]}'))
                             _otp_update_message(o['chat_id'],o['message_id'],_otp_received_update_text(updated_order),kb)
+                            # The waiting card is updated in place, then send a
+                            # separate, clear notification so the requester gets
+                            # an unmistakable OTP-arrived message as well.
+                            bot.send_message(
+                                o['chat_id'],
+                                f'📩 <b>OTP RECEIVED</b>\n\n'
+                                f'📞 Your request for <code>{html.escape(str(o["phone_number"]))}</code> has been received.\n\n'
+                                f'🔐 <b>OTP: {html.escape(str(otp))}</b>',
+                                parse_mode='HTML'
+                            )
                         except Exception as exc:
-                            logger.warning('OTP received UI update failed: %s',exc)
+                            logger.warning('OTP received UI update/notification failed: %s',exc)
                     elif r.get('raw') in {'STATUS_CANCEL','NO_ACTIVATION'}:
                         with db_tx() as conn:
                             cur=conn.execute('SELECT * FROM otp_orders WHERE order_id=? AND status="waiting" AND refunded=0',(o['order_id'],)).fetchone()

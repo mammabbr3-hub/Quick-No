@@ -45,3 +45,4 @@ AUTO-CLEANUP UPDATE
 - Navigation/option messages using Reply Keyboards are automatically deleted when the user starts the next action.
 - Useful result/record messages are not tracked for deletion.
 - Inline callback messages are preserved when a handler needs to edit them in place.
+\n\nOTP FLOW FINAL RULES: Get New Number never cancels/release/refunds the previous waiting activation. Each activation has independent 5-minute manual cancel and 20-minute automatic expiry. OTP receipt marks the order completed with no cancel/refund and sends a separate OTP notification after updating the waiting message.\n
