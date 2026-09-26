@@ -66,13 +66,13 @@ logger = logging.getLogger("mobile")
 # ---------------------------------------------------------------
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-BOT_LINK = os.environ.get("BOT_LINK", "https://t.me/mobile_Digital_hub_bot").strip()
+BOT_LINK = os.environ.get("BOT_LINK", "").strip()
 DB_PATH = os.environ.get("mobile_DB_PATH", "mobile.db").strip()
 
 _admin_ids_raw = os.environ.get("ADMIN_IDS", "").strip()
 ADMIN_IDS = {a.strip() for a in _admin_ids_raw.split(",") if a.strip()}
 
-# Quick OTP / Grizzly integration uses the SAME SQLite database and SAME wallet as Mobile Digital Hub.
+# Quick OTP / Grizzly integration uses the SAME SQLite database and SAME wallet as Mobile Business Hub.
 GRIZZLY_API_KEY = os.environ.get("GRIZZLY_API_KEY", "").strip()
 GRIZZLY_BASE_URL = os.environ.get("GRIZZLY_BASE_URL", "https://api.grizzlysms.com/stubs/handler_api.php").strip()
 
@@ -451,37 +451,6 @@ CREATE INDEX IF NOT EXISTS idx_support_tickets_user ON support_tickets(user_id);
 -- Admin-adjustable limits (minimum withdrawal, etc.)
 -- so they can be changed anytime via the "⚙️ Settings" panel instead
 -- of being fixed in code.
-CREATE TABLE IF NOT EXISTS fund_methods (
-    method_id     TEXT PRIMARY KEY,
-    name          TEXT NOT NULL,
-    currency_code TEXT NOT NULL,
-    rate_usdt     REAL NOT NULL,
-    destination   TEXT NOT NULL,
-    active        INTEGER NOT NULL DEFAULT 1,
-    created_at    TEXT NOT NULL,
-    updated_at    TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_fund_methods_active ON fund_methods(active);
-
-CREATE TABLE IF NOT EXISTS fund_requests (
-    request_id      TEXT PRIMARY KEY,
-    user_id         TEXT NOT NULL,
-    method_id       TEXT NOT NULL,
-    currency_code   TEXT NOT NULL,
-    amount_currency REAL NOT NULL,
-    usdt_amount     REAL NOT NULL,
-    proof_file_id   TEXT NOT NULL,
-    proof_type      TEXT NOT NULL DEFAULT 'photo',
-    status          TEXT NOT NULL DEFAULT 'PENDING',
-    created_at      TEXT NOT NULL,
-    processed_at    TEXT,
-    processed_by    TEXT,
-    decline_reason  TEXT,
-    credited_txn_id TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_fund_requests_status ON fund_requests(status);
-CREATE INDEX IF NOT EXISTS idx_fund_requests_user ON fund_requests(user_id);
-
 CREATE TABLE IF NOT EXISTS fund_methods (
     method_id     TEXT PRIMARY KEY,
     name          TEXT NOT NULL,
@@ -6294,7 +6263,6 @@ _FLOW_ROUTES = {
     ("fund_admin_add", "currency"): _handle_fund_admin_add,
     ("fund_admin_add", "rate"): _handle_fund_admin_add,
     ("fund_admin_add", "destination"): _handle_fund_admin_add,
-    ("fund_admin_edit", "value"): _handle_fund_admin_edit,
     ("withdraw", None): _handle_withdraw_amount,
     ("wd_decline_reason", None): _handle_wd_decline_reason,
     ("admin_fund", "user_id"): _handle_admin_fund_user_id,
@@ -6556,7 +6524,7 @@ def _otp_waiting_text(o,remaining,manual_remaining):
     a=f'{auto//60:02d}:{auto%60:02d}'; m=f'{manual//60:02d}:{manual%60:02d}'
     return (f'📱 <b>Number received</b>\n\nPhone no: <code>{html.escape(str(o["phone_number"]))}</code>\n\n'
             f'💰 <b>Price 🪙</b>: {float(o["selling_price"]):.2f} USDT\n'
-            f'📦 <b>Order (available)#</b> <code>{o["order_id"]}</code>\n'
+            f'📦 <b>Order (available):</b> <code>#{o["order_id"]}</code>\n'
             f'📊 <b>Available</b>: {int(o["available_count"] or 0):,}\n'
             f'⚖️ <b>Main balance</b>: {_otp_balance(o["user_id"]):.2f} USDT\n\n'
             f'⏳ <b>Waiting for OTP</b>\n⏱ Auto cancel: <b>{a}</b>\n'

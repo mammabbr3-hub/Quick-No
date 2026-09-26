@@ -1,7 +1,13 @@
-BOT_TOKEN=your_bot_token
+BOT_TOKEN=PASTE_YOUR_BOT_TOKEN_HERE
 ADMIN_IDS=7517279474
-GRIZZLY_API_KEY=your_grizzly_api_key
+GRIZZLY_API_KEY=PASTE_YOUR_GRIZZLY_API_KEY_HERE
 GRIZZLY_BASE_URL=https://api.grizzlysms.com/stubs/handler_api.php
 mobile_DB_PATH=/app/data/mobile.db
-# Community IDs/links are configured inside Admin -> ⚙️ Community Settings.
-# Do not put secrets in the ZIP.
+BOT_LINK=
+
+# Optional legacy fallbacks; Community Settings inside the bot is preferred.
+SUPPORT_GROUP_ID=
+WORK_CHANNEL_ID=
+BANK_GROUP_ID=
+SUPPORT_GROUP_LINK=
+WORK_CHANNEL_LINK=
