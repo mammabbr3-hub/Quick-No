@@ -3,6 +3,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram import Bot
 from sqlalchemy import select
 from decimal import Decimal
+import json
 from app.db.session import SessionLocal
 from app.db.models import User, Country, Order, Wallet, MaintenanceState, OrderEvent
 from app.services.pricing import selling_price
@@ -129,10 +130,69 @@ async def confirm_buy(c: CallbackQuery, bot: Bot):
         order.status = 'waiting_for_otp'
         await s.commit()
 
-    await c.message.edit_text(
-        f'📱 <b>Number received</b>\n\nOrder: <code>{public_id}</code>\nCountry: {country_flag} {country_name}\nNumber: <code>{result["phone_number"]}</code>\nPrice: <b>{price:.2f} USDT</b>\n\n⏳ Waiting for OTP…',
-        parse_mode='HTML'
+    waiting_text = (
+        f'📱 <b>Number received</b>\n\n'
+        f'Order: <code>{public_id}</code>\n'
+        f'Country: {country_flag} {country_name}\n'
+        f'Number: <code>{result["phone_number"]}</code>\n'
+        f'Price: <b>{price:.2f} USDT</b>\n\n'
+        f'⏳ <b>Waiting for OTP</b>\n'
+        f'⏱ Time remaining: <b>20:00</b>\n\n'
+        f'You can buy another number from the same country while this one is waiting.'
     )
+    sent = await c.message.edit_text(
+        waiting_text, parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text='❌ Cancel & Refund', callback_data=f'cancel_order:{order_id}')
+        ]])
+    )
+    async with SessionLocal() as s:
+        o = await s.scalar(select(Order).where(Order.id == order_id).with_for_update())
+        if o:
+            ev = await s.scalar(select(OrderEvent).where(
+                OrderEvent.order_id == order_id, OrderEvent.event_type == 'waiting_ui'
+            ).order_by(OrderEvent.created_at.desc()))
+            data = json.dumps({'chat_id': sent.chat.id, 'message_id': sent.message_id})
+            if ev: ev.data = data
+            else: s.add(OrderEvent(order_id=order_id, event_type='waiting_ui', data=data))
+            await s.commit()
+
+@router.callback_query(F.data.startswith('cancel_order:'))
+async def cancel_order(c: CallbackQuery, bot: Bot):
+    oid = int(c.data.split(':', 1)[1])
+    await c.answer('Cancelling…')
+    client = GrizzlyClient()
+    async with SessionLocal() as s:
+        u = await s.scalar(select(User).where(User.telegram_id == c.from_user.id))
+        ok, msg = await allowed(bot, s, u, financial=True)
+        if not ok: return await c.answer(msg, show_alert=True)
+        o = await s.scalar(select(Order).where(Order.id == oid, Order.user_id == u.id).with_for_update())
+        if not o: return await c.answer('Order not found.', show_alert=True)
+        if o.status != 'waiting_for_otp' or not o.activation_id:
+            return await c.answer('This order is no longer cancellable.', show_alert=True)
+        activation_id = o.activation_id
+    try:
+        result = await client.set_status(activation_id, 8)
+    except GrizzlyTransportError:
+        return await c.answer('⚠️ Grizzly did not confirm the cancellation. Please try again shortly.', show_alert=True)
+    except Exception:
+        return await c.answer('⚠️ Cancellation failed. Please try again.', show_alert=True)
+    raw = str(result.get('raw', ''))
+    if raw not in {'ACCESS_CANCEL', 'STATUS_CANCEL', 'NO_ACTIVATION'}:
+        return await c.answer(f'⚠️ Grizzly rejected the cancellation: {raw or "unknown response"}', show_alert=True)
+    async with SessionLocal() as s:
+        o = await s.scalar(select(Order).where(Order.id == oid).with_for_update())
+        if not o or o.refunded: return await c.answer('Already closed.', show_alert=True)
+        await refund_order(s, o, c.from_user.id)
+        o.status = 'cancelled'
+        s.add(OrderEvent(order_id=o.id, event_type='cancelled_by_user', data='{}'))
+        public_id, amount = o.order_id, o.selling_price
+        await s.commit()
+    try:
+        await c.message.edit_text(
+            f'❌ <b>Order cancelled</b>\n\nOrder: <code>{public_id}</code>\n'
+            f'💰 <b>{amount:.2f} USDT refunded</b> to your balance.', parse_mode='HTML')
+    except Exception: pass
 
 @router.message(F.text == '📦 My Orders')
 async def orders(m: Message, bot: Bot):
