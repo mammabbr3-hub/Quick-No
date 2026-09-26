@@ -85,6 +85,7 @@ async def _direct_new_number(c: CallbackQuery, bot: Bot, cid: int):
         wallet = await s.scalar(select(Wallet).where(Wallet.user_id == u.id).with_for_update())
         if not wallet or Decimal(wallet.balance) < price:
             return None, '💰 Insufficient balance.'
+        main_balance = Decimal(wallet.balance) - price
         order = await create_order(s, u.id, row, price)
         await s.commit()
         order_id = order.id
@@ -124,13 +125,17 @@ async def _direct_new_number(c: CallbackQuery, bot: Bot, cid: int):
 
     text = (
         f'📱 <b>Number received</b>\n\n'
-        f'Order: <code>{public_id}</code>\nCountry: {country_flag} {country_name}\n'
-        f'Phone no: <code>{result["phone_number"]}</code>\nPrice: <b>{price:.2f} USDT</b>\n\n'
-        f'⏳ <b>Waiting for OTP</b>\n⏱ Auto cancel: <b>20:00</b>\n✋ Manual cancel: <b>05:00</b>'
+        f'Phone no: <code>{result["phone_number"]}</code>\n\n'
+        f'💰 <b>Price 🪙</b>: {price:.2f} USDT\n'
+        f'📦 <b>Order (available)#</b> <code>{public_id}</code>\n'
+        f'⚖️ <b>Main balance</b>: {main_balance:.2f} USDT\n\n'
+        f'⏳ <b>Waiting for OTP</b>\n⏱ Auto cancel: <b>20:00</b>\n'
+        f'✋ <b>Cancel available in 05:00</b>'
     )
-    sent = await c.message.answer(text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text='🆕 Get New Number', callback_data=f'get_new:{cid}')
-    ]]))
+    sent = await c.message.answer(text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='🆕 Get New Number', callback_data=f'get_new:{cid}')],
+        [InlineKeyboardButton(text='✋ Cancel available 05:00', callback_data=f'cancel_ask:{order_id}')]
+    ]))
     async with SessionLocal() as s:
         s.add(OrderEvent(order_id=order_id, event_type='waiting_ui', data=json.dumps({'chat_id': sent.chat.id, 'message_id': sent.message_id, 'country_id': cid})))
         await s.commit()
@@ -178,6 +183,7 @@ async def confirm_buy(c: CallbackQuery, bot: Bot):
         wallet = await s.scalar(select(Wallet).where(Wallet.user_id == u.id).with_for_update())
         if not wallet or Decimal(wallet.balance) < price:
             return await c.message.answer('💰 Insufficient balance.')
+        main_balance = Decimal(wallet.balance) - price
         order = await create_order(s, u.id, row, price)
         await s.commit()
         order_id = order.id
@@ -229,13 +235,15 @@ async def confirm_buy(c: CallbackQuery, bot: Bot):
         f'Phone no: <code>{result["phone_number"]}</code>\n'
         f'Price: <b>{price:.2f} USDT</b>\n\n'
         f'⏳ <b>Waiting for OTP</b>\n'
-        f'⏱ Auto cancel: <b>20:00</b>\n✋ Manual cancel: <b>05:00</b>\n\n'
+        f'⏱ Auto cancel: <b>20:00</b>\n'
+        f'✋ <b>Cancel available in 05:00</b>\n'
     )
     sent = await c.message.edit_text(
         waiting_text, parse_mode='HTML',
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text='🆕 Get New Number', callback_data=f'get_new:{cid}')
-        ]])
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text='🆕 Get New Number', callback_data=f'get_new:{cid}')],
+            [InlineKeyboardButton(text='✋ Cancel available 05:00', callback_data=f'cancel_ask:{order_id}')]
+        ])
     )
     async with SessionLocal() as s:
         o = await s.scalar(select(Order).where(Order.id == order_id).with_for_update())
@@ -259,12 +267,15 @@ async def cancel_ask(c: CallbackQuery, bot: Bot):
         o = await s.scalar(select(Order).where(Order.id == oid, Order.user_id == u.id))
         if not o or o.status != 'waiting_for_otp':
             return await c.answer('This order is no longer cancellable.', show_alert=True)
-        started = o.updated_at or o.created_at
+        started = o.created_at
         if started and datetime.now(timezone.utc) - started < MANUAL_CANCEL_WINDOW:
             left = MANUAL_CANCEL_WINDOW - (datetime.now(timezone.utc) - started)
             secs = max(0, int(left.total_seconds()))
             mm, ss = divmod(secs, 60)
             return await c.answer(f'⏱ Cancel will be available in {mm:02d}:{ss:02d}.', show_alert=True)
+    async with SessionLocal() as s:
+        s.add(OrderEvent(order_id=oid, event_type='cancel_prompt', data='{}'))
+        await s.commit()
     await c.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text='✅ Yes, Cancel', callback_data=f'cancel_order:{oid}')
     ],[
@@ -286,10 +297,13 @@ async def cancel_back(c: CallbackQuery, bot: Bot):
         cid = await s.scalar(select(Country.id).where(Country.code == o.country_code, Country.service_code == 'wa', Country.enabled.is_(True)))
     if cid is None:
         return await c.answer('Country is no longer available.', show_alert=True)
-    await c.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text='🆕 Get New Number', callback_data=f'get_new:{cid}'),
-        InlineKeyboardButton(text='❌ Cancel', callback_data=f'cancel_ask:{oid}')
-    ]]))
+    async with SessionLocal() as s:
+        s.add(OrderEvent(order_id=oid, event_type='cancel_prompt_cleared', data='{}'))
+        await s.commit()
+    await c.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='🆕 Get New Number', callback_data=f'get_new:{cid}')],
+        [InlineKeyboardButton(text='❌ Cancel', callback_data=f'cancel_ask:{oid}')]
+    ]))
     await c.answer('Order is still waiting for OTP.')
 
 @router.callback_query(F.data.startswith('cancel_order:'))
@@ -305,7 +319,7 @@ async def cancel_order(c: CallbackQuery, bot: Bot):
         if not o: return await c.answer('Order not found.', show_alert=True)
         if o.status != 'waiting_for_otp' or not o.activation_id:
             return await c.answer('This order is no longer cancellable.', show_alert=True)
-        started = o.updated_at or o.created_at
+        started = o.created_at
         if started and datetime.now(timezone.utc) - started < MANUAL_CANCEL_WINDOW:
             left = MANUAL_CANCEL_WINDOW - (datetime.now(timezone.utc) - started)
             secs = max(0, int(left.total_seconds()))
