@@ -1,3 +1,0 @@
-MESSAGE RETENTION POLICY
-
-Bot-generated messages are never auto-deleted. Messages containing IDs, order IDs, request IDs, transaction IDs, OTP request details, or generated records are retained for tracking and troubleshooting. Navigation/menu messages are also retained. Only a dedicated Work-explanation cleanup may remove an instructional message when explicitly implemented; it is not part of generic auto-delete.
