@@ -3,8 +3,8 @@ MOBILE BUSINESS HUB — RAILWAY
 1. Deploy this folder as a Railway service.
 2. Set the variables in RAILWAY_ENV.txt in Railway Variables.
 3. Do NOT put BOT_TOKEN or GRIZZLY_API_KEY inside bot.py.
-4. Start command / Procfile: web: WEBHOOK_AUTOSTART=1 gunicorn --workers 1 --threads 4 --timeout 120 -b 0.0.0.0:$PORT bot:web_app
-5. Production mode uses Railway PostgreSQL by setting DATABASE_URL. SQLite remains available as a small/single-instance fallback when DATABASE_URL is not set.
+4. Start command / Procfile: worker: python3 bot.py
+5. Database is SQLite. No PostgreSQL is required.
 
 Required variables:
 BOT_TOKEN=your Telegram bot token

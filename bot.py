@@ -24,7 +24,6 @@
 import os
 import json
 import sqlite3
-import uuid
 import secrets
 import logging
 import html
@@ -33,17 +32,6 @@ import time
 import urllib.request
 import urllib.parse
 import re
-import hashlib
-
-# Optional production database backend. SQLite remains the default for backwards compatibility.
-try:
-    import psycopg
-    from psycopg.rows import dict_row
-    from psycopg_pool import ConnectionPool
-except Exception:
-    psycopg = None
-    dict_row = None
-    ConnectionPool = None
 try:
     import pycountry
 except Exception:
@@ -89,15 +77,6 @@ logger = logging.getLogger("mobile")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 BOT_LINK = os.environ.get("BOT_LINK", "").strip()
 DB_PATH = os.environ.get("mobile_DB_PATH", "mobile.db").strip()
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-DB_POOL_MIN_SIZE = max(1, int(os.environ.get("DB_POOL_MIN_SIZE", "2") or 2))
-DB_POOL_MAX_SIZE = max(DB_POOL_MIN_SIZE, int(os.environ.get("DB_POOL_MAX_SIZE", "20") or 20))
-DB_BACKEND = "postgres" if DATABASE_URL else "sqlite"
-PG_POOL = None
-if DB_BACKEND == "postgres":
-    if psycopg is None or ConnectionPool is None:
-        raise SystemExit("DATABASE_URL is set, but psycopg[binary,pool] is not installed. Add it to requirements.txt.")
-    PG_POOL = ConnectionPool(conninfo=DATABASE_URL, min_size=DB_POOL_MIN_SIZE, max_size=DB_POOL_MAX_SIZE, kwargs={"row_factory": dict_row}, open=True)
 
 _admin_ids_raw = os.environ.get("ADMIN_IDS", "").strip()
 ADMIN_IDS = {a.strip() for a in _admin_ids_raw.split(",") if a.strip()}
@@ -158,10 +137,6 @@ PRIMARY_ADMIN = int(sorted(ADMIN_IDS)[0]) if False else int(next(iter(ADMIN_IDS)
 _admin_list_ordered = [a.strip() for a in _admin_ids_raw.split(",") if a.strip()]
 if _admin_list_ordered:
     PRIMARY_ADMIN = int(_admin_list_ordered[0])
-
-WORKER_ID = os.environ.get("WORKER_ID", "").strip() or f"otp-{uuid.uuid4().hex[:12]}"
-OTP_WORKER_BATCH = max(1, int(os.environ.get("OTP_WORKER_BATCH", "100") or 100))
-OTP_WORKER_LEASE_SECONDS = max(10, int(os.environ.get("OTP_WORKER_LEASE_SECONDS", "30") or 30))
 
 VALID_CURRENCIES = ("usdt",)
 CURRENCY_LABELS = {"usdt": "USDT"}
@@ -261,97 +236,27 @@ class ActionStateError(Exception):
 # ---------------------------------------------------------------
 # DATABASE CONNECTION HELPERS
 # ---------------------------------------------------------------
-# SQLite is retained for compatibility/small deployments. For production
-# scale set DATABASE_URL to PostgreSQL. Every logical operation gets its own
-# pooled PostgreSQL connection, allowing multiple bot replicas to share the
-# same database safely.
-
-class _HybridRow(dict):
-    """Dictionary-like DB row that also supports SQLite-style numeric indexes."""
-    def __init__(self, mapping):
-        super().__init__(mapping)
-        self._keys = list(mapping.keys())
-    def __getitem__(self, key):
-        if isinstance(key, int):
-            return super().__getitem__(self._keys[key])
-        return super().__getitem__(key)
-
-class _PGResult:
-    def __init__(self, cursor):
-        self.cursor = cursor
-        self.rowcount = cursor.rowcount
-    def fetchone(self):
-        row = self.cursor.fetchone()
-        if row is None:
-            return None
-        return _HybridRow(row)
-    def fetchall(self):
-        return [_HybridRow(r) for r in self.cursor.fetchall()]
-
-class _PGConn:
-    def __init__(self):
-        self._ctx = PG_POOL.connection()
-        self._conn = self._ctx.__enter__()
-    def _sql(self, query):
-        q = query.strip()
-        if q.upper().startswith("PRAGMA "):
-            return None
-        if q.upper() == "BEGIN IMMEDIATE":
-            return "BEGIN"
-        # SQLite's INSERT OR IGNORE maps directly to PostgreSQL's
-        # conflict-safe insert semantics.
-        q = re.sub(r"^INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", q, flags=re.I)
-        if q.upper().startswith("INSERT INTO") and not re.search(r"\bON\s+CONFLICT\b", q, flags=re.I):
-            q = q + " ON CONFLICT DO NOTHING"
-        had_autoincrement = "AUTOINCREMENT" in q.upper()
-        q = q.replace("AUTOINCREMENT", "")
-        if had_autoincrement:
-            q = re.sub(r"\bINTEGER\s+PRIMARY\s+KEY\b", "BIGSERIAL PRIMARY KEY", q, flags=re.I)
-        q = re.sub(r"\?", "%s", q)
-        return q
-    def execute(self, query, params=()):
-        q = self._sql(query)
-        if q is None:
-            return _PGResult(_DummyCursor())
-        cur = self._conn.cursor()
-        cur.execute(q, params)
-        return _PGResult(cur)
-    def executescript(self, script):
-        for statement in script.split(';'):
-            stmt = statement.strip()
-            if not stmt or stmt.upper().startswith('PRAGMA '):
-                continue
-            self.execute(stmt)
-    def commit(self):
-        self._conn.commit()
-    def rollback(self):
-        self._conn.rollback()
-    def close(self):
-        try:
-            self._ctx.__exit__(None, None, None)
-        except Exception:
-            pass
-
-class _DummyCursor:
-    rowcount = -1
-    def fetchone(self): return None
-    def fetchall(self): return []
-
+# We open a short-lived connection per operation rather than sharing
+# one connection across threads (pyTelegramBotAPI's infinity_polling
+# runs handlers on worker threads). WAL mode + busy_timeout lets
+# reads and writes coexist safely. Every state-changing operation
+# runs inside db_tx(), which issues BEGIN IMMEDIATE to take a write
+# lock up front — this is what makes "check status, then update"
+# operations (like approving a withdrawal) safe against two admins
+# clicking buttons at the same time.
 
 def _connect():
-    if DB_BACKEND == "postgres":
-        return _PGConn()
     db_parent = os.path.dirname(os.path.abspath(DB_PATH))
     if db_parent:
         os.makedirs(db_parent, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 
 def db_ro():
+    """Connection for read-only queries. Caller must close it."""
     return _connect()
 
 
@@ -373,6 +278,14 @@ def fetchall(query, params=()):
 
 @contextmanager
 def db_tx():
+    """
+    Context manager for an atomic write transaction.
+    Usage:
+        with db_tx() as conn:
+            conn.execute(...)
+            ... more statements ...
+        # auto-committed on success, auto-rolled-back on any exception
+    """
     conn = _connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -383,41 +296,6 @@ def db_tx():
         raise
     finally:
         conn.close()
-
-def try_claim_distributed_job(job_key: str, lease_seconds: int = 120) -> bool:
-    now = datetime.now(timezone.utc)
-    now_s = now.isoformat(timespec="seconds")
-    until_s = (now + timedelta(seconds=max(10, int(lease_seconds)))).isoformat(timespec="seconds")
-    with db_tx() as conn:
-        conn.execute("INSERT OR IGNORE INTO distributed_jobs(job_key,owner_id,lease_until,updated_at) VALUES(?,?,?,?)",
-                     (job_key, WORKER_ID, until_s, now_s))
-        row = conn.execute(("SELECT owner_id,lease_until FROM distributed_jobs WHERE job_key=? FOR UPDATE" if DB_BACKEND == "postgres" else "SELECT owner_id,lease_until FROM distributed_jobs WHERE job_key=?"), (job_key,)).fetchone()
-        if not row: return False
-        current = row["lease_until"]
-        if current:
-            try:
-                dt = datetime.fromisoformat(str(current))
-                if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
-                if dt > now and row["owner_id"] != WORKER_ID: return False
-            except ValueError: pass
-        conn.execute("UPDATE distributed_jobs SET owner_id=?,lease_until=?,updated_at=? WHERE job_key=?",
-                     (WORKER_ID, until_s, now_s, job_key))
-        return True
-
-def renew_distributed_job(job_key: str, lease_seconds: int = 120) -> bool:
-    until_s=(datetime.now(timezone.utc)+timedelta(seconds=max(10,int(lease_seconds)))).isoformat(timespec="seconds")
-    with db_tx() as conn:
-        cur=conn.execute("UPDATE distributed_jobs SET lease_until=?,updated_at=? WHERE job_key=? AND owner_id=?",
-                         (until_s,now_iso(),job_key,WORKER_ID))
-        return cur.rowcount > 0
-
-def release_distributed_job(job_key: str) -> None:
-    try:
-        with db_tx() as conn:
-            conn.execute("UPDATE distributed_jobs SET owner_id=NULL,lease_until=NULL,updated_at=? WHERE job_key=? AND owner_id=?",
-                         (now_iso(),job_key,WORKER_ID))
-    except Exception:
-        logger.exception("Could not release distributed job %s", job_key)
 
 
 # ---------------------------------------------------------------
@@ -582,14 +460,6 @@ CREATE TABLE IF NOT EXISTS fsm_state (
     updated_at  TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS distributed_jobs (
-    job_key TEXT PRIMARY KEY,
-    owner_id TEXT,
-    lease_until TEXT,
-    updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_distributed_jobs_lease ON distributed_jobs(lease_until);
-
 CREATE TABLE IF NOT EXISTS support_tickets (
     ticket_id     TEXT PRIMARY KEY,
     user_id       TEXT NOT NULL,
@@ -730,8 +600,6 @@ _MIGRATIONS = [
     "ALTER TABLE auto_messages ADD COLUMN target_value TEXT",
     "ALTER TABLE audit_log ADD COLUMN channel_sent INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE audit_log ADD COLUMN channel_message_id INTEGER",
-    "ALTER TABLE audit_log ADD COLUMN processing_by TEXT",
-    "ALTER TABLE audit_log ADD COLUMN processing_until TEXT",
 ]
 
 
@@ -768,11 +636,10 @@ def init_db():
             try:
                 conn.execute(stmt)
                 conn.commit()
-            except Exception as e:
-                if "duplicate column" not in str(e).lower() and "already exists" not in str(e).lower():
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
                     logger.exception("Migration failed: %s", stmt)
-        if DB_BACKEND == "sqlite":
-            _migrate_legacy_finance_schema(conn)
+        _migrate_legacy_finance_schema(conn)
         # Seed the requested default minimum withdrawal only when the admin
         # has never configured it. Existing admin choices are preserved.
         try:
@@ -892,15 +759,22 @@ def ensure_wallet(conn, user_id):
 
 
 def ensure_user(conn, user_id, name, username=None) -> bool:
-    """Atomically create/update a user so concurrent replicas are idempotent."""
+    """Returns True if this is a newly created user."""
     user_id = str(user_id)
-    cur = conn.execute("INSERT OR IGNORE INTO users (user_id, name, username, created_at) VALUES (?,?,?,?)",
-                       (user_id, name, username, now_iso()))
-    is_new = cur.rowcount > 0
+    row = conn.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,)).fetchone()
+    is_new = row is None
     if is_new:
+        conn.execute(
+            "INSERT INTO users (user_id, name, username, created_at) VALUES (?,?,?,?)",
+            (user_id, name, username, now_iso()),
+        )
         ensure_wallet(conn, user_id)
     else:
-        conn.execute("UPDATE users SET name=?, username=? WHERE user_id=?", (name, username, user_id))
+        # Keep name/username fresh (Telegram users can change either).
+        conn.execute(
+            "UPDATE users SET name=?, username=? WHERE user_id=?",
+            (name, username, user_id),
+        )
     return is_new
 
 
@@ -1040,11 +914,11 @@ def adjust_balance(conn, user_id, currency, delta, txn_type, *, reason=None,
         raise ValueError(f"Invalid currency: {currency}")
 
     user_id = str(user_id)
-    row = conn.execute(f"SELECT {currency} FROM wallets WHERE user_id=?" + (" FOR UPDATE" if DB_BACKEND == "postgres" else ""), (user_id,)).fetchone()
+    row = conn.execute(f"SELECT {currency} FROM wallets WHERE user_id=?", (user_id,)).fetchone()
     if row is None:
         raise ValueError(f"No wallet found for user {user_id}")
 
-    balance_before = row[0] if not isinstance(row, dict) else row[currency]
+    balance_before = row[0]
     balance_after = balance_before + delta
 
     if delta < 0 and balance_after < -1e-9 and not allow_negative:
@@ -1272,8 +1146,8 @@ def approve_submission(sub_id, admin_id):
         if cur.rowcount == 0:
             raise SubmissionStateError("This submission was just processed by another admin.")
 
-        pending_expr = "GREATEST(pending - 1, 0)" if DB_BACKEND == "postgres" else "MAX(pending - 1, 0)"
-        conn.execute(f"UPDATE wallets SET approved = approved + 1, pending = {pending_expr} WHERE user_id=?", (row["user_id"],))
+        conn.execute("UPDATE wallets SET approved = approved + 1, pending = MAX(pending - 1, 0) "
+                      "WHERE user_id=?", (row["user_id"],))
         conn.execute(
             "UPDATE reject_counts SET count = 0 WHERE user_id=?", (row["user_id"],)
         )
@@ -1301,8 +1175,8 @@ def reject_submission(sub_id, admin_id, reason):
         if cur.rowcount == 0:
             raise SubmissionStateError("This submission was just processed by another admin.")
 
-        pending_expr = "GREATEST(pending - 1, 0)" if DB_BACKEND == "postgres" else "MAX(pending - 1, 0)"
-        conn.execute(f"UPDATE wallets SET pending = {pending_expr} WHERE user_id=?", (row["user_id"],))
+        conn.execute("UPDATE wallets SET pending = MAX(pending - 1, 0) WHERE user_id=?",
+                      (row["user_id"],))
         conn.execute(
             "INSERT INTO reject_counts (user_id, count) VALUES (?, 1) "
             "ON CONFLICT(user_id) DO UPDATE SET count = count + 1",
@@ -1695,44 +1569,23 @@ def get_fund_request(request_id):
 
 
 def approve_fund_request(request_id, admin_id):
-    """Approve a funding request exactly once across concurrent admins.
-
-    The request row is claimed first (inside the same transaction) before the
-    wallet is credited. This prevents two concurrent admins from both crediting
-    the same funding request. The PostgreSQL path uses row locking; SQLite's
-    write transaction already serializes the operation.
-    """
     with db_tx() as conn:
-        select_sql = (
-            "SELECT * FROM fund_requests WHERE request_id=? FOR UPDATE"
-            if DB_BACKEND == "postgres"
-            else "SELECT * FROM fund_requests WHERE request_id=?"
-        )
-        row = conn.execute(select_sql, (request_id,)).fetchone()
+        row = conn.execute("SELECT * FROM fund_requests WHERE request_id=?", (request_id,)).fetchone()
         if not row:
             raise ValueError("Funding request not found.")
         if row["status"] != "PENDING":
             raise ValueError(f"This request is already {row['status']}.")
-
-        # Claim the request before touching the wallet. If anything below fails,
-        # the transaction rolls back and the request remains PENDING.
-        claim = conn.execute(
-            "UPDATE fund_requests SET status='APPROVED',processed_at=?,processed_by=? "
-            "WHERE request_id=? AND status='PENDING'",
-            (now_iso(), str(admin_id), request_id),
-        )
-        if claim.rowcount != 1:
-            raise ValueError("This request was just processed by another admin.")
-
         ensure_wallet(conn, row["user_id"])
         entry = _change_wallet_locked(
             conn, row["user_id"], "usdt", float(row["usdt_amount"]),
             "FUND_WALLET", f"Funding approved {request_id}", request_id, str(admin_id)
         )
         conn.execute(
-            "UPDATE fund_requests SET credited_txn_id=? WHERE request_id=?",
-            (entry["txn_id"], request_id),
+            "UPDATE fund_requests SET status='APPROVED',processed_at=?,processed_by=?,credited_txn_id=? WHERE request_id=? AND status='PENDING'",
+            (now_iso(), str(admin_id), entry["txn_id"], request_id),
         )
+        if conn.total_changes < 1:
+            raise ValueError("This request was just processed by another admin.")
         return row, entry
 
 
@@ -2082,19 +1935,8 @@ def mark_auto_message_sent(auto_id, date_str):
         conn.execute("UPDATE auto_messages SET last_sent_date=? WHERE auto_id=?", (date_str, auto_id))
 
 
-def iter_user_ids(batch_size=1000):
-    """Stream user IDs with keyset pagination; never materialize millions in RAM."""
-    last_id = ""
-    while True:
-        rows = fetchall("SELECT user_id FROM users WHERE user_id>? ORDER BY user_id LIMIT ?", (last_id, int(batch_size)))
-        if not rows: break
-        for row in rows:
-            last_id = str(row["user_id"])
-            yield row["user_id"]
-        if len(rows) < int(batch_size): break
-
 def all_user_ids():
-    return list(iter_user_ids())
+    return [row["user_id"] for row in fetchall("SELECT user_id FROM users")]
 
 
 # ---------------------------------------------------------------
@@ -2677,24 +2519,21 @@ def _audit_text(row):
             f"🕒 {html.escape(str(row['created_at']))}")
 
 def audit_channel_dispatcher():
-    """Deliver audit rows with per-row leases so replicas cannot send the same row simultaneously."""
+    """Deliver durable SQLite audit history to the configured channel.
+    The database remains the source of truth; failed Telegram delivery is retried.
+    """
     while True:
         try:
             cid=_audit_channel_id()
             if cid:
-                rows=fetchall("SELECT * FROM audit_log WHERE channel_sent=0 AND (processing_until IS NULL OR processing_until < ?) ORDER BY id LIMIT 25",(now_iso(),))
+                rows=fetchall("SELECT * FROM audit_log WHERE channel_sent=0 ORDER BY id LIMIT 25")
                 for row in rows:
-                    aid=row["id"]; until=(datetime.now(timezone.utc)+timedelta(seconds=120)).isoformat(timespec="seconds")
-                    with db_tx() as conn:
-                        cur=conn.execute("UPDATE audit_log SET processing_by=?,processing_until=? WHERE id=? AND channel_sent=0 AND (processing_until IS NULL OR processing_until < ?)",
-                                         (WORKER_ID,until,aid,now_iso()))
-                        if cur.rowcount==0: continue
                     try:
                         sent=bot.send_message(cid,_audit_text(row),parse_mode="HTML")
                         with db_tx() as conn:
-                            conn.execute("UPDATE audit_log SET channel_sent=1,channel_message_id=?,processing_by=NULL,processing_until=NULL WHERE id=? AND processing_by=?",(sent.message_id,aid,WORKER_ID))
+                            conn.execute("UPDATE audit_log SET channel_sent=1,channel_message_id=? WHERE id=?",(sent.message_id,row["id"]))
                     except Exception:
-                        logger.exception("Audit channel delivery failed for audit id %s",aid)
+                        logger.exception("Audit channel delivery failed for audit id %s",row["id"])
                         break
         except Exception:
             logger.exception("Audit channel dispatcher error")
@@ -4596,30 +4435,21 @@ def broadcast_decision_cb(c):
         clear_state(chat_id); bot.answer_callback_query(c.id); bot.edit_message_text("❌ Cancelled.",chat_id,c.message.message_id); return
     text=state.get("text",""); target=state.get("target","all"); clear_state(chat_id)
     bot.answer_callback_query(c.id); bot.edit_message_text("⌛ Sending message...",chat_id,c.message.message_id)
-    def run_broadcast():
-        sent=0
-        if target=="all":
-            job_key=f"broadcast:{hashlib.sha256(text.encode('utf-8')).hexdigest()}"
-            if not try_claim_distributed_job(job_key,180):
-                bot.send_message(chat_id,"⏳ This broadcast is already being processed by another worker.",reply_markup=main_menu(chat_id)); return
-            try:
-                for idx,uid in enumerate(iter_user_ids(),1):
-                    try: bot.send_message(uid,f"📢 {BRAND}:\n\n{text}"); sent+=1
-                    except Exception: logger.exception("Broadcast failed to reach %s",uid)
-                    if idx % 100 == 0: renew_distributed_job(job_key,180)
-            finally:
-                release_distributed_job(job_key)
-        else:
-            cid=_community_id(target)
-            if not cid:
-                bot.send_message(chat_id,"❌ That community destination is not configured.",reply_markup=main_menu(chat_id)); return
-            try: bot.send_message(cid,f"📢 {BRAND}:\n\n{text}"); sent=1
-            except Exception as e: bot.send_message(chat_id,f"❌ Could not send to destination: {e}",reply_markup=main_menu(chat_id)); return
-        bot.send_message(chat_id,f"✅ Broadcast sent successfully.\n📨 Delivered: {sent}",reply_markup=main_menu(chat_id))
-        with db_tx() as conn:
-            conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",
-                         (str(chat_id),"BROADCAST_SENT",None,None,gen_id("MSG"),f"target={target}; delivered={sent}; {text[:300]}",now_iso()))
-    threading.Thread(target=run_broadcast, daemon=True, name=f"broadcast-{chat_id}").start()
+    sent=0
+    if target=="all":
+        for row in fetchall("SELECT user_id FROM users"):
+            try: bot.send_message(row["user_id"],f"📢 {BRAND}:\n\n{text}"); sent+=1
+            except Exception: logger.exception("Broadcast failed to reach %s",row["user_id"])
+    else:
+        cid=_community_id(target)
+        if not cid:
+            return bot.send_message(chat_id,"❌ That community destination is not configured.",reply_markup=main_menu(chat_id))
+        try: bot.send_message(cid,f"📢 {BRAND}:\n\n{text}"); sent=1
+        except Exception as e: bot.send_message(chat_id,f"❌ Could not send to destination: {e}",reply_markup=main_menu(chat_id)); return
+    bot.send_message(chat_id,f"✅ Broadcast sent successfully.\n📨 Delivered: {sent}",reply_markup=main_menu(chat_id))
+    with db_tx() as conn:
+        conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",
+                     (str(chat_id),"BROADCAST_SENT",None,None,gen_id("MSG"),f"target={target}; delivered={sent}; {text[:300]}",now_iso()))
 
 
 # ================================================================
@@ -5399,10 +5229,10 @@ def _handle_admin_withdraw_method(m,state):
         name=state.get("name"); mid=gen_id("WDM")
         create_withdrawal_method(mid,name,value,m.chat.id,active=1)
         clear_state(m.chat.id)
-        bot.send_message(m.chat.id,f"✅ Payment method created and ACTIVE.\n\n💳 {html.escape(name)}\n📝 {html.escape(value)}",parse_mode="HTML",reply_markup=main_menu(m.chat.id)); return
+        bot.send_message(m.chat.id,f"✅ Payment method created and ACTIVE.\n\n💳 {html.escape(name)}\n📝 {html.escape(value)}",parse_mode="HTML",reply_markup=admin_menu(m.chat.id)); return
     mid=state.get("method_id"); row=get_withdrawal_method(mid)
     if not row:
-        clear_state(m.chat.id); bot.send_message(m.chat.id,"❌ Payment method no longer exists.",reply_markup=main_menu(m.chat.id)); return
+        clear_state(m.chat.id); bot.send_message(m.chat.id,"❌ Payment method no longer exists.",reply_markup=admin_menu(m.chat.id)); return
     if step=="prompt_edit":
         update_withdrawal_method(mid,prompt=value,admin_id=m.chat.id)
     elif step=="name_edit":
@@ -5411,7 +5241,7 @@ def _handle_admin_withdraw_method(m,state):
         update_withdrawal_method(mid,name=value,admin_id=m.chat.id)
     else:
         clear_state(m.chat.id); return
-    clear_state(m.chat.id); bot.send_message(m.chat.id,"✅ Withdrawal payment method updated.",reply_markup=main_menu(m.chat.id))
+    clear_state(m.chat.id); bot.send_message(m.chat.id,"✅ Withdrawal payment method updated.",reply_markup=admin_menu(m.chat.id))
 
 
 # ================================================================
@@ -6880,18 +6710,16 @@ def _handle_auto_edit_field(m, state):
     bot.send_message(m.chat.id, "✅ Updated.", reply_markup=main_menu(m.chat.id))
 
 
-def _send_target_message(target_type, body, target_value=None, lease_key=None):
+def _send_target_message(target_type, body, target_value=None):
     """Send a scheduled/manual message to the configured audience."""
     sent=0
     if target_type == "bot_users":
-        for idx, uid in enumerate(iter_user_ids(), 1):
+        for uid in all_user_ids():
             try:
                 bot.send_message(uid, f"📢 {BRAND}:\n\n{body}")
-                sent += 1
+                sent+=1
             except Exception:
                 logger.exception("Message delivery failed to bot user %s", uid)
-            if lease_key and idx % 100 == 0:
-                renew_distributed_job(lease_key, 180)
         return sent
     cid=_community_id(target_type)
     if cid:
@@ -6901,35 +6729,55 @@ def _send_target_message(target_type, body, target_value=None, lease_key=None):
 
 
 def auto_message_scheduler():
-    """Run scheduled messages once across horizontally scaled replicas."""
+    """Background loop: every ~30s, checks whether any active auto
+    message's daily send-time has arrived (Africa/Lagos) and, if so,
+    sends it to every user once, then marks it sent for the day so it
+    doesn't repeat until tomorrow."""
     while True:
         try:
-            now=datetime.now(LAGOS_TZ); today_str=now.strftime("%Y-%m-%d")
+            now = datetime.now(LAGOS_TZ)
+            today_str = now.strftime("%Y-%m-%d")
             for r in list_auto_messages():
-                if not r["active"]: continue
-                job_key=f"auto_message:{r['auto_id']}"
-                if not try_claim_distributed_job(job_key,180): continue
-                try:
-                    if r["interval_minutes"]:
-                        due=True
-                        if r["last_sent_at"]:
-                            try:
-                                last=datetime.fromisoformat(r["last_sent_at"]); last=last if last.tzinfo else last.replace(tzinfo=timezone.utc)
-                                due=(datetime.now(timezone.utc)-last)>=timedelta(minutes=r["interval_minutes"])
-                            except (ValueError,TypeError): due=True
-                        if due:
-                            sent=_send_target_message(r["target_type"],r["body"],r["target_value"],lease_key=job_key); mark_auto_message_sent_at(r["auto_id"],now_iso())
-                            with db_tx() as conn:
-                                conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",(str(r["created_by"] or "SYSTEM"),"AUTO_MESSAGE_SENT",None,None,r["auto_id"],f"target={r['target_type']}; delivered={sent}",now_iso()))
-                    elif r["last_sent_date"]!=today_str and now.hour==r["hour"] and now.minute==r["minute"]:
-                        sent=_send_target_message(r["target_type"],r["body"],r["target_value"],lease_key=job_key); mark_auto_message_sent(r["auto_id"],today_str)
-                        with db_tx() as conn:
-                            conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",(str(r["created_by"] or "SYSTEM"),"AUTO_MESSAGE_SENT",None,None,r["auto_id"],f"target={r['target_type']}; delivered={sent}",now_iso()))
-                finally:
-                    release_distributed_job(job_key)
+                if not r["active"]:
+                    continue
+
+                if r["interval_minutes"]:
+                    # Repeat-every-N-minutes mode: ignores the daily
+                    # hour/minute fields entirely and instead tracks
+                    # the last send timestamp.
+                    due = True
+                    if r["last_sent_at"]:
+                        try:
+                            last = datetime.fromisoformat(r["last_sent_at"])
+                            due = (datetime.now(timezone.utc) - last) >= timedelta(minutes=r["interval_minutes"])
+                        except ValueError:
+                            due = True
+                    if not due:
+                        continue
+                    sent = _send_target_message(r["target_type"], r["body"], r["target_value"])
+                    mark_auto_message_sent_at(r["auto_id"], now_iso())
+                    logger.info(
+                        "Auto message %s ('%s') sent to %d destinations (every %d min)",
+                        r["auto_id"], r["title"], sent, r["interval_minutes"],
+                    )
+                    with db_tx() as conn:
+                        conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",
+                                     (str(r["created_by"] or "SYSTEM"),"AUTO_MESSAGE_SENT",None,None,r["auto_id"],f"target={r['target_type']}; delivered={sent}",now_iso()))
+                    continue
+
+                if r["last_sent_date"] == today_str:
+                    continue
+                if now.hour == r["hour"] and now.minute == r["minute"]:
+                    sent = _send_target_message(r["target_type"], r["body"], r["target_value"])
+                    mark_auto_message_sent(r["auto_id"], today_str)
+                    logger.info("Auto message %s ('%s') sent to %d destinations", r["auto_id"], r["title"], sent)
+                    with db_tx() as conn:
+                        conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",
+                                     (str(r["created_by"] or "SYSTEM"),"AUTO_MESSAGE_SENT",None,None,r["auto_id"],f"target={r['target_type']}; delivered={sent}",now_iso()))
         except Exception:
             logger.exception("Auto message scheduler loop error")
         time.sleep(30)
+
 
 
 @bot.message_handler(func=lambda m: m.text == btn_label("buy_sell_mail"))
@@ -8232,17 +8080,15 @@ def _otp_price(row, service_row=None):
 def otp_db_init():
     with db_tx() as conn:
         conn.executescript(OTP_SCHEMA)
-        # Backward-compatible migrations for both SQLite and PostgreSQL.
+        # SQLite migrations for existing installations.
         try: conn.execute('ALTER TABLE otp_services ADD COLUMN global_profit_percent REAL')
         except Exception: pass
         # Migrate older installations before Quick OTP starts using the newer
-        # activation lifecycle.
-        if DB_BACKEND == "sqlite":
-            otp_order_columns = {r[1] for r in conn.execute("PRAGMA table_info(otp_orders)").fetchall()}
-        else:
-            otp_order_columns = {r["column_name"] for r in conn.execute(
-                "SELECT column_name FROM information_schema.columns WHERE table_name='otp_orders'"
-            ).fetchall()}
+        # activation lifecycle. CREATE TABLE IF NOT EXISTS does NOT alter an
+        # already-existing otp_orders table, so older databases could reach
+        # Buy Number successfully and then fail on `activation_id`, producing
+        # the generic Telegram "Something went wrong" message.
+        otp_order_columns = {r[1] for r in conn.execute("PRAGMA table_info(otp_orders)").fetchall()}
         otp_order_migrations = [
             ("service_code", "TEXT NOT NULL DEFAULT 'wa'"),
             ("status", "TEXT NOT NULL DEFAULT 'processing'"),
@@ -8264,14 +8110,6 @@ def otp_db_init():
             conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_otp_orders_activation_id ON otp_orders(activation_id) WHERE activation_id IS NOT NULL')
         except Exception:
             logger.exception('Could not create OTP activation index')
-        # Distributed OTP workers: each PostgreSQL replica can safely claim a
-        # short lease on an order. SQLite keeps the original single-worker path.
-        if DB_BACKEND == "postgres":
-            for col, definition in [("worker_id", "TEXT"), ("lease_until", "TEXT")]:
-                try: conn.execute(f"ALTER TABLE otp_orders ADD COLUMN {col} {definition}")
-                except Exception: pass
-            try: conn.execute("CREATE INDEX IF NOT EXISTS idx_otp_orders_lease ON otp_orders(status,lease_until,created_at)")
-            except Exception: pass
 
         # Refresh human-readable service labels for existing installations.
         existing_services=conn.execute('SELECT service_code,service_name FROM otp_services').fetchall()
@@ -9581,119 +9419,107 @@ def otp_admin_alerts(c):
 
 # OTP worker: keep the existing safe reconciliation/refund behavior, but use the selected service.
 def _otp_price_watcher():
-    # Only one replica refreshes provider catalogue/stock at a time.
+    # Watch only services that have at least one configured/active country, avoiding thousands of unnecessary API calls.
     while True:
         try:
-            if try_claim_distributed_job("otp_price_watcher",900):
-                try:
-                    services=fetchall('SELECT DISTINCT service_code FROM otp_service_countries WHERE enabled=1 OR explicit_price IS NOT NULL OR profit_active=1')
-                    for r in services:
-                        try: otp_sync_service_stock(r['service_code'])
-                        except Exception as exc: logger.warning('OTP price watcher failed for %s: %s',r['service_code'],exc)
-                finally:
-                    release_distributed_job("otp_price_watcher")
+            services=fetchall('SELECT DISTINCT service_code FROM otp_service_countries WHERE enabled=1 OR explicit_price IS NOT NULL OR profit_active=1')
+            for r in services:
+                try: otp_sync_service_stock(r['service_code'])
+                except Exception as exc: logger.warning('OTP price watcher failed for %s: %s',r['service_code'],exc)
         except Exception: logger.exception('OTP price watcher error')
         time.sleep(600)
-
-def _otp_claim_batch():
-    """Claim a batch of waiting OTP orders when using PostgreSQL.
-    SKIP LOCKED prevents two bot replicas from polling the same activation."""
-    if DB_BACKEND != "postgres":
-        return fetchall('SELECT o.*,s.service_name FROM otp_orders o LEFT JOIN otp_services s ON s.service_code=o.service_code WHERE o.status="waiting" ORDER BY o.created_at LIMIT 300')
-    now_iso_value = _otp_now()
-    lease_until = (datetime.now(timezone.utc) + timedelta(seconds=OTP_WORKER_LEASE_SECONDS)).isoformat(timespec="seconds")
-    with db_tx() as conn:
-        rows = conn.execute(
-            "SELECT o.*,s.service_name FROM otp_orders o LEFT JOIN otp_services s ON s.service_code=o.service_code "
-            "WHERE o.status='waiting' AND (o.worker_id IS NULL OR o.lease_until < ?) "
-            "ORDER BY o.created_at LIMIT ? FOR UPDATE SKIP LOCKED",
-            (now_iso_value, OTP_WORKER_BATCH),
-        ).fetchall()
-        for row in rows:
-            conn.execute("UPDATE otp_orders SET worker_id=?, lease_until=? WHERE order_id=?", (WORKER_ID, lease_until, row['order_id']))
-        return rows
-
-
-def _otp_release_claim(order_id):
-    if DB_BACKEND != "postgres":
-        return
-    try:
-        with db_tx() as conn:
-            conn.execute("UPDATE otp_orders SET worker_id=NULL, lease_until=NULL WHERE order_id=? AND worker_id=?", (order_id, WORKER_ID))
-    except Exception:
-        logger.exception("Could not release OTP worker lease for %s", order_id)
-
 
 def _otp_worker():
     last_status={}
     while True:
         try:
-            active=_otp_claim_batch()
+            active=fetchall('SELECT o.*,s.service_name FROM otp_orders o LEFT JOIN otp_services s ON s.service_code=o.service_code WHERE o.status="waiting" ORDER BY o.created_at LIMIT 300')
             now=datetime.now(timezone.utc)
             for o_row in active:
+                # sqlite3.Row does not implement .get(). Convert once so the
+                # waiting UI/clock code can safely use dictionary access.
                 o=dict(o_row)
                 try: elapsed=(now-datetime.fromisoformat(o['created_at'])).total_seconds()
-                except Exception:
-                    _otp_release_claim(o.get('order_id')); continue
+                except Exception: continue
                 auto=max(0,1200-int(elapsed)); manual=max(0,300-int(elapsed))
-                try:
-                    if elapsed>=1200:
-                        try: r=_otp_http('setStatus',id=o['activation_id'],status='8')
-                        except Exception: continue
-                        if r.get('raw') not in {'ACCESS_CANCEL','STATUS_CANCEL','NO_ACTIVATION'}: continue
+                if elapsed>=1200:
+                    try: r=_otp_http('setStatus',id=o['activation_id'],status='8')
+                    except Exception: continue
+                    if r.get('raw') not in {'ACCESS_CANCEL','STATUS_CANCEL','NO_ACTIVATION'}: continue
+                    with db_tx() as conn:
+                        cur=conn.execute('SELECT * FROM otp_orders WHERE order_id=? AND status="waiting" AND refunded=0',(o['order_id'],)).fetchone()
+                        if cur:
+                            adjust_balance(conn,cur['user_id'],'usdt',float(cur['selling_price']),'OTP_REFUND',reason=f'Quick OTP auto cancel {o["order_id"]}',related_txn=o['order_id'],processed_by=cur['user_id'])
+                            conn.execute('UPDATE otp_orders SET status="expired",refunded=1,updated_at=? WHERE order_id=?',(_otp_now(),o['order_id']))
+                    try:
+                        _otp_update_message(
+                            o['chat_id'], o['message_id'],
+                            f'⌛ <b>OTP REQUEST EXPIRED</b>\n\n🆔 Request ID: <code>{html.escape(str(o["order_id"]))}</code>\n\n💰 Your refund has been processed because no OTP was received within 20 minutes.',
+                            types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{o["order_id"]}'))
+                        )
+                    except Exception: logger.exception('Could not update expired OTP message')
+                    continue
+                if o['chat_id'] and o['message_id']:
+                    _otp_update_message(o['chat_id'],o['message_id'],_otp_waiting_text(o,auto,manual),_otp_kb(o['order_id'],o['service_code'],o['country_code'],manual,o.get('phone_number')))
+                if elapsed-last_status.get(o['order_id'],-999)>=3:
+                    last_status[o['order_id']]=elapsed
+                    try: r=_otp_http('getStatusV2',id=o['activation_id'])
+                    except Exception: continue
+                    # The API poll is also a synchronization point for the
+                    # waiting card. Recalculate the timers immediately after
+                    # every status check, whether an OTP was found or not.
+                    if not r.get('otp') and o['chat_id'] and o['message_id']:
+                        try:
+                            fresh_now=datetime.now(timezone.utc)
+                            fresh_elapsed=(fresh_now-datetime.fromisoformat(o['created_at'])).total_seconds()
+                            fresh_auto=max(0,1200-int(fresh_elapsed)); fresh_manual=max(0,300-int(fresh_elapsed))
+                            fresh=dict(o)
+                            _otp_update_message(o['chat_id'],o['message_id'],_otp_waiting_text(fresh,fresh_auto,fresh_manual),_otp_kb(o['order_id'],o['service_code'],o['country_code'],fresh_manual,o.get('phone_number')))
+                        except Exception:
+                            logger.warning('OTP waiting-clock sync after status check failed for order=%s',o['order_id'])
+                    if r.get('otp'):
+                        logger.info('Quick OTP code received order=%s activation_id=%s',o['order_id'],o['activation_id'])
+                        otp=r['otp']
+                        try: _otp_http('setStatus',id=o['activation_id'],status='6')
+                        except Exception: pass
+                        with db_tx() as conn:
+                            cur=conn.execute('SELECT * FROM otp_orders WHERE order_id=? AND status="waiting"',(o['order_id'],)).fetchone()
+                            if cur:
+                                conn.execute('UPDATE otp_orders SET status="completed",otp_code=?,updated_at=? WHERE order_id=?',(otp,_otp_now(),o['order_id']))
+                                conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",(str(cur['user_id']),"OTP_COMPLETED",str(cur['user_id']),cur['selling_price'],o['order_id'],f'service={cur["service_code"]}; country={cur["country_name"]}',_otp_now()))
+                        # Update the existing waiting message in place. Do NOT send
+                        # a second OTP message: the phone number and OTP stay together.
+                        try:
+                            updated_order=dict(o)
+                            updated_order['phone_number']=cur['phone_number'] or o['phone_number']
+                            updated_order['otp_code']=otp
+                            kb=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{o["order_id"]}'))
+                            _otp_update_message(o['chat_id'],o['message_id'],_otp_received_update_text(updated_order),kb)
+                            # The waiting card is updated in place, then send a
+                            # separate, clear notification so the requester gets
+                            # an unmistakable OTP-arrived message as well.
+                            bot.send_message(
+                                o['chat_id'],
+                                f'📩 <b>OTP RECEIVED</b>\n\n'
+                                f'📞 Your request for <code>{html.escape(_otp_phone_parts(o["phone_number"], o.get("country_name"))[1])}</code> has been received.\n\n'
+                                f'🔐 <b>OTP: {html.escape(str(otp))}</b>',
+                                parse_mode='HTML'
+                            )
+                        except Exception as exc:
+                            logger.warning('OTP received UI update/notification failed: %s',exc)
+                    elif r.get('provider_status') in {'STATUS_CANCEL','STATUS_CANCELLED','NO_ACTIVATION','ACCESS_CANCEL','ACCESS_CANCEL_ALREADY'} or r.get('raw') in {'STATUS_CANCEL','NO_ACTIVATION','ACCESS_CANCEL','ACCESS_CANCEL_ALREADY'}:
                         with db_tx() as conn:
                             cur=conn.execute('SELECT * FROM otp_orders WHERE order_id=? AND status="waiting" AND refunded=0',(o['order_id'],)).fetchone()
                             if cur:
-                                adjust_balance(conn,cur['user_id'],'usdt',float(cur['selling_price']),'OTP_REFUND',reason=f'Quick OTP auto cancel {o["order_id"]}',related_txn=o['order_id'],processed_by=cur['user_id'])
-                                conn.execute('UPDATE otp_orders SET status="expired",refunded=1,updated_at=? WHERE order_id=?',(_otp_now(),o['order_id']))
+                                adjust_balance(conn,cur['user_id'],'usdt',float(cur['selling_price']),'OTP_REFUND',reason=f'Quick OTP provider cancel {o["order_id"]}',related_txn=o['order_id'],processed_by=cur['user_id'])
+                                conn.execute('UPDATE otp_orders SET status="cancelled",refunded=1,updated_at=? WHERE order_id=?',(_otp_now(),o['order_id']))
                         try:
-                            _otp_update_message(o['chat_id'],o['message_id'],f'⌛ <b>OTP REQUEST EXPIRED</b>\n\n🆔 Request ID: <code>{html.escape(str(o["order_id"]))}</code>\n\n💰 Your refund has been processed because no OTP was received within 20 minutes.',types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{o["order_id"]}')))
-                        except Exception: logger.exception('Could not update expired OTP message')
-                        continue
-                    if o['chat_id'] and o['message_id']:
-                        _otp_update_message(o['chat_id'],o['message_id'],_otp_waiting_text(o,auto,manual),_otp_kb(o['order_id'],o['service_code'],o['country_code'],manual,o.get('phone_number')))
-                    if elapsed-last_status.get(o['order_id'],-999)>=3:
-                        last_status[o['order_id']]=elapsed
-                        try: r=_otp_http('getStatusV2',id=o['activation_id'])
-                        except Exception: continue
-                        if not r.get('otp') and o['chat_id'] and o['message_id']:
-                            try:
-                                fresh_now=datetime.now(timezone.utc)
-                                fresh_elapsed=(fresh_now-datetime.fromisoformat(o['created_at'])).total_seconds()
-                                fresh_auto=max(0,1200-int(fresh_elapsed)); fresh_manual=max(0,300-int(fresh_elapsed))
-                                fresh=dict(o)
-                                _otp_update_message(o['chat_id'],o['message_id'],_otp_waiting_text(fresh,fresh_auto,fresh_manual),_otp_kb(o['order_id'],o['service_code'],o['country_code'],fresh_manual,o.get('phone_number')))
-                            except Exception:
-                                logger.warning('OTP waiting-clock sync after status check failed for order=%s',o['order_id'])
-                        if r.get('otp'):
-                            logger.info('Quick OTP code received order=%s activation_id=%s',o['order_id'],o['activation_id'])
-                            otp=r['otp']
-                            try: _otp_http('setStatus',id=o['activation_id'],status='6')
-                            except Exception: pass
-                            with db_tx() as conn:
-                                cur=conn.execute('SELECT * FROM otp_orders WHERE order_id=? AND status="waiting"',(o['order_id'],)).fetchone()
-                                if cur:
-                                    conn.execute('UPDATE otp_orders SET status="completed",otp_code=?,updated_at=?,worker_id=NULL,lease_until=NULL WHERE order_id=?',(otp,_otp_now(),o['order_id']))
-                                    conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",(str(cur['user_id']),"OTP_COMPLETED",str(cur['user_id']),cur['selling_price'],o['order_id'],f'service={cur["service_code"]}; country={cur["country_name"]}',_otp_now()))
-                            try:
-                                updated_order=dict(o)
-                                updated_order['phone_number']=cur['phone_number'] or o['phone_number']
-                                updated_order['otp_code']=otp
-                                kb=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{o["order_id"]}'))
-                                _otp_update_message(o['chat_id'],o['message_id'],_otp_received_update_text(updated_order),kb)
-                                bot.send_message(o['chat_id'],f'📩 <b>OTP RECEIVED</b>\n\n📞 Your request for <code>{html.escape(_otp_phone_parts(o["phone_number"], o.get("country_name"))[1])}</code> has been received.\n\n🔐 <b>OTP: {html.escape(str(otp))}</b>',parse_mode='HTML')
-                            except Exception as exc: logger.warning('OTP received UI update/notification failed: %s',exc)
-                        elif r.get('provider_status') in {'STATUS_CANCEL','STATUS_CANCELLED','NO_ACTIVATION','ACCESS_CANCEL','ACCESS_CANCEL_ALREADY'} or r.get('raw') in {'STATUS_CANCEL','NO_ACTIVATION','ACCESS_CANCEL','ACCESS_CANCEL_ALREADY'}:
-                            with db_tx() as conn:
-                                cur=conn.execute('SELECT * FROM otp_orders WHERE order_id=? AND status="waiting" AND refunded=0',(o['order_id'],)).fetchone()
-                                if cur:
-                                    adjust_balance(conn,cur['user_id'],'usdt',float(cur['selling_price']),'OTP_REFUND',reason=f'Quick OTP provider cancel {o["order_id"]}',related_txn=o['order_id'],processed_by=cur['user_id'])
-                                    conn.execute('UPDATE otp_orders SET status="cancelled",refunded=1,updated_at=?,worker_id=NULL,lease_until=NULL WHERE order_id=?',(_otp_now(),o['order_id']))
-                            try:
-                                _otp_update_message(o['chat_id'],o['message_id'],f'❌ <b>OTP REQUEST CANCELLED</b>\n\n🆔 Request ID: <code>{html.escape(str(o["order_id"]))}</code>\n\n💰 Your refund has been processed.',types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{o["order_id"]}')))
-                            except Exception: logger.exception('Could not update provider-cancelled OTP message')
-                finally:
-                    _otp_release_claim(o.get('order_id'))
+                            _otp_update_message(
+                                o['chat_id'], o['message_id'],
+                                f'❌ <b>OTP REQUEST CANCELLED</b>\n\n🆔 Request ID: <code>{html.escape(str(o["order_id"]))}</code>\n\n💰 Your refund has been processed.',
+                                types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{o["order_id"]}'))
+                            )
+                        except Exception: logger.exception('Could not update provider-cancelled OTP message')
             live={x['order_id'] for x in active}; last_status={k:v for k,v in last_status.items() if k in live}
         except Exception: logger.exception('Quick OTP worker error')
         time.sleep(1)
@@ -9740,46 +9566,6 @@ def generic_state_router(m):
 
 
 # ================================================================
-# PRODUCTION WEBHOOK SERVER
-# ================================================================
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip().rstrip("/")
-WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/telegram/webhook").strip() or "/telegram/webhook"
-WEBHOOK_PORT = int(os.environ.get("PORT", "8080") or 8080)
-web_app = None
-
-if WEBHOOK_URL:
-    try:
-        from flask import Flask, request
-        web_app = Flask(__name__)
-
-        @web_app.get("/health")
-        def health():
-            return {"ok": True, "service": BRAND, "db": DB_BACKEND}
-
-        @web_app.post(WEBHOOK_PATH)
-        def telegram_webhook():
-            try:
-                update = types.Update.de_json(request.get_data(as_text=True))
-                if update is not None:
-                    bot.process_new_updates([update])
-                return "OK", 200
-            except Exception:
-                logger.exception("Telegram webhook processing failed")
-                return "ERROR", 500
-    except Exception as exc:
-        logger.exception("Could not initialize webhook server: %s", exc)
-        web_app = None
-
-
-def _configure_webhook():
-    if not WEBHOOK_URL:
-        return
-    bot.remove_webhook()
-    time.sleep(0.5)
-    bot.set_webhook(url=WEBHOOK_URL + WEBHOOK_PATH)
-    logger.info("Telegram webhook enabled: %s", WEBHOOK_URL + WEBHOOK_PATH)
-
-# ================================================================
 # ENTRYPOINT
 # ================================================================
 
@@ -9792,29 +9578,8 @@ def main():
     print(f"🚀 {BRAND} is starting…")
     threading.Thread(target=auto_message_scheduler, daemon=True, name="auto-message-scheduler").start()
     threading.Thread(target=audit_channel_dispatcher, daemon=True, name="audit-channel-dispatcher").start()
-    if WEBHOOK_URL:
-        if web_app is None:
-            raise RuntimeError("WEBHOOK_URL is set but Flask webhook app could not be initialized")
-        _configure_webhook()
-        web_app.run(host="0.0.0.0", port=WEBHOOK_PORT, threaded=True)
-    else:
-        bot.infinity_polling(timeout=20, long_polling_timeout=10)
+    bot.infinity_polling(timeout=20, long_polling_timeout=10)
 
 
 if __name__ == "__main__":
     main()
-
-# Gunicorn imports this module instead of calling main(). Start durable background
-# workers once per replica; Telegram webhook delivery is load-balanced across replicas.
-if os.environ.get("WEBHOOK_AUTOSTART") == "1" and os.environ.get("WEBHOOK_URL"):
-    try:
-        init_db()
-        otp_db_init()
-        threading.Thread(target=_otp_worker, daemon=True, name="quick-otp-worker").start()
-        threading.Thread(target=_otp_price_watcher, daemon=True, name="quick-otp-price-watcher").start()
-        threading.Thread(target=auto_message_scheduler, daemon=True, name="auto-message-scheduler").start()
-        threading.Thread(target=audit_channel_dispatcher, daemon=True, name="audit-channel-dispatcher").start()
-        _configure_webhook()
-    except Exception:
-        logger.exception("Gunicorn startup initialization failed")
-        raise
