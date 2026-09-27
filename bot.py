@@ -8988,19 +8988,26 @@ def otp_new_cb(c):
     bot.answer_callback_query(c.id,'Getting a new number…')
     try:
         result,msg=_otp_create_activation(c.from_user.id,service,code,c.message.chat.id)
+        if not result:
+            return bot.answer_callback_query(c.id, str(msg)[:180], show_alert=True)
+        # Give the new activation its own permanent tracking message. The worker
+        # polls by activation_id, so old and new numbers can receive OTPs independently.
+        result=dict(result)
+        text=_otp_waiting_text(result,1200,300)
+        sent=bot.send_message(
+            c.message.chat.id,
+            text,
+            parse_mode='HTML',
+            reply_markup=_otp_kb(result['order_id'],service,code,300,result.get('phone_number'))
+        )
+        with db_tx() as conn:
+            conn.execute(
+                'UPDATE otp_orders SET chat_id=?,message_id=?,updated_at=? WHERE order_id=?',
+                (str(sent.chat.id),sent.message_id,_otp_now(),result['order_id'])
+            )
     except Exception as exc:
         logger.exception('Quick OTP new-number creation failed: %s',exc)
-        return bot.send_message(c.message.chat.id,'⚠️ We could not request the new number right now. Please try again.',parse_mode='HTML')
-    if not result:
-        return bot.send_message(c.message.chat.id,str(msg),parse_mode='HTML')
-
-    # Give the new activation its own permanent tracking message. The worker
-    # polls by activation_id, so old and new numbers can receive OTPs independently.
-    text=_otp_waiting_text(dict(result),1200,300)
-    sent=bot.send_message(c.message.chat.id,text,parse_mode='HTML',reply_markup=_otp_kb(result['order_id'],service,code,300))
-    with db_tx() as conn:
-        conn.execute('UPDATE otp_orders SET chat_id=?,message_id=?,updated_at=? WHERE order_id=?',
-                     (str(sent.chat.id),sent.message_id,_otp_now(),result['order_id']))
+        return bot.answer_callback_query(c.id,'Unable to get a new number right now. Please try again.',show_alert=True)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_cancel:'))
 @safe_handler
@@ -9415,7 +9422,10 @@ def _otp_worker():
         try:
             active=fetchall('SELECT o.*,s.service_name FROM otp_orders o LEFT JOIN otp_services s ON s.service_code=o.service_code WHERE o.status="waiting" ORDER BY o.created_at LIMIT 300')
             now=datetime.now(timezone.utc)
-            for o in active:
+            for o_row in active:
+                # sqlite3.Row does not implement .get(). Convert once so the
+                # waiting UI/clock code can safely use dictionary access.
+                o=dict(o_row)
                 try: elapsed=(now-datetime.fromisoformat(o['created_at'])).total_seconds()
                 except Exception: continue
                 auto=max(0,1200-int(elapsed)); manual=max(0,300-int(elapsed))
