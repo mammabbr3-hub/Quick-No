@@ -131,3 +131,10 @@ SECURITY / CONTROL AUDIT UPDATE
 
 AUTO DELETE / CHAT CLEANUP
 Navigation messages that use Reply Keyboards are automatically deleted when the user starts the next action. Useful result/record messages remain visible. Inline callback messages are preserved when handlers edit them in place.
+
+CALLING CODE FIX (2026-09-27)
+- Grizzly country codes are treated strictly as Grizzly internal catalogue IDs.
+- Real telephone country calling codes are resolved from countryinfo metadata using the country name and returned phone number.
+- Example: Grizzly Colombia ID 33 -> Colombia telephone code +57; the returned E.164 number is split as +57 + local number.
+- The same logic applies to countries added later, without adding a new Grizzly-ID-to-calling-code mapping.
+- Copy Number copies only the local/subscriber number.

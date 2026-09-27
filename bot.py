@@ -36,6 +36,10 @@ try:
     import pycountry
 except Exception:
     pycountry = None
+try:
+    from countryinfo import CountryInfo
+except Exception:
+    CountryInfo = None
 
 from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
@@ -8502,53 +8506,161 @@ def _otp_update_message(chat_id,message_id,text,kb):
     except Exception as exc:
         if 'message is not modified' not in str(exc).lower(): logger.warning('OTP UI update failed: %s',exc)
 
+_OTP_CALLING_CACHE = {}
+_OTP_CALLING_DATA_READY = False
+_OTP_CALLING_BY_NAME = {}
+
+def _otp_norm_country_name(value):
+    value = str(value or "").strip().lower()
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+def _otp_load_calling_codes():
+    """Build a country-name -> E.164 calling-code index from countryinfo.
+
+    IMPORTANT: Grizzly's country `code` is an internal API/catalogue ID and is
+    deliberately NOT used as a telephone calling code. This index is based on
+    the real country's callingCodes metadata, so newly-added Grizzly countries
+    follow the same rule without adding another Grizzly-ID mapping.
+    """
+    global _OTP_CALLING_DATA_READY, _OTP_CALLING_BY_NAME
+    if _OTP_CALLING_DATA_READY:
+        return
+    _OTP_CALLING_DATA_READY = True
+    if CountryInfo is None:
+        return
+    try:
+        import glob
+        data_dir = os.path.join(os.path.dirname(__import__('countryinfo').__file__), 'data')
+        for path in glob.glob(os.path.join(data_dir, '*.json')):
+            try:
+                with open(path, encoding='utf-8') as fh:
+                    data = json.load(fh)
+                codes = [str(x).strip().lstrip('+') for x in (data.get('callingCodes') or []) if str(x).strip()]
+                if not codes:
+                    continue
+                names = set()
+                for key in ('name','nativeName'):
+                    if data.get(key): names.add(str(data[key]))
+                names.update(str(x) for x in (data.get('altSpellings') or []) if x)
+                translations = data.get('translations') or {}
+                if isinstance(translations, dict):
+                    names.update(str(x) for x in translations.values() if x)
+                for name in names:
+                    _OTP_CALLING_BY_NAME[_otp_norm_country_name(name)] = codes
+            except Exception:
+                continue
+    except Exception as exc:
+        logger.warning('Could not load country calling-code metadata: %s', exc)
+
+def _otp_country_calling_code(country_name, phone=None):
+    """Return the REAL telephone calling code, never Grizzly's country ID."""
+    _otp_load_calling_codes()
+    name = _otp_norm_country_name(country_name)
+    codes = _OTP_CALLING_BY_NAME.get(name, [])
+    p = re.sub(r"[^0-9]", "", str(phone or ""))
+    if codes:
+        # Some territories share a calling code; choose the one that actually
+        # prefixes the returned E.164 number. Otherwise use the country's
+        # primary assigned calling code.
+        for code in sorted(codes, key=len, reverse=True):
+            if p.startswith(code):
+                return code
+        return sorted(codes, key=len, reverse=True)[0]
+
+    # Secondary lookup through pycountry when Grizzly's display name differs
+    # slightly from the countryinfo spelling. Still no Grizzly-ID assumption.
+    if pycountry is not None and name:
+        try:
+            c = pycountry.countries.lookup(str(country_name))
+            for key in (c.alpha_2, c.alpha_3):
+                alt = _OTP_CALLING_BY_NAME.get(_otp_norm_country_name(key), [])
+                if alt:
+                    return alt[0]
+        except Exception:
+            pass
+    return ''
+
+def _otp_phone_parts(phone, country_name):
+    """Return (real calling code, local/subscriber number)."""
+    p = re.sub(r"[^0-9]", "", str(phone or ""))
+    cc = _otp_country_calling_code(country_name, p)
+    if cc and p.startswith(cc) and len(p) > len(cc):
+        return cc, p[len(cc):]
+    return cc, p
+
+def _otp_local_phone(phone, country_name=None, country_code=None):
+    """Return local number using the country's REAL E.164 calling code.
+
+    `country_code` is retained only for backward-compatible callers. It is
+    NEVER interpreted as a telephone calling code because Grizzly uses its own
+    internal country IDs (for example Colombia=33 while +57 is Colombia's
+    actual calling code).
+    """
+    return _otp_phone_parts(phone, country_name)[1]
+
 def _otp_waiting_text(o,remaining,manual_remaining):
-    # Permanent tracking card: never expose the upstream provider and never
-    # rely on deleting this message. The request ID is intentionally visible
-    # so support/admin can trace the exact activation.
     a=max(0,int(remaining)); m=max(0,int(manual_remaining))
     cancel_line = (f'⏱ Cancel available in <b>{m//60:02d}:{m%60:02d}</b>' if m>0
                    else '🟢 <b>Cancel is now available</b>')
     service_name=html.escape(str(o.get("service_name") or o.get("service_code") or "Service"))
     country_name=html.escape(str(o.get("country_name") or "Country"))
-    country_code=html.escape(str(o.get("country_code") or ""))
-    phone=html.escape(str(o.get("phone_number") or ""))
+    calling_code, local_phone = _otp_phone_parts(o.get("phone_number"), o.get("country_name"))
+    phone=html.escape(local_phone)
+    country_code=html.escape(calling_code)
     order_id=html.escape(str(o.get("order_id") or ""))
-    return (f'╭━━━━━━━━━━━━━━━━━━╮\n'
+    return (f'╭━━━━━━━━━━━━━━━━━━━━╮\n'
             f'   📱 <b>QUICK OTP</b>\n'
-            f'╰━━━━━━━━━━━━━━━━━━╯\n\n'
-            f'🔹 <b>{service_name}</b>  •  {country_name} {o.get("country_flag") or "🌍"}\n'
-            f'🌎 Country Code: <b>+{country_code.lstrip("+")}</b>\n'
-            f'💳 Price: <b>${float(o.get("selling_price") or 0):.2f}</b>\n\n'
+            f'╰━━━━━━━━━━━━━━━━━━━━╯\n\n'
+            f'{_otp_service_emoji(o.get("service_name") or o.get("service_code"))} <b>{service_name}</b>  •  {country_name} {o.get("country_flag") or "🌍"}\n'
+            f'🌍 <b>Country Code:</b> +{country_code.lstrip("+")}\n'
+            f'💰 <b>Price:</b> ${float(o.get("selling_price") or 0):.2f}\n\n'
             f'📞 <b>Your Number</b>\n'
             f'<code>{phone}</code>\n\n'
-            f'⏳ <b>Waiting for your OTP...</b>\n'
-            f'📨 We are checking for your code automatically.\n\n'
-            f'⌛ Auto cancel in <b>{a//60:02d}:{a%60:02d}</b>\n'
+            f'⏳ <b>Waiting for OTP</b>\n'
+            f'<i>Your verification code will appear here automatically.</i>\n\n'
+            f'⌛ <b>Auto Cancel:</b> {a//60:02d}:{a%60:02d}\n'
             f'{cancel_line}\n\n'
-            f'🆔 Request ID: <code>{order_id}</code>')
+            f'🆔 <b>Request ID:</b> <code>{order_id}</code>')
 
 def _otp_received_update_text(o):
-    # Edit the existing waiting message in place. The OTP and phone number
-    # remain together in this single message; no second OTP message is sent.
-    return (f'╭───────────────╮\n'
+    calling_code, local_phone = _otp_phone_parts(o.get("phone_number"), o.get("country_name"))
+    phone=html.escape(local_phone)
+    country_code=html.escape(calling_code)
+    code=html.escape(str(o.get("otp_code") or o.get("otp") or ""))
+    return (f'╭━━━━━━━━━━━━━━━━━━━━╮\n'
             f'   📱 <b>QUICK OTP</b>\n'
-            f'╰───────────────╯\n\n'
-            f'🌎 Country Code: {html.escape(str(o.get("country_code") or ""))}\n'
-            f'🪙 Price: ${float(o.get("selling_price") or 0):.2f}\n\n'
-            f'{_otp_service_emoji(o.get("service_name") or o.get("service_code"))} <b>{html.escape(str(o.get("service_name") or o.get("service_code")))}</b> • {html.escape(str(o.get("country_name")))}\n\n'
-            f'📞 Phone Number\n'
-            f'<code>{html.escape(str(o["phone_number"]))}</code>\n\n'
+            f'╰━━━━━━━━━━━━━━━━━━━━╯\n\n'
+            f'{_otp_service_emoji(o.get("service_name") or o.get("service_code"))} <b>{html.escape(str(o.get("service_name") or o.get("service_code")))}</b> • {html.escape(str(o.get("country_name")))}\n'
+            f'🌍 <b>Country Code:</b> +{country_code.lstrip("+")}\n\n'
+            f'📞 <b>Phone Number</b>\n'
+            f'<code>{phone}</code>\n\n'
             f'✅ <b>OTP RECEIVED</b>\n\n'
-            f'🔐 <b>OTP: {html.escape(str(o.get("otp_code") or o.get("otp") or ""))}</b>\n'
-            f'📱 The OTP for {html.escape(str(o["phone_number"]))} is {html.escape(str(o.get("otp_code") or o.get("otp") or ""))}')
+            f'🔐 <b>OTP: {code}</b>\n'
+            f'📩 Your request for <code>{phone}</code> has been received.\n'
+            f'🔑 <b>Verification code: {code}</b>')
 
-def _otp_kb(order_id,service_code,country_code,manual_remaining):
-    # Get New Number creates a completely independent activation. The current
-    # activation is never released/cancelled by this button. Cancel remains
-    # subject to the 5-minute manual window.
+def _otp_kb(order_id,service_code,country_code,manual_remaining, phone_number=None):
     label=f'✋ Cancel available {manual_remaining//60:02d}:{manual_remaining%60:02d}' if manual_remaining>0 else '❌ Cancel'
-    return types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{order_id}')).add(types.InlineKeyboardButton(label,callback_data=f'otp_cancel:{order_id}'))
+    kb=types.InlineKeyboardMarkup()
+    # Telegram's official copy_text button copies ONLY the local/subscriber number.
+    # Never treat Grizzly's internal country ID as a telephone calling code.
+    row = fetchone('SELECT name FROM otp_service_countries WHERE service_code=? AND country_code=?',(service_code,str(country_code)))
+    local = _otp_phone_parts(phone_number, row['name'] if row else None)[1]
+    try:
+        kb.row(types.InlineKeyboardButton('📋 Copy Number', copy_text=types.CopyTextButton(text=local)))
+    except Exception:
+        # Compatibility fallback for older pyTelegramBotAPI versions.
+        try:
+            btn=types.InlineKeyboardButton('📋 Copy Number', callback_data=f'otp_copy:{order_id}')
+            setattr(btn,'copy_text', {'text': local})
+            btn.callback_data=None
+            kb.row(btn)
+        except Exception:
+            pass
+    kb.row(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{order_id}'))
+    kb.row(types.InlineKeyboardButton(label,callback_data=f'otp_cancel:{order_id}'))
+    return kb
 
 def _otp_create_activation(user_id,service_code,country_code,source_chat_id):
     # Refresh ONLY the selected country before purchase. The previous code
@@ -8619,11 +8731,7 @@ def _otp_show_services(chat_id, page=0, edit=None):
 def otp_services_page_cb(c):
     if not is_feature_enabled("quick_otp", c.from_user.id):
         return bot.answer_callback_query(c.id, "Quick OTP is currently unavailable.", show_alert=True)
-    # Pagination must update the existing service-list message, never create a
-    # second page underneath it.
-    page=int(c.data.split(':',1)[1] or 0)
-    bot.answer_callback_query(c.id)
-    _otp_show_services(c.message.chat.id,page,edit=c.message.message_id)
+    bot.answer_callback_query(c.id); _otp_show_services(c.message.chat.id,int(c.data.split(':',1)[1]),edit=c.message.message_id)
 
 _OTP_CATALOG_REFRESH_LOCK = threading.Lock()
 _OTP_CATALOG_REFRESH_AT = 0.0
@@ -8729,7 +8837,7 @@ def otp_user_country_search_cb(c):
     svc=fetchone('SELECT service_name,emoji FROM otp_services WHERE service_code=? AND enabled=1',(service,))
     if not svc: return bot.answer_callback_query(c.id,'Service unavailable.',show_alert=True)
     clear_state(c.from_user.id)
-    update_state(c.from_user.id,flow='otp_user_find_country',step=None,otp_service=service,otp_ui_message_id=c.message.message_id)
+    update_state(c.from_user.id,flow='otp_user_find_country',step=None,otp_service=service)
     bot.answer_callback_query(c.id)
     bot.edit_message_text(
         f'{svc["emoji"]} <b>SEARCH COUNTRY</b>\n\n'
@@ -8750,28 +8858,20 @@ def _handle_otp_user_find_country(m,state):
     except Exception as exc: logger.warning('User country search sync failed for %s: %s',service,exc)
     rows=fetchall("SELECT * FROM otp_service_countries WHERE service_code=? AND enabled=1 AND profit_active=1 AND available_count>0 AND (lower(name) LIKE ? OR lower(country_code) LIKE ?) ORDER BY name LIMIT 30",(service,f'%{q}%',f'%{q}%'))
     rows=[r for r in rows if _otp_profit_active(r,svc)]
-    ui_message_id=state.get('otp_ui_message_id')
     clear_state(m.chat.id)
     if not rows:
-        text=(f'❌ <b>No country found</b>\n\n'
-              f'Nothing available for <code>{html.escape(m.text.strip())}</code>.\n\n'
-              'Try another country name or code.')
-        kb=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🔎 Search Again',callback_data=f'otp_user_country_search:{service}')).add(types.InlineKeyboardButton('⬅️ Countries',callback_data=f'otp_service:{service}'))
-        if ui_message_id:
-            try: return bot.edit_message_text(text,m.chat.id,ui_message_id,parse_mode='HTML',reply_markup=kb)
-            except Exception: pass
-        return bot.send_message(m.chat.id,text,parse_mode='HTML',reply_markup=kb)
+        return bot.send_message(m.chat.id,
+            f'❌ No available country found for <b>{html.escape(m.text.strip())}</b>.\n\nTry another country name or code.',
+            parse_mode='HTML',reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🔎 Search Again',callback_data=f'otp_user_country_search:{service}')).add(types.InlineKeyboardButton('⬅️ Countries',callback_data=f'otp_service:{service}')))
     kb=types.InlineKeyboardMarkup()
     for r in rows:
         kb.add(types.InlineKeyboardButton(f'{r["flag"]} {r["name"]} • {_otp_price(r,svc):.2f} USDT',callback_data=f'otp_country:{service}:{r["country_code"]}'))
     kb.add(types.InlineKeyboardButton('🔎 Search Another Country',callback_data=f'otp_user_country_search:{service}'))
     kb.add(types.InlineKeyboardButton('⬅️ Countries',callback_data=f'otp_service:{service}'))
-    text=(f'{svc["emoji"]} <b>{html.escape(str(svc["service_name"]))}</b>\n\n'
-          f'🔎 Results for: <code>{html.escape(m.text.strip())}</code>\n\nSelect a country:')
-    if ui_message_id:
-        try: return bot.edit_message_text(text,m.chat.id,ui_message_id,parse_mode='HTML',reply_markup=kb)
-        except Exception: pass
-    bot.send_message(m.chat.id,text,parse_mode='HTML',reply_markup=kb)
+    bot.send_message(m.chat.id,
+        f'{svc["emoji"]} <b>{html.escape(str(svc["service_name"]))}</b>\n\n'
+        f'🔎 Results for: <code>{html.escape(m.text.strip())}</code>\n\nSelect a country:',
+        parse_mode='HTML',reply_markup=kb)
 
 _FLOW_ROUTES[('otp_user_find_country',None)] = _handle_otp_user_find_country
 
@@ -8798,38 +8898,13 @@ def otp_country_cb(c):
 def otp_buy_cb(c):
     if not is_feature_enabled("quick_otp", c.from_user.id):
         return bot.answer_callback_query(c.id, "Quick OTP is currently unavailable.", show_alert=True)
-    _,service,code=c.data.split(':',2)
-    # The visible processing state lives in the same message. This prevents
-    # the chat from filling with duplicate error/processing messages.
-    svc=fetchone('SELECT * FROM otp_services WHERE service_code=?',(service,))
-    country=fetchone('SELECT * FROM otp_service_countries WHERE service_code=? AND country_code=?',(service,code))
-    if not svc or not country:
-        return bot.answer_callback_query(c.id,'This selection is no longer available.',show_alert=True)
-    processing_kb=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('↩️ Back to Countries',callback_data=f'otp_service:{service}'))
-    bot.answer_callback_query(c.id)
-    try:
-        bot.edit_message_text('⏳ <b>Please wait...</b>\n\nYour request is being processed.',c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=processing_kb)
-    except Exception as exc:
-        logger.warning('Could not show OTP processing state: %s',exc)
+    _,service,code=c.data.split(':',2); bot.answer_callback_query(c.id,'Processing…')
     result,msg=_otp_create_activation(c.from_user.id,service,code,c.message.chat.id)
-    if not result:
-        error_kb=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🔄 Try Again',callback_data=f'otp_buy:{service}:{code}')).add(types.InlineKeyboardButton('⬅️ Countries',callback_data=f'otp_service:{service}'))
-        text=f'⚠️ <b>Request could not be completed</b>\n\n{msg or "Please try again."}'
-        try: bot.edit_message_text(text,c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=error_kb)
-        except Exception: bot.send_message(c.message.chat.id,text,parse_mode='HTML',reply_markup=error_kb)
-        return
-    # Keep the same Telegram message as the permanent tracking card.
-    result=dict(result)
-    result['country_flag']=country['flag']
-    text=_otp_waiting_text(result,1200,300)
-    kb=_otp_kb(result['order_id'],service,code,300)
-    try:
-        bot.edit_message_text(text,c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=kb)
-        with db_tx() as conn: conn.execute('UPDATE otp_orders SET chat_id=?,message_id=?,updated_at=? WHERE order_id=?',(str(c.message.chat.id),c.message.message_id,_otp_now(),result['order_id']))
-    except Exception as exc:
-        logger.warning('Could not update OTP tracking message in place: %s',exc)
-        sent=bot.send_message(c.message.chat.id,text,parse_mode='HTML',reply_markup=kb)
-        with db_tx() as conn: conn.execute('UPDATE otp_orders SET chat_id=?,message_id=?,updated_at=? WHERE order_id=?',(str(sent.chat.id),sent.message_id,_otp_now(),result['order_id']))
+    if not result: return bot.send_message(c.message.chat.id,msg,parse_mode='HTML')
+    r=fetchone('SELECT * FROM otp_service_countries WHERE service_code=? AND country_code=?',(service,code))
+    text=_otp_waiting_text(dict(result),1200,300)
+    sent=bot.send_message(c.message.chat.id,text,parse_mode='HTML',reply_markup=_otp_kb(result['order_id'],service,code,300))
+    with db_tx() as conn: conn.execute('UPDATE otp_orders SET chat_id=?,message_id=?,updated_at=? WHERE order_id=?',(str(sent.chat.id),sent.message_id,_otp_now(),result['order_id']))
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_new:'))
 @safe_handler
@@ -8957,13 +9032,7 @@ def otp_admin_services(c):
     if (page+1)*per<total: nav.append(types.InlineKeyboardButton('Next ➡️',callback_data=f'otp_admin_services:{page+1}'))
     if nav: kb.row(*nav)
     kb.row(types.InlineKeyboardButton('🔄 Sync',callback_data='otp_admin_sync_services'))
-    text=f'🧩 <b>GRIZZLY SERVICES</b>\n\nShowing {page*per+1 if total else 0}-{min((page+1)*per,total)} of {total:,}.\n\nSelect a service to configure its countries and profit.'
-    bot.answer_callback_query(c.id)
-    # Always paginate by editing the current list message.
-    try:
-        bot.edit_message_text(text,c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=kb)
-    except Exception as exc:
-        if 'message is not modified' not in str(exc).lower(): logger.warning('Admin service pagination edit failed: %s',exc)
+    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,f'🧩 <b>GRIZZLY SERVICES</b>\n\nShowing {page*per+1 if total else 0}-{min((page+1)*per,total)} of {total:,}.\n\nSelect a service to configure its countries and profit.',parse_mode='HTML',reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_admin_svc:'))
 @safe_handler
@@ -9302,7 +9371,7 @@ def _otp_worker():
                     except Exception: logger.exception('Could not update expired OTP message')
                     continue
                 if o['chat_id'] and o['message_id']:
-                    _otp_update_message(o['chat_id'],o['message_id'],_otp_waiting_text(o,auto,manual),_otp_kb(o['order_id'],o['service_code'],o['country_code'],manual))
+                    _otp_update_message(o['chat_id'],o['message_id'],_otp_waiting_text(o,auto,manual),_otp_kb(o['order_id'],o['service_code'],o['country_code'],manual,o.get('phone_number')))
                 if elapsed-last_status.get(o['order_id'],-999)>=5:
                     last_status[o['order_id']]=elapsed
                     try: r=_otp_http('getStatusV2',id=o['activation_id'])
@@ -9331,7 +9400,7 @@ def _otp_worker():
                             bot.send_message(
                                 o['chat_id'],
                                 f'📩 <b>OTP RECEIVED</b>\n\n'
-                                f'📞 Your request for <code>{html.escape(str(o["phone_number"]))}</code> has been received.\n\n'
+                                f'📞 Your request for <code>{html.escape(_otp_phone_parts(o["phone_number"], o.get("country_name"))[1])}</code> has been received.\n\n'
                                 f'🔐 <b>OTP: {html.escape(str(otp))}</b>',
                                 parse_mode='HTML'
                             )
