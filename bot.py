@@ -8609,6 +8609,19 @@ def _otp_country_calling_code(country_name, phone=None):
             pass
     return ''
 
+def _otp_country_flag(country_name, existing_flag=None):
+    """Return a real country flag, deriving it from the country name when stored flag is missing/placeholder."""
+    f = str(existing_flag or '').strip()
+    if f and f != '🌍':
+        return f
+    try:
+        iso = _otp_iso_from_country_name(country_name)
+        if iso:
+            return _otp_flag_from_iso(iso)
+    except Exception:
+        pass
+    return f or '🌍'
+
 def _otp_phone_parts(phone, country_name):
     """Return (real calling code, local/subscriber number)."""
     p = re.sub(r"[^0-9]", "", str(phone or ""))
@@ -8640,7 +8653,7 @@ def _otp_waiting_text(o,remaining,manual_remaining):
     return (f'╭━━━━━━━━━━━━━━━━━━━━╮\n'
             f'   📱 <b>QUICK OTP</b>\n'
             f'╰━━━━━━━━━━━━━━━━━━━━╯\n\n'
-            f'{_otp_service_emoji(o.get("service_name") or o.get("service_code"))} <b>{service_name}</b>  •  {country_name} {o.get("country_flag") or "🌍"}\n'
+            f'{_otp_service_emoji(o.get("service_name") or o.get("service_code"))} <b>{service_name}</b>  •  {country_name} {_otp_country_flag(country_name, o.get("country_flag"))}\n'
             f'🌍 <b>Country Code:</b> +{country_code.lstrip("+")}\n'
             f'💰 <b>Price:</b> ${float(o.get("selling_price") or 0):.2f}\n\n'
             f'📞 <b>Your Number</b>\n'
@@ -8659,7 +8672,7 @@ def _otp_received_update_text(o):
     return (f'╭━━━━━━━━━━━━━━━━━━━━╮\n'
             f'   📱 <b>QUICK OTP</b>\n'
             f'╰━━━━━━━━━━━━━━━━━━━━╯\n\n'
-            f'{_otp_service_emoji(o.get("service_name") or o.get("service_code"))} <b>{html.escape(str(o.get("service_name") or o.get("service_code")))}</b> • {html.escape(str(o.get("country_name")))}\n'
+            f'{_otp_service_emoji(o.get("service_name") or o.get("service_code"))} <b>{html.escape(str(o.get("service_name") or o.get("service_code")))}</b> • {_otp_country_flag(o.get("country_name"), o.get("country_flag"))} {html.escape(str(o.get("country_name")))}\n'
             f'🌍 <b>Country Code:</b> +{country_code.lstrip("+")}\n\n'
             f'📞 <b>Phone Number</b>\n'
             f'<code>{phone}</code>\n\n'
@@ -8836,7 +8849,7 @@ def _otp_show_countries(chat_id, service, page, svc, edit=None):
         if page>0: page=max(0,page-1); rows=rows[page*per:(page+1)*per]
         if not rows: return
     kb=types.InlineKeyboardMarkup()
-    for r in rows: kb.add(types.InlineKeyboardButton(f'{r["flag"]} {r["name"]} • {_otp_price(r,service_cfg):.2f} USDT',callback_data=f'otp_country:{service}:{r["country_code"]}'))
+    for r in rows: kb.add(types.InlineKeyboardButton(f'{_otp_country_flag(r["name"], r["flag"])} {r["name"]} • {_otp_price(r,service_cfg):.2f} USDT',callback_data=f'otp_country:{service}:{r["country_code"]}'))
     nav=[]
     if page>0: nav.append(types.InlineKeyboardButton('⬅️ Previous',callback_data=f'otp_countries_page:{service}:{page-1}'))
     if (page+1)*per<total: nav.append(types.InlineKeyboardButton('Next ➡️',callback_data=f'otp_countries_page:{service}:{page+1}'))
@@ -9192,7 +9205,7 @@ def _handle_otp_find_country(m,state):
     for r in rows:
         status='🟢' if _otp_profit_active(r,svc_cfg) else '⚪'
         price='N/A' if r['grizzly_cost'] is None else f'{_otp_price(r,svc_cfg):.2f} USDT'
-        kb.add(types.InlineKeyboardButton(f'{status} {r["flag"]} {r["name"]} • {price}',callback_data=f'otp_admin_sc:{service}:{r["country_code"]}'))
+        kb.add(types.InlineKeyboardButton(f'{status} {_otp_country_flag(r["name"], r["flag"])} {r["name"]} • {price}',callback_data=f'otp_admin_sc:{service}:{r["country_code"]}'))
     kb.add(types.InlineKeyboardButton('🔎 Search Another Country',callback_data=f'otp_admin_country_search:{service}'))
     kb.add(types.InlineKeyboardButton(f'⬅️ Back to {svc["service_name"]}',callback_data=f'otp_admin_svc:{service}'))
     clear_state(m.chat.id)
@@ -9239,7 +9252,7 @@ def otp_admin_sc(c):
     global_profit='OFF' if not svc or svc['global_profit_percent'] is None else f"{float(svc['global_profit_percent']):g}%"
     manual_price='OFF' if r['explicit_price'] is None else f"{float(r['explicit_price']):.2f} USDT"
     cost_text='N/A' if r['grizzly_cost'] is None else f"{float(r['grizzly_cost']):.4f}"
-    bot.answer_callback_query(c.id); bot.edit_message_text(f'{service_emoji} <b>{html.escape(str(service_label))}</b>\n🌍 {r["flag"]} <b>{html.escape(r["name"])}</b>\n\n🏷 Grizzly cost: {cost_text}\n💰 User price: <b>{_otp_price(r,svc):.2f} USDT</b>\n📈 Global profit: <b>{global_profit}</b>\n✍️ Manual country price: <b>{manual_price}</b>\n📦 Available: <b>{int(r["available_count"]):,}</b>\n🔘 Status: {status}',c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=kb)
+    bot.answer_callback_query(c.id); bot.edit_message_text(f'{service_emoji} <b>{html.escape(str(service_label))}</b>\n🌍 {_otp_country_flag(r["name"], r["flag"])} <b>{html.escape(r["name"])}</b>\n\n🏷 Grizzly cost: {cost_text}\n💰 User price: <b>{_otp_price(r,svc):.2f} USDT</b>\n📈 Global profit: <b>{global_profit}</b>\n✍️ Manual country price: <b>{manual_price}</b>\n📦 Available: <b>{int(r["available_count"]):,}</b>\n🔘 Status: {status}',c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_service_toggle:'))
 @safe_handler
