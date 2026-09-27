@@ -12,3 +12,14 @@ WORK_CHANNEL_ID=
 BANK_GROUP_ID=
 SUPPORT_GROUP_LINK=
 WORK_CHANNEL_LINK=
+
+# --- Production scale (1M+ registered users) ---
+# Set DATABASE_URL to Railway PostgreSQL. Leave mobile_DB_PATH only for legacy SQLite fallback.
+DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DBNAME
+DB_POOL_MIN_SIZE=5
+DB_POOL_MAX_SIZE=30
+OTP_WORKER_BATCH=100
+OTP_WORKER_LEASE_SECONDS=30
+# Set WEBHOOK_URL to the public Railway service URL, e.g. https://your-service.up.railway.app
+WEBHOOK_URL=
+WEBHOOK_PATH=/telegram/webhook

@@ -1,0 +1,69 @@
+MOBILE BUSINESS HUB — 1M+ SCALE DEPLOYMENT
+
+Goal
+----
+This build keeps the existing Telegram UI/flows and adds a production-scale path:
+- PostgreSQL via DATABASE_URL (SQLite remains the fallback).
+- PostgreSQL connection pooling.
+- Telegram webhook mode (required for horizontal bot replicas).
+- Distributed OTP worker leases using PostgreSQL row locking.
+- Existing SQLite behavior remains available when DATABASE_URL is not set.
+
+Railway setup
+-------------
+1) Create a Railway PostgreSQL service in the same project.
+2) Set DATABASE_URL to the PostgreSQL connection string supplied by Railway.
+3) Set WEBHOOK_URL to the public URL of the bot service, for example:
+   https://your-bot-service.up.railway.app
+4) Keep BOT_TOKEN, ADMIN_IDS, GRIZZLY_API_KEY and the existing channel settings.
+5) Set DB_POOL_MIN_SIZE=5 and DB_POOL_MAX_SIZE=30 as a starting point. Tune after load testing.
+6) Deploy with the supplied Procfile.
+7) Before switching a live SQLite database, run:
+   SQLITE_PATH=/app/data/mobile.db DATABASE_URL='...' python migrate_sqlite_to_postgres.py
+   The migration script never deletes or modifies the SQLite source.
+8) After confirming the migrated balances/users/settings, deploy with DATABASE_URL enabled.
+
+Horizontal scaling
+------------------
+- Keep one Gunicorn worker per replica (the supplied Procfile does this).
+- Increase Railway replicas/instances as traffic grows.
+- Telegram webhook delivery is shared through the same public URL.
+- PostgreSQL is shared by all replicas.
+- OTP orders are leased with FOR UPDATE SKIP LOCKED so multiple replicas do not
+  intentionally poll the same activation at the same time.
+
+Important capacity note
+-----------------------
+"1M+ users" means the database/application architecture is prepared for a very
+large registered/active-user population. It is NOT a claim that one Railway
+instance or the upstream OTP provider can handle 1M concurrent OTP activations.
+Concurrent OTP polling and Telegram message-edit limits must be load-tested and
+scaled independently.
+
+Hardening included in the verified build
+-----------------------------------------
+- PostgreSQL Work approval/rejection uses GREATEST() instead of SQLite-only MAX(a,b).
+- User creation is atomic/idempotent across concurrent replicas.
+- Scheduled auto messages use distributed leases so replicas do not intentionally run the same job together.
+- Audit-channel delivery uses per-row leases across replicas.
+- OTP price/stock refresh is single-leader across replicas.
+- Large user broadcasts stream IDs with keyset pagination instead of loading the full user table into RAM.
+- Long broadcasts run in a background thread and renew their distributed lease.
+- PostgreSQL migration resets BIGSERIAL sequences after copying explicit SQLite IDs.
+- Withdrawal payment-method handlers return to the existing main admin menu; no missing admin_menu() dependency remains.
+
+These changes improve horizontal scaling without changing the user-facing Quick OTP flow.
+
+Hardening included in the verified build
+-----------------------------------------
+- PostgreSQL Work approval/rejection uses GREATEST() instead of SQLite-only MAX(a,b).
+- User creation is atomic/idempotent across concurrent replicas.
+- Scheduled auto messages use distributed leases so replicas do not intentionally run the same job together.
+- Audit-channel delivery uses per-row leases across replicas.
+- OTP price/stock refresh is single-leader across replicas.
+- Large user broadcasts stream IDs with keyset pagination instead of loading the full user table into RAM.
+- Long broadcasts run in a background thread and renew their distributed lease.
+- PostgreSQL migration resets BIGSERIAL sequences after copying explicit SQLite IDs.
+- Withdrawal payment-method handlers return to the existing main admin menu; no missing admin_menu() dependency remains.
+
+These changes improve horizontal scaling without changing the user-facing Quick OTP flow.

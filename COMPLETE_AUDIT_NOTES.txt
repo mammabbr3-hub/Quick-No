@@ -46,3 +46,9 @@ AUTO-CLEANUP UPDATE
 - Useful result/record messages are not tracked for deletion.
 - Inline callback messages are preserved when a handler needs to edit them in place.
 \n\nOTP FLOW FINAL RULES: Get New Number never cancels/release/refunds the previous waiting activation. Each activation has independent 5-minute manual cancel and 20-minute automatic expiry. OTP receipt marks the order completed with no cancel/refund and sends a separate OTP notification after updating the waiting message.\n
+FINAL HARDENING PASS — 2026-09-27
+- Funding approval was reworked to claim the request before wallet crediting and
+  uses cursor.rowcount, so concurrent admins cannot double-credit a request and
+  the PostgreSQL path does not depend on SQLite-only conn.total_changes.
+- Final local runtime smoke tests and a concurrent funding approval test passed.
+- Final package excludes generated logs/pycache artifacts.
