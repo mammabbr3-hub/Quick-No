@@ -8083,6 +8083,34 @@ def otp_db_init():
         # SQLite migrations for existing installations.
         try: conn.execute('ALTER TABLE otp_services ADD COLUMN global_profit_percent REAL')
         except Exception: pass
+        # Migrate older installations before Quick OTP starts using the newer
+        # activation lifecycle. CREATE TABLE IF NOT EXISTS does NOT alter an
+        # already-existing otp_orders table, so older databases could reach
+        # Buy Number successfully and then fail on `activation_id`, producing
+        # the generic Telegram "Something went wrong" message.
+        otp_order_columns = {r[1] for r in conn.execute("PRAGMA table_info(otp_orders)").fetchall()}
+        otp_order_migrations = [
+            ("service_code", "TEXT NOT NULL DEFAULT 'wa'"),
+            ("status", "TEXT NOT NULL DEFAULT 'processing'"),
+            ("phone_number", "TEXT"),
+            ("activation_id", "TEXT"),
+            ("raw_cost", "REAL"),
+            ("otp_code", "TEXT"),
+            ("refunded", "INTEGER NOT NULL DEFAULT 0"),
+            ("chat_id", "TEXT"),
+            ("message_id", "INTEGER"),
+        ]
+        for col, definition in otp_order_migrations:
+            if col not in otp_order_columns:
+                try:
+                    conn.execute(f'ALTER TABLE otp_orders ADD COLUMN {col} {definition}')
+                except Exception:
+                    logger.exception('Quick OTP migration failed for otp_orders.%s', col)
+        try:
+            conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_otp_orders_activation_id ON otp_orders(activation_id) WHERE activation_id IS NOT NULL')
+        except Exception:
+            logger.exception('Could not create OTP activation index')
+
         # Refresh human-readable service labels for existing installations.
         existing_services=conn.execute('SELECT service_code,service_name FROM otp_services').fetchall()
         for sr in existing_services:
@@ -8898,13 +8926,47 @@ def otp_country_cb(c):
 def otp_buy_cb(c):
     if not is_feature_enabled("quick_otp", c.from_user.id):
         return bot.answer_callback_query(c.id, "Quick OTP is currently unavailable.", show_alert=True)
-    _,service,code=c.data.split(':',2); bot.answer_callback_query(c.id,'Processing…')
-    result,msg=_otp_create_activation(c.from_user.id,service,code,c.message.chat.id)
-    if not result: return bot.send_message(c.message.chat.id,msg,parse_mode='HTML')
-    r=fetchone('SELECT * FROM otp_service_countries WHERE service_code=? AND country_code=?',(service,code))
-    text=_otp_waiting_text(dict(result),1200,300)
-    sent=bot.send_message(c.message.chat.id,text,parse_mode='HTML',reply_markup=_otp_kb(result['order_id'],service,code,300))
-    with db_tx() as conn: conn.execute('UPDATE otp_orders SET chat_id=?,message_id=?,updated_at=? WHERE order_id=?',(str(sent.chat.id),sent.message_id,_otp_now(),result['order_id']))
+    _,service,code=c.data.split(':',2)
+    bot.answer_callback_query(c.id,'Processing…')
+    try:
+        result,msg=_otp_create_activation(c.from_user.id,service,code,c.message.chat.id)
+        if not result:
+            # Keep the Quick OTP flow in-place. Do not create a stack of
+            # repeated generic error messages underneath the country screen.
+            bot.edit_message_text(
+                f'⚠️ <b>Number request could not be completed.</b>\n\n{msg}',
+                c.message.chat.id,c.message.message_id,parse_mode='HTML',
+                reply_markup=types.InlineKeyboardMarkup().add(
+                    types.InlineKeyboardButton('🔄 Try Again',callback_data=f'otp_country:{service}:{code}')
+                ).add(
+                    types.InlineKeyboardButton('⬅️ Countries',callback_data=f'otp_service:{service}')
+                )
+            )
+            return
+        text=_otp_waiting_text(dict(result),1200,300)
+        # The country/service message becomes the waiting card. This prevents
+        # duplicate "Something went wrong" / duplicate option messages.
+        bot.edit_message_text(
+            text,c.message.chat.id,c.message.message_id,parse_mode='HTML',
+            reply_markup=_otp_kb(result['order_id'],service,code,300,result['phone_number'])
+        )
+        with db_tx() as conn:
+            conn.execute('UPDATE otp_orders SET chat_id=?,message_id=?,updated_at=? WHERE order_id=?',
+                         (str(c.message.chat.id),c.message.message_id,_otp_now(),result['order_id']))
+    except Exception:
+        logger.exception('Quick OTP buy failed order creation chat=%s service=%s country=%s',c.message.chat.id,service,code)
+        try:
+            bot.edit_message_text(
+                '⚠️ <b>Number request failed.</b>\n\nPlease try again. Your balance was not charged if the number was not confirmed.',
+                c.message.chat.id,c.message.message_id,parse_mode='HTML',
+                reply_markup=types.InlineKeyboardMarkup().add(
+                    types.InlineKeyboardButton('🔄 Try Again',callback_data=f'otp_country:{service}:{code}')
+                ).add(
+                    types.InlineKeyboardButton('⬅️ Countries',callback_data=f'otp_service:{service}')
+                )
+            )
+        except Exception:
+            raise
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_new:'))
 @safe_handler
