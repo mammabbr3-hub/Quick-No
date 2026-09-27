@@ -2242,6 +2242,60 @@ def _delete_old_option_after_success(chat_id, old_message_id, keep_message_id=No
     # Never auto-delete bot-generated navigation/result messages.
     return
 
+# ================================================================
+# IN-PLACE SCREEN UPDATES
+# ================================================================
+# Navigation/configuration screens are edited in place instead of creating
+# another bot message. The current screen is tracked separately from the
+# permanent record/transaction messages, so IDs, OTPs, receipts, audit
+# records and other tracking messages are never edited or deleted.
+_SCREEN_MESSAGES_LOCK = threading.RLock()
+_SCREEN_MESSAGES = {}  # chat_id -> message_id
+
+def _screen_bind(chat_id, message_id):
+    if message_id:
+        with _SCREEN_MESSAGES_LOCK:
+            _SCREEN_MESSAGES[str(chat_id)] = int(message_id)
+
+def _screen_for(chat_id):
+    with _SCREEN_MESSAGES_LOCK:
+        return _SCREEN_MESSAGES.get(str(chat_id))
+
+def _screen_clear(chat_id):
+    with _SCREEN_MESSAGES_LOCK:
+        _SCREEN_MESSAGES.pop(str(chat_id), None)
+
+def _screen_back_kb():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("⬅️ Back", callback_data="screen_back"))
+    return kb
+
+def _screen_send(chat_id, text, *, reply_markup=None, parse_mode=None, edit_message_id=None):
+    """Update the active UI screen, or create it when entering a new step.
+
+    This helper is ONLY for navigation/configuration screens. Do not use it
+    for permanent IDs, OTPs, receipts, audit records, approvals, or other
+    tracking/result messages."""
+    mid = edit_message_id or _screen_for(chat_id)
+    if mid:
+        try:
+            bot.edit_message_text(text, chat_id, mid, parse_mode=parse_mode, reply_markup=reply_markup)
+            return mid
+        except Exception:
+            # The screen may have been replaced/expired. Fall through to a
+            # fresh screen rather than losing the user's navigation.
+            logger.debug("Could not edit UI screen %s/%s", chat_id, mid, exc_info=True)
+    msg = bot.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
+    _screen_bind(chat_id, msg.message_id)
+    return msg.message_id
+
+def _screen_send_for_chat(chat_id, text, *, reply_markup=None, parse_mode=None):
+    return _screen_send(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
+
+def _screen_from_callback(c, text, *, reply_markup=None, parse_mode=None):
+    _screen_bind(c.message.chat.id, c.message.message_id)
+    return _screen_send(c.message.chat.id, text, reply_markup=reply_markup, parse_mode=parse_mode, edit_message_id=c.message.message_id)
+
 # Wrap send_message so every Reply Keyboard menu is automatically registered.
 # This covers main menu, Back/Refresh menus, admin menus, and other navigation
 # screens without changing the financial/OTP result messages.
@@ -2494,6 +2548,16 @@ def safe_handler(func):
     return wrapper
 
 
+@bot.callback_query_handler(func=lambda c: c.data == "screen_back")
+@safe_handler
+def _screen_back_cb(c):
+    clear_state(c.message.chat.id)
+    _screen_clear(c.message.chat.id)
+    bot.answer_callback_query(c.id)
+    # Returning to the main menu is a deliberate step change, so a fresh
+    # message is appropriate here. The previous screen remains in chat.
+    bot.send_message(c.message.chat.id, "🏠 Main Menu", reply_markup=main_menu(c.message.chat.id))
+
 def notify_admins(text, **kwargs):
     for admin_id in ADMIN_IDS:
         try:
@@ -2625,7 +2689,7 @@ def community_refresh_cb(c):
             except Exception as e:
                 results.append(f"⚠️ {COMMUNITY_LABELS[k]}: bot cannot access this chat ({cid})")
         bot.answer_callback_query(c.id, "Configuration checked.")
-        bot.send_message(c.message.chat.id, "🔎 <b>COMMUNITY CHECK</b>\n\n"+"\n".join(results), parse_mode="HTML")
+        _screen_from_callback(c, "🔎 <b>COMMUNITY CHECK</b>\n\n"+"\n".join(results), parse_mode="HTML")
     else:
         bot.answer_callback_query(c.id)
     admin_community_settings(c.message)
@@ -2640,7 +2704,7 @@ def community_set_cb(c):
     update_state(c.message.chat.id, flow="community_set", step="value", kind=kind)
     bot.answer_callback_query(c.id)
     current=_community_get(kind)
-    bot.send_message(c.message.chat.id,
+    _screen_from_callback(c,
         f"✏️ <b>{COMMUNITY_LABELS[kind]}</b>\n\n"
         "Send the Telegram numeric chat ID and optional invite/public link in one line:\n\n"
         "<code>-1001234567890 | https://t.me/example</code>\n\n"
@@ -2655,16 +2719,16 @@ def _handle_community_set(m,state):
     cid=parts[0] if parts else ""
     link=parts[1] if len(parts)>1 else ""
     if not cid.lstrip("-").isdigit() or not cid.startswith("-100"):
-        bot.send_message(m.chat.id,"❌ Invalid Telegram supergroup/channel ID. It should look like <code>-1001234567890</code>.",parse_mode="HTML")
+        _screen_send_for_chat(m.chat.id,"❌ Invalid Telegram supergroup/channel ID. It should look like <code>-1001234567890</code>.",parse_mode="HTML")
         return
     try:
         chat=bot.get_chat(int(cid))
     except Exception:
-        bot.send_message(m.chat.id,"❌ Bot cannot access that chat. Add the bot to the group/channel first, then try again.")
+        _screen_send_for_chat(m.chat.id,"❌ Bot cannot access that chat. Add the bot to the group/channel first, then try again.")
         return
     _community_set(kind,cid,link,m.chat.id)
     clear_state(m.chat.id)
-    bot.send_message(m.chat.id,f"✅ {COMMUNITY_LABELS[kind]} saved.\n\nTitle: {html.escape(chat.title or str(cid))}\nID: <code>{cid}</code>",parse_mode="HTML",reply_markup=main_menu(m.chat.id))
+    _screen_send_for_chat(m.chat.id,f"✅ {COMMUNITY_LABELS[kind]} saved.\n\nTitle: {html.escape(chat.title or str(cid))}\nID: <code>{cid}</code>",parse_mode="HTML",reply_markup=main_menu(m.chat.id))
 
 def _user_join_requirements():
     return [("user_group","👥 Group"),("user_channel","📢 Channel")]
@@ -2700,7 +2764,7 @@ def _join_gate(chat_id):
 def community_join_check_cb(c):
     if _join_gate(c.message.chat.id):
         bot.answer_callback_query(c.id,"✅ Membership confirmed.")
-        bot.send_message(c.message.chat.id,"✅ You have joined the required communities.",reply_markup=main_menu(c.message.chat.id))
+        _screen_from_callback(c,"✅ You have joined the required communities.",reply_markup=main_menu(c.message.chat.id))
     else:
         bot.answer_callback_query(c.id,"⚠️ You still need to join both.",show_alert=True)
 
@@ -3573,12 +3637,12 @@ def dash_open_submissions(c):
         "SELECT * FROM submissions WHERE status='PENDING' ORDER BY created_at ASC LIMIT 15"
     )
     if not rows:
-        bot.send_message(c.message.chat.id, "✅ No pending work submissions right now.")
+        _screen_from_callback(c, "✅ No pending work submissions right now.")
         return
     lines = ["📤 PENDING WORK SUBMISSIONS\n"]
     for r in rows:
         lines.append(f"⏳ <code>{r['sub_id']}</code> — user <code>{r['user_id']}</code> — {r['created_at']}")
-    bot.send_message(c.message.chat.id, "\n".join(lines), parse_mode="HTML")
+    _screen_from_callback(c, "\n".join(lines), parse_mode="HTML")
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "dash_open_bank")
@@ -3591,7 +3655,7 @@ def dash_open_bank(c):
         "SELECT * FROM bank_submissions WHERE status='PENDING' ORDER BY created_at ASC LIMIT 15"
     )
     if not rows:
-        bot.send_message(c.message.chat.id, "✅ No pending bank/wallet/crypto submissions right now.")
+        _screen_from_callback(c, "✅ No pending bank/wallet/crypto submissions right now.")
         return
     lines = ["🏦 PENDING BANK/WALLET/CRYPTO DETAILS\n"]
     for r in rows:
@@ -3599,7 +3663,7 @@ def dash_open_bank(c):
             f"⏳ <code>{r['bank_id']}</code> — user <code>{r['user_id']}</code> — "
             f"{r['category']}/{r['method']} — {r['created_at']}"
         )
-    bot.send_message(c.message.chat.id, "\n".join(lines), parse_mode="HTML")
+    _screen_from_callback(c, "\n".join(lines), parse_mode="HTML")
 
 
 # ================================================================
@@ -3651,7 +3715,7 @@ def admin_maintenance_cb(c):
     try:
         bot.edit_message_text(_maintenance_admin_text(), c.message.chat.id, c.message.message_id, parse_mode="HTML", reply_markup=_maintenance_admin_kb())
     except Exception:
-        bot.send_message(c.message.chat.id, _maintenance_admin_text(), parse_mode="HTML", reply_markup=_maintenance_admin_kb())
+        _screen_from_callback(c, _maintenance_admin_text(), parse_mode="HTML", reply_markup=_maintenance_admin_kb())
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "maintenance_try")
@@ -3662,7 +3726,7 @@ def maintenance_try_cb(c):
         maintenance_message(c.message.chat.id)
         return
     bot.answer_callback_query(c.id, "The system is available again.")
-    bot.send_message(c.message.chat.id, "✅ The system is available again. Please choose an option from the menu.", reply_markup=main_menu(c.message.chat.id))
+    _screen_from_callback(c, "✅ The system is available again. Please choose an option from the menu.", reply_markup=main_menu(c.message.chat.id))
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "maintenance_support")
@@ -3848,7 +3912,7 @@ def admin_feature_toggle_cb(c):
     try:
         bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=_feature_control_kb())
     except Exception:
-        bot.send_message(c.message.chat.id, "🛠 FEATURE CONTROL", reply_markup=_feature_control_kb())
+        _screen_from_callback(c, "🛠 FEATURE CONTROL", reply_markup=_feature_control_kb())
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("dynfeat_toggle:"))
@@ -3884,7 +3948,7 @@ def dynamic_feature_toggle_cb(c):
     try:
         bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=kb)
     except Exception:
-        bot.send_message(c.message.chat.id, text, reply_markup=kb)
+        _screen_from_callback(c, text, reply_markup=kb)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("dynfeat_restrict:"))
@@ -3895,7 +3959,7 @@ def dynamic_feature_restrict_start(c):
     key = c.data.split(":", 1)[1]
     update_state(c.message.chat.id, flow="admin_dynamic_feature_restrict", step="user_id", feature=key)
     bot.answer_callback_query(c.id)
-    bot.send_message(c.message.chat.id, f"🔒 Enter the User ID or @username to restrict/unrestrict this handle: <code>{html.escape(key)}</code>", parse_mode="HTML", reply_markup=back_kb())
+    _screen_from_callback(c, f"🔒 Enter the User ID or @username to restrict/unrestrict this handle: <code>{html.escape(key)}</code>", parse_mode="HTML", reply_markup=_screen_back_kb())
 
 
 def _handle_admin_dynamic_feature_restrict_user_id(m, state):
@@ -3904,7 +3968,7 @@ def _handle_admin_dynamic_feature_restrict_user_id(m, state):
         return
     user = resolve_user_ref(m.text.strip())
     if user is None:
-        bot.send_message(m.chat.id, "❌ No user found with that ID/username.")
+        _screen_send_for_chat(m.chat.id, "❌ No user found with that ID/username.")
         return
     key = state["feature"]
     uid = user["user_id"]
@@ -3915,7 +3979,7 @@ def _handle_admin_dynamic_feature_restrict_user_id(m, state):
         types.InlineKeyboardButton("🔴 Turn OFF for this user", callback_data=f"dynuserfeat_off:{key}:{uid}"),
         types.InlineKeyboardButton("🟢 Turn ON for this user", callback_data=f"dynuserfeat_on:{key}:{uid}"),
     )
-    bot.send_message(m.chat.id, f"👤 {html.escape(user['name'])} (<code>{uid}</code>)\n🛠 Handle: <code>{html.escape(key)}</code>\n📊 Currently: {'🟢 ON' if currently_on else '🔴 OFF'}", parse_mode="HTML", reply_markup=kb)
+    _screen_send_for_chat(m.chat.id, f"👤 {html.escape(user['name'])} (<code>{uid}</code>)\n🛠 Handle: <code>{html.escape(key)}</code>\n📊 Currently: {'🟢 ON' if currently_on else '🔴 OFF'}", parse_mode="HTML", reply_markup=kb)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("dynuserfeat_on:") or c.data.startswith("dynuserfeat_off:"))
@@ -3945,17 +4009,13 @@ def admin_restrict_user_start(c):
         return
     update_state(c.message.chat.id, flow="admin_feature_restrict", step="user_id", feature=key)
     bot.answer_callback_query(c.id)
-    bot.send_message(
-        c.message.chat.id,
-        f"🔒 Enter the User ID or @username to restrict/unrestrict for \"{FEATURES[key][0]}\":",
-        reply_markup=back_kb(),
-    )
+    _screen_from_callback(c, f"🔒 Enter the User ID or @username to restrict/unrestrict for \"{FEATURES[key][0]}\":")
 
 
 def _handle_admin_feature_restrict_user_id(m, state):
     user = resolve_user_ref(m.text.strip())
     if user is None:
-        bot.send_message(m.chat.id, "❌ No user found with that ID/username.")
+        _screen_send_for_chat(m.chat.id, "❌ No user found with that ID/username.")
         return
     key = state["feature"]
     uid = user["user_id"]
@@ -4049,7 +4109,7 @@ def admin_role_add_cb(c):
         return bot.answer_callback_query(c.id, "Super Admin only", show_alert=True)
     update_state(c.message.chat.id, flow="admin_add_admin", step="user_id")
     bot.answer_callback_query(c.id)
-    bot.send_message(c.message.chat.id, "🛡️ Send the numeric Telegram User ID of the new operational admin:", reply_markup=back_kb())
+    _screen_from_callback(c, "🛡️ Send the numeric Telegram User ID of the new operational admin:", reply_markup=_screen_back_kb())
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("admin_role_remove:"))
@@ -4423,7 +4483,7 @@ def _handle_admin_broadcast_text(m,state):
     kb=types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("✅ YES, SEND NOW",callback_data="confirm_broadcast"))
     kb.add(types.InlineKeyboardButton("❌ CANCEL",callback_data="cancel_admin"))
-    bot.send_message(m.chat.id,f"Destination: <b>{labels.get(state.get('target','all'))}</b>\n\nMessage:\n{html.escape(m.text)}\n\nSend it?",parse_mode="HTML",reply_markup=kb)
+    _screen_send_for_chat(m.chat.id,f"Destination: <b>{labels.get(state.get('target','all'))}</b>\n\nMessage:\n{html.escape(m.text)}\n\nSend it?",parse_mode="HTML",reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data in ("confirm_broadcast", "cancel_admin"))
 @safe_handler
@@ -4589,7 +4649,7 @@ def admin_users_page_cb(c):
     try:
         bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=kb, parse_mode="HTML")
     except Exception:
-        bot.send_message(c.message.chat.id, text, reply_markup=kb, parse_mode="HTML")
+        _screen_from_callback(c, text, reply_markup=kb, parse_mode="HTML")
 
 
 # ================================================================
@@ -4646,7 +4706,7 @@ def admin_banned_page_cb(c):
     try:
         bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=kb, parse_mode="HTML")
     except Exception:
-        bot.send_message(c.message.chat.id, text, reply_markup=kb, parse_mode="HTML")
+        _screen_from_callback(c, text, reply_markup=kb, parse_mode="HTML")
 
 
 # ================================================================
@@ -5134,7 +5194,7 @@ def admin_wdm_add_cb(c):
     clear_state(c.from_user.id)
     update_state(c.from_user.id, flow="admin_withdraw_method", step="name")
     bot.answer_callback_query(c.id)
-    bot.send_message(c.from_user.id, "➕ ADD WITHDRAWAL PAYMENT METHOD\n\nSend the method name users should see.\n\nExamples: Binance ID, USDT BEP20 Address, OPay, PalmPay, Bank Account, or any custom method.", reply_markup=back_kb())
+    _screen_from_callback(c, "➕ ADD WITHDRAWAL PAYMENT METHOD\n\nSend the method name users should see.\n\nExamples: Binance ID, USDT BEP20 Address, OPay, PalmPay, Bank Account, or any custom method.", reply_markup=_screen_back_kb())
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("wdm_view:"))
 @safe_handler
@@ -5150,7 +5210,7 @@ def admin_wdm_view_cb(c):
     kb.add(types.InlineKeyboardButton("✏️ Edit Instruction", callback_data=f"wdm_edit_prompt:{mid}"), types.InlineKeyboardButton("✏️ Rename", callback_data=f"wdm_edit_name:{mid}"))
     kb.add(types.InlineKeyboardButton("🗑 Delete", callback_data=f"wdm_delete:{mid}"), types.InlineKeyboardButton("⬅️ Back", callback_data="wdm_back"))
     bot.answer_callback_query(c.id)
-    bot.send_message(c.from_user.id, f"💸 <b>{html.escape(row['name'])}</b>\n\nStatus: <b>{status}</b>\nMethod ID: <code>{html.escape(row['method_id'])}</code>\n\nUser instruction:\n<code>{html.escape(row['prompt'])}</code>", parse_mode="HTML", reply_markup=kb)
+    _screen_from_callback(c, f"💸 <b>{html.escape(row['name'])}</b>\n\nStatus: <b>{status}</b>\nMethod ID: <code>{html.escape(row['method_id'])}</code>\n\nUser instruction:\n<code>{html.escape(row['prompt'])}</code>", parse_mode="HTML", reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data == "wdm_back")
 @safe_handler
@@ -5177,7 +5237,7 @@ def admin_wdm_toggle_cb(c):
         kb.add(types.InlineKeyboardButton("⛔ Turn OFF" if int(row["active"]) else "✅ Turn ON", callback_data=f"wdm_toggle:{mid}"))
         kb.add(types.InlineKeyboardButton("✏️ Edit Instruction", callback_data=f"wdm_edit_prompt:{mid}"), types.InlineKeyboardButton("✏️ Rename", callback_data=f"wdm_edit_name:{mid}"))
         kb.add(types.InlineKeyboardButton("🗑 Delete", callback_data=f"wdm_delete:{mid}"), types.InlineKeyboardButton("⬅️ Back", callback_data="wdm_back"))
-        bot.send_message(c.from_user.id, f"💸 <b>{html.escape(row['name'])}</b>\n\nStatus: <b>{status}</b>\nMethod ID: <code>{html.escape(row['method_id'])}</code>\n\nUser instruction:\n<code>{html.escape(row['prompt'])}</code>", parse_mode="HTML", reply_markup=kb)
+        _screen_from_callback(c, f"💸 <b>{html.escape(row['name'])}</b>\n\nStatus: <b>{status}</b>\nMethod ID: <code>{html.escape(row['method_id'])}</code>\n\nUser instruction:\n<code>{html.escape(row['prompt'])}</code>", parse_mode="HTML", reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("wdm_edit_prompt:"))
 @safe_handler
@@ -5189,7 +5249,7 @@ def admin_wdm_edit_prompt_cb(c):
         bot.answer_callback_query(c.id,"Method not found.",show_alert=True); return
     update_state(c.from_user.id, flow="admin_withdraw_method", step="prompt_edit", method_id=mid)
     bot.answer_callback_query(c.id)
-    bot.send_message(c.from_user.id,"✏️ Send the exact instruction users should see.\nExample: Please send your USDT BEP20 address only.",reply_markup=back_kb())
+    _screen_from_callback(c,"✏️ Send the exact instruction users should see.\nExample: Please send your USDT BEP20 address only.",reply_markup=_screen_back_kb())
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("wdm_edit_name:"))
 @safe_handler
@@ -5201,7 +5261,7 @@ def admin_wdm_edit_name_cb(c):
         bot.answer_callback_query(c.id,"Method not found.",show_alert=True); return
     update_state(c.from_user.id, flow="admin_withdraw_method", step="name_edit", method_id=mid)
     bot.answer_callback_query(c.id)
-    bot.send_message(c.from_user.id,"✏️ Send the new payment method name users should see.",reply_markup=back_kb())
+    _screen_from_callback(c,"✏️ Send the new payment method name users should see.",reply_markup=_screen_back_kb())
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("wdm_delete:"))
 @safe_handler
@@ -5219,29 +5279,29 @@ def _handle_admin_withdraw_method(m,state):
         clear_state(m.chat.id); return
     step=state.get("step"); value=(m.text or "").strip()
     if not value:
-        bot.send_message(m.chat.id,"❌ Please send a value."); return
+        _screen_send_for_chat(m.chat.id,"❌ Please send a value."); return
     if step=="name":
         if fetchone("SELECT 1 FROM withdrawal_methods WHERE lower(name)=lower(?)",(value,)):
-            bot.send_message(m.chat.id,"❌ That payment method already exists. Send a different name."); return
+            _screen_send_for_chat(m.chat.id,"❌ That payment method already exists. Send a different name."); return
         update_state(m.chat.id,flow="admin_withdraw_method",step="prompt",name=value)
-        bot.send_message(m.chat.id,"✍️ Now send the exact instruction users should receive.\nExample: Please send your Binance ID only.",reply_markup=back_kb()); return
+        _screen_send_for_chat(m.chat.id,"✍️ Now send the exact instruction users should receive.\nExample: Please send your Binance ID only.",reply_markup=_screen_back_kb()); return
     if step=="prompt":
         name=state.get("name"); mid=gen_id("WDM")
         create_withdrawal_method(mid,name,value,m.chat.id,active=1)
         clear_state(m.chat.id)
-        bot.send_message(m.chat.id,f"✅ Payment method created and ACTIVE.\n\n💳 {html.escape(name)}\n📝 {html.escape(value)}",parse_mode="HTML",reply_markup=admin_menu(m.chat.id)); return
+        _screen_send_for_chat(m.chat.id,f"✅ Payment method created and ACTIVE.\n\n💳 {html.escape(name)}\n📝 {html.escape(value)}",parse_mode="HTML",reply_markup=admin_menu(m.chat.id)); return
     mid=state.get("method_id"); row=get_withdrawal_method(mid)
     if not row:
-        clear_state(m.chat.id); bot.send_message(m.chat.id,"❌ Payment method no longer exists.",reply_markup=admin_menu(m.chat.id)); return
+        clear_state(m.chat.id); _screen_send_for_chat(m.chat.id,"❌ Payment method no longer exists.",reply_markup=admin_menu(m.chat.id)); return
     if step=="prompt_edit":
         update_withdrawal_method(mid,prompt=value,admin_id=m.chat.id)
     elif step=="name_edit":
         if fetchone("SELECT 1 FROM withdrawal_methods WHERE lower(name)=lower(?) AND method_id<>?",(value,mid)):
-            bot.send_message(m.chat.id,"❌ Another payment method already uses that name. Send a different name."); return
+            _screen_send_for_chat(m.chat.id,"❌ Another payment method already uses that name. Send a different name."); return
         update_withdrawal_method(mid,name=value,admin_id=m.chat.id)
     else:
         clear_state(m.chat.id); return
-    clear_state(m.chat.id); bot.send_message(m.chat.id,"✅ Withdrawal payment method updated.",reply_markup=admin_menu(m.chat.id))
+    clear_state(m.chat.id); _screen_send_for_chat(m.chat.id,"✅ Withdrawal payment method updated.",reply_markup=admin_menu(m.chat.id))
 
 
 # ================================================================
@@ -5318,7 +5378,7 @@ def admin_settings_edit_cb(c):
             f"✏️ Enter the new value for {label} ({value_type.upper()}):\n\n"
             "Send a plain number (e.g. 500 or 0.5)."
         )
-    bot.send_message(c.message.chat.id, prompt, reply_markup=back_kb())
+    _screen_from_callback(c, prompt, reply_markup=_screen_back_kb())
 
 
 def _handle_admin_setting(m, state):
@@ -5354,15 +5414,15 @@ def _handle_admin_setting(m, state):
     try:
         value = float(m.text.strip())
     except (TypeError, ValueError):
-        bot.send_message(m.chat.id, "❌ Invalid number. Please enter a numeric value.")
+        _screen_send_for_chat(m.chat.id, "❌ Invalid number. Please enter a numeric value.")
         return
     if value < 0:
-        bot.send_message(m.chat.id, "❌ Value cannot be negative.")
+        _screen_send_for_chat(m.chat.id, "❌ Value cannot be negative.")
         return
     clear_state(m.chat.id)
 
     set_setting(key, value, m.chat.id)
-    bot.send_message(m.chat.id, f"✅ {label} updated to {value} {value_type.upper()}.", reply_markup=main_menu(m.chat.id))
+    _screen_send_for_chat(m.chat.id, f"✅ {label} updated to {value} {value_type.upper()}.", reply_markup=main_menu(m.chat.id))
 
 
 # ================================================================
@@ -5414,15 +5474,11 @@ def admin_text_edit_cb(c):
     bot.answer_callback_query(c.id)
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("↩️ Reset to default", callback_data=f"textreset_{key}"))
-    bot.send_message(
-        c.message.chat.id,
-        f"✏️ {label}\n\n"
-        "Current text (send a new version below to replace it, keeping any "
-        "{placeholders} you want to keep):\n\n"
-        f"――――――――――――――\n{current}\n――――――――――――――",
+    _screen_from_callback(
+        c,
+        f"✏️ {label}\n\nCurrent text:\n\n――――――――――――――\n{current}\n――――――――――――――\n\n👉 Send the new text now:",
         reply_markup=kb,
     )
-    bot.send_message(c.message.chat.id, "👉 Send the new text now:", reply_markup=back_kb())
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("textreset_"))
@@ -5438,7 +5494,7 @@ def admin_text_reset_cb(c):
     delete_setting(f"text:{key}")
     clear_state(c.message.chat.id)
     bot.answer_callback_query(c.id, "↩️ Reset to default.")
-    bot.send_message(c.message.chat.id, "✅ Reset to the original wording.", reply_markup=main_menu(c.message.chat.id))
+    _screen_from_callback(c, "✅ Reset to the original wording.", reply_markup=main_menu(c.message.chat.id))
 
 
 def _handle_text_edit(m, state):
@@ -5476,7 +5532,7 @@ def _handle_text_edit(m, state):
 
     clear_state(m.chat.id)
     set_setting(f"text:{key}", new_text, m.chat.id)
-    bot.send_message(m.chat.id, f"✅ {label} updated.", reply_markup=main_menu(m.chat.id))
+    _screen_send_for_chat(m.chat.id, f"✅ {label} updated.", reply_markup=main_menu(m.chat.id))
 
 
 # ================================================================
@@ -5584,10 +5640,9 @@ def me_labels_cb(c):
         kb.add(types.InlineKeyboardButton(
             f"{'✏️' if edited else '📄'} {btn_label(key)}", callback_data=f"me_lbl_{key}",
         ))
-    bot.send_message(
-        c.message.chat.id,
-        "🔘 MAIN BUTTON LABELS\n\n"
-        "Tap a button below to rename it. ✏️ = already customized, 📄 = original wording.",
+    _screen_from_callback(
+        c,
+        "🔘 MAIN BUTTON LABELS\n\nTap a button below to rename it. ✏️ = already customized, 📄 = original wording.",
         reply_markup=kb,
     )
 
@@ -5605,7 +5660,7 @@ def me_label_reset_cb(c):
     reset_btn_label(key)
     clear_state(c.message.chat.id)
     bot.answer_callback_query(c.id, "↩️ Reset to default.")
-    bot.send_message(c.message.chat.id, "✅ Reset to the original wording.", reply_markup=main_menu(c.message.chat.id))
+    _screen_from_callback(c, "✅ Reset to the original wording.", reply_markup=main_menu(c.message.chat.id))
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("me_lbl_"))
@@ -5623,8 +5678,8 @@ def me_label_edit_cb(c):
     bot.answer_callback_query(c.id)
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("↩️ Reset to default", callback_data=f"me_lblreset_{key}"))
-    bot.send_message(c.message.chat.id, f"✏️ Current label: {btn_label(key)}", reply_markup=kb)
-    bot.send_message(c.message.chat.id, "👉 Send the new button text now:", reply_markup=back_kb())
+    _screen_from_callback(c, f"✏️ Current label: {btn_label(key)}", reply_markup=kb)
+    _screen_from_callback(c, "👉 Send the new button text now:", reply_markup=_screen_back_kb())
 
 
 def _handle_btn_label_edit(m, state):
@@ -5657,22 +5712,24 @@ def me_work_cb(c):
         bot.answer_callback_query(c.id)
         return
     bot.answer_callback_query(c.id)
-    _send_work_categories(c.message.chat.id)
+    _send_work_categories(c.message.chat.id, edit_message_id=c.message.message_id)
 
 
-def _send_work_categories(chat_id):
+def _send_work_categories(chat_id, edit_message_id=None):
     kb = types.InlineKeyboardMarkup()
     for cat in list_menu_options("work_category", active_only=False):
         status = "🟢" if cat["active"] else "🔴"
         kb.add(types.InlineKeyboardButton(f"{status} {cat['label']}", callback_data=f"me_wcat_{cat['option_id']}"))
     kb.add(types.InlineKeyboardButton("➕ Add Work Category", callback_data="me_wcat_add"))
-    bot.send_message(
-        chat_id,
+    text = (
         "💼 SUBMIT WORK — CATEGORIES\n\n"
         "🟢 = active, 🔴 = disabled. Tap a category to rename/disable/delete it or add "
-        "options inside it, or add a whole new category.",
-        reply_markup=kb,
+        "options inside it, or add a whole new category."
     )
+    if edit_message_id:
+        _screen_send(chat_id, text, reply_markup=kb, edit_message_id=edit_message_id)
+    else:
+        _screen_send(chat_id, text, reply_markup=kb)
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "me_wcat_add")
@@ -5684,7 +5741,7 @@ def me_wcat_add_cb(c):
     clear_state(c.message.chat.id)
     update_state(c.message.chat.id, flow="menu_opt_add", section="work_category")
     bot.answer_callback_query(c.id)
-    bot.send_message(c.message.chat.id, "✍️ Send the name for the new work category (e.g. \"🟢 TikTok Work\"):", reply_markup=back_kb())
+    _screen_from_callback(c, "✍️ Send the name for the new work category (e.g. \"🟢 TikTok Work\"):", reply_markup=_screen_back_kb())
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("me_wcat_") and not c.data.startswith("me_wcat_add"))
@@ -5729,7 +5786,7 @@ def me_wcat_rename_cb(c):
     clear_state(c.message.chat.id)
     update_state(c.message.chat.id, flow="menu_opt_rename", option_id=option_id)
     bot.answer_callback_query(c.id)
-    bot.send_message(c.message.chat.id, "✍️ Send the new name for this category:", reply_markup=back_kb())
+    _screen_from_callback(c, "✍️ Send the new name for this category:", reply_markup=_screen_back_kb())
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("me_wcattoggle_"))
@@ -5777,7 +5834,7 @@ def me_wsub_add_cb(c):
     clear_state(c.message.chat.id)
     update_state(c.message.chat.id, flow="menu_opt_add", section="work_subtype", parent_key=parent_id)
     bot.answer_callback_query(c.id)
-    bot.send_message(c.message.chat.id, f"✍️ Send the name for the new option inside \"{cat['label']}\" (e.g. \"🆔 New Sub-type\"):", reply_markup=back_kb())
+    _screen_from_callback(c, f"✍️ Send the name for the new option inside \"{cat['label']}\" (e.g. \"🆔 New Sub-type\"):", reply_markup=_screen_back_kb())
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("me_wsub_") and not c.data.startswith("me_wsub_add_"))
@@ -5796,11 +5853,7 @@ def me_wsub_manage_cb(c):
     kb.add(types.InlineKeyboardButton("✏️ Rename", callback_data=f"me_wsubren_{option_id}"))
     kb.add(types.InlineKeyboardButton("🔴 Disable" if sub["active"] else "🟢 Enable", callback_data=f"me_wsubtoggle_{option_id}"))
     kb.add(types.InlineKeyboardButton("🗑️ Delete", callback_data=f"me_wsubdel_{option_id}"))
-    bot.send_message(
-        c.message.chat.id,
-        f"🔧 {sub['label']}\n\n📊 Status: {'🟢 Active' if sub['active'] else '🔴 Disabled'}",
-        reply_markup=kb,
-    )
+    _screen_from_callback(c, f"🔧 {sub['label']}\n\n📊 Status: {'🟢 Active' if sub['active'] else '🔴 Disabled'}", reply_markup=kb)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("me_wsubren_"))
@@ -5816,7 +5869,7 @@ def me_wsub_rename_cb(c):
     clear_state(c.message.chat.id)
     update_state(c.message.chat.id, flow="menu_opt_rename", option_id=option_id)
     bot.answer_callback_query(c.id)
-    bot.send_message(c.message.chat.id, "✍️ Send the new name for this option:", reply_markup=back_kb())
+    _screen_from_callback(c, "✍️ Send the new name for this option:", reply_markup=_screen_back_kb())
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("me_wsubtoggle_"))
@@ -5832,7 +5885,7 @@ def me_wsub_toggle_cb(c):
         return
     toggle_menu_option(option_id, not sub["active"])
     bot.answer_callback_query(c.id, "✅ Updated")
-    bot.send_message(c.message.chat.id, "✅ Updated. Open the category again from 🧩 Menu Editor to see the change.")
+    _screen_from_callback(c, "✅ Updated. Open the category again from 🧩 Menu Editor to see the change.")
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("me_wsubdel_"))
@@ -5847,7 +5900,7 @@ def me_wsub_delete_cb(c):
         return
     delete_menu_option(option_id)
     bot.answer_callback_query(c.id, "🗑️ Deleted")
-    bot.send_message(c.message.chat.id, "✅ Deleted.")
+    _screen_from_callback(c, "✅ Deleted.")
 
 
 # ---- Buy/Sell Mail options ---------------------------------------
@@ -5859,21 +5912,23 @@ def me_mail_cb(c):
         bot.answer_callback_query(c.id)
         return
     bot.answer_callback_query(c.id)
-    _send_mail_options(c.message.chat.id)
+    _send_mail_options(c.message.chat.id, edit_message_id=c.message.message_id)
 
 
-def _send_mail_options(chat_id):
+def _send_mail_options(chat_id, edit_message_id=None):
     kb = types.InlineKeyboardMarkup()
     for o in list_menu_options("mail_option", active_only=False):
         status = "🟢" if o["active"] else "🔴"
         kb.add(types.InlineKeyboardButton(f"{status} {o['label']}", callback_data=f"me_mopt_{o['option_id']}"))
     kb.add(types.InlineKeyboardButton("➕ Add Mail Option", callback_data="me_mopt_add"))
-    bot.send_message(
-        chat_id,
+    text = (
         "📧 BUY/SELL MAIL — OPTIONS\n\n"
-        "🟢 = active, 🔴 = disabled. Tap an option to rename/disable/delete it, or add a new one.",
-        reply_markup=kb,
+        "🟢 = active, 🔴 = disabled. Tap an option to rename/disable/delete it, or add a new one."
     )
+    if edit_message_id:
+        _screen_send(chat_id, text, reply_markup=kb, edit_message_id=edit_message_id)
+    else:
+        _screen_send(chat_id, text, reply_markup=kb)
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "me_mopt_add")
@@ -5885,7 +5940,7 @@ def me_mopt_add_cb(c):
     clear_state(c.message.chat.id)
     update_state(c.message.chat.id, flow="menu_opt_add", section="mail_option")
     bot.answer_callback_query(c.id)
-    bot.send_message(c.message.chat.id, "✍️ Send the name for the new mail option (e.g. \"SELL OUTLOOK\"):", reply_markup=back_kb())
+    _screen_from_callback(c, "✍️ Send the name for the new mail option (e.g. \"SELL OUTLOOK\"):", reply_markup=_screen_back_kb())
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("me_mopt_") and not c.data.startswith("me_mopt_add"))
@@ -5904,11 +5959,7 @@ def me_mopt_manage_cb(c):
     kb.add(types.InlineKeyboardButton("✏️ Rename", callback_data=f"me_moptren_{option_id}"))
     kb.add(types.InlineKeyboardButton("🔴 Disable" if o["active"] else "🟢 Enable", callback_data=f"me_mopttoggle_{option_id}"))
     kb.add(types.InlineKeyboardButton("🗑️ Delete", callback_data=f"me_moptdel_{option_id}"))
-    bot.send_message(
-        c.message.chat.id,
-        f"🔧 {o['label']}\n\n📊 Status: {'🟢 Active' if o['active'] else '🔴 Disabled'}",
-        reply_markup=kb,
-    )
+    _screen_from_callback(c, f"🔧 {o['label']}\n\n📊 Status: {'🟢 Active' if o['active'] else '🔴 Disabled'}", reply_markup=kb)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("me_moptren_"))
@@ -5924,7 +5975,7 @@ def me_mopt_rename_cb(c):
     clear_state(c.message.chat.id)
     update_state(c.message.chat.id, flow="menu_opt_rename", option_id=option_id)
     bot.answer_callback_query(c.id)
-    bot.send_message(c.message.chat.id, "✍️ Send the new name for this option:", reply_markup=back_kb())
+    _screen_from_callback(c, "✍️ Send the new name for this option:", reply_markup=_screen_back_kb())
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("me_mopttoggle_"))
@@ -5968,23 +6019,23 @@ def _handle_menu_opt_add(m, state):
     parent_key = state.get("parent_key")
     label = m.text.strip()
     if not label:
-        bot.send_message(m.chat.id, "❌ Name can't be empty. Please send the text.")
+        _screen_send_for_chat(m.chat.id, "❌ Name can't be empty. Please send the text.")
         return
     if label in reserved_labels_now():
-        bot.send_message(m.chat.id, "❌ That name is already used elsewhere in the bot. Please choose a different one.")
+        _screen_send_for_chat(m.chat.id, "❌ That name is already used elsewhere in the bot. Please choose a different one.")
         return
     if get_menu_option_by_label(section, label, parent_key=parent_key) is not None:
-        bot.send_message(m.chat.id, "❌ An option with that exact name already exists here. Please choose a different name.")
+        _screen_send_for_chat(m.chat.id, "❌ An option with that exact name already exists here. Please choose a different name.")
         return
     clear_state(m.chat.id)
     create_menu_option(section, label, m.chat.id, parent_key=parent_key)
-    bot.send_message(m.chat.id, f"✅ Added: {label}", reply_markup=main_menu(m.chat.id))
+    _screen_send_for_chat(m.chat.id, f"✅ Added: {label}", reply_markup=main_menu(m.chat.id))
     if section == "work_category":
         _send_work_categories(m.chat.id)
     elif section == "work_subtype":
         cat = get_menu_option(parent_key)
         if cat:
-            bot.send_message(m.chat.id, f"Open \"{cat['label']}\" again from 🧩 Menu Editor to see it.")
+            _screen_send_for_chat(m.chat.id, f"Open \"{cat['label']}\" again from 🧩 Menu Editor to see it.")
     elif section == "mail_option":
         _send_mail_options(m.chat.id)
 
@@ -5997,19 +6048,19 @@ def _handle_menu_opt_rename(m, state):
     row = get_menu_option(option_id)
     if row is None:
         clear_state(m.chat.id)
-        bot.send_message(m.chat.id, "❌ That option no longer exists.", reply_markup=main_menu(m.chat.id))
+        _screen_send_for_chat(m.chat.id, "❌ That option no longer exists.", reply_markup=main_menu(m.chat.id))
         return
     new_label = m.text.strip()
     if not new_label:
-        bot.send_message(m.chat.id, "❌ Name can't be empty. Please send the text.")
+        _screen_send_for_chat(m.chat.id, "❌ Name can't be empty. Please send the text.")
         return
     others = reserved_labels_now() - {row["label"]}
     if new_label in others:
-        bot.send_message(m.chat.id, "❌ That name is already used elsewhere in the bot. Please choose a different one.")
+        _screen_send_for_chat(m.chat.id, "❌ That name is already used elsewhere in the bot. Please choose a different one.")
         return
     clear_state(m.chat.id)
     update_menu_option_label(option_id, new_label)
-    bot.send_message(m.chat.id, f"✅ Renamed to: {new_label}", reply_markup=main_menu(m.chat.id))
+    _screen_send_for_chat(m.chat.id, f"✅ Renamed to: {new_label}", reply_markup=main_menu(m.chat.id))
 
 
 # ================================================================
@@ -6114,7 +6165,7 @@ def admin_custom_handle_type_cb(c):
     bot.answer_callback_query(c.id)
     if action_type == "static_message":
         update_state(c.message.chat.id, flow="custom_handle_add", step="static_text", action_type=action_type)
-        bot.send_message(c.message.chat.id, "✍️ Step 3/4 — Send the message to show when this button is tapped.", reply_markup=back_kb())
+        _screen_from_callback(c, "✍️ Step 3/4 — Send the message to show when this button is tapped.", reply_markup=_screen_back_kb())
     elif action_type == "forward_to_admin":
         update_state(c.message.chat.id, flow="custom_handle_add", step="forward_prompt", action_type=action_type)
         bot.send_message(
@@ -6126,13 +6177,13 @@ def admin_custom_handle_type_cb(c):
         )
     elif action_type == "link_button":
         update_state(c.message.chat.id, flow="custom_handle_add", step="link_url", action_type=action_type)
-        bot.send_message(c.message.chat.id, "✍️ Step 3/4 — Send the URL this button should open (must start with http:// or https://).", reply_markup=back_kb())
+        _screen_from_callback(c, "✍️ Step 3/4 — Send the URL this button should open (must start with http:// or https://).", reply_markup=_screen_back_kb())
     elif action_type == "feature_link":
         update_state(c.message.chat.id, flow="custom_handle_add", step="feature_pick", action_type=action_type)
         kb = types.InlineKeyboardMarkup()
         for fkey, fcap in FEATURE_LINK_LABELS.items():
             kb.add(types.InlineKeyboardButton(fcap, callback_data=f"chafeat_{fkey}"))
-        bot.send_message(c.message.chat.id, "✍️ Step 3/4 — Which existing feature should this button open?", reply_markup=kb)
+        _screen_from_callback(c, "✍️ Step 3/4 — Which existing feature should this button open?", reply_markup=kb)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("chafeat_"))
@@ -6456,11 +6507,7 @@ def admin_auto_add_start(c):
     clear_state(c.message.chat.id)
     update_state(c.message.chat.id, flow="auto_add", step="title")
     bot.answer_callback_query(c.id)
-    bot.send_message(
-        c.message.chat.id,
-        "➕ NEW AUTO MESSAGE\n\n📝 First, send a short title (for your own reference, e.g. 'Morning Reminder'):",
-        reply_markup=back_kb(),
-    )
+    _screen_from_callback(c, "➕ NEW AUTO MESSAGE\n\n📝 First, send a short title (for your own reference, e.g. 'Morning Reminder'):")
 
 
 def _handle_auto_add_title(m, state):
@@ -6493,7 +6540,7 @@ def auto_msg_target_cb(c):
     kb=types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("⏰ Daily at a fixed time", callback_data="automode_daily"))
     kb.add(types.InlineKeyboardButton("🔁 Repeat every N minutes", callback_data="automode_interval"))
-    bot.send_message(c.message.chat.id, "🕒 <b>Choose the schedule:</b>", parse_mode="HTML", reply_markup=kb)
+    _screen_from_callback(c, "🕒 <b>Choose the schedule:</b>", parse_mode="HTML", reply_markup=kb)
 
 
 @bot.callback_query_handler(func=lambda c: c.data in ("automode_daily", "automode_interval"))
@@ -6581,7 +6628,7 @@ def admin_auto_delete_cb(c):
     try:
         bot.edit_message_text(text, c.message.chat.id, c.message.message_id, reply_markup=kb)
     except Exception:
-        bot.send_message(c.message.chat.id, text, reply_markup=kb)
+        _screen_from_callback(c, text, reply_markup=kb)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("autoedit_"))
@@ -6608,8 +6655,8 @@ def admin_auto_edit_cb(c):
         schedule = f"{row['hour']:02d}:{row['minute']:02d} (Lagos, daily)"
     toggle_label = "🔴 Deactivate" if row["active"] else "🟢 Activate"
     kb.add(types.InlineKeyboardButton(toggle_label, callback_data=f"autotoggle_{auto_id}"))
-    bot.send_message(
-        c.message.chat.id,
+    _screen_from_callback(
+        c,
         f"✏️ EDIT: {row['title']}\n\n"
         f"🕒 Schedule: {schedule}\n"
         f"📊 Status: {'🟢 Active' if row['active'] else '🔴 Inactive'}\n\n"
@@ -6631,7 +6678,7 @@ def admin_auto_toggle_cb(c):
         return
     update_auto_message(auto_id, active=0 if row["active"] else 1)
     bot.answer_callback_query(c.id, "✅ Updated")
-    bot.send_message(c.message.chat.id, "✅ Status updated.", reply_markup=main_menu(c.message.chat.id))
+    _screen_from_callback(c, "✅ Status updated.", reply_markup=main_menu(c.message.chat.id))
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("autofield_"))
@@ -6653,7 +6700,7 @@ def admin_auto_field_cb(c):
         kb.add(types.InlineKeyboardButton("🤖 Bot Users", callback_data=f"automsgedit_target:{auto_id}:bot_users"))
         kb.add(types.InlineKeyboardButton("👥 User Group", callback_data=f"automsgedit_target:{auto_id}:user_group"))
         kb.add(types.InlineKeyboardButton("📢 User Channel", callback_data=f"automsgedit_target:{auto_id}:user_channel"))
-        bot.send_message(c.message.chat.id, "🎯 Choose the new destination:", reply_markup=kb)
+        _screen_from_callback(c, "🎯 Choose the new destination:", reply_markup=kb)
         return
     prompts = {
         "title": "📝 Send the new title:",
@@ -6661,7 +6708,7 @@ def admin_auto_field_cb(c):
         "time": "⏰ Send the new time as HH:MM (24-hour, Africa/Lagos), e.g. 08:00:",
         "interval": "🔁 Send the new interval in minutes (e.g. 30, 60, 120):",
     }
-    bot.send_message(c.message.chat.id, prompts[field], reply_markup=back_kb())
+    _screen_from_callback(c, prompts[field], reply_markup=_screen_back_kb())
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("automsgedit_target:"))
@@ -6677,7 +6724,7 @@ def auto_msg_edit_target_cb(c):
         bot.answer_callback_query(c.id,"Not found",show_alert=True); return
     update_auto_message(auto_id,target_type=target)
     bot.answer_callback_query(c.id,"Destination updated")
-    bot.send_message(c.message.chat.id,f"✅ Destination changed to {target}.",reply_markup=main_menu(c.message.chat.id))
+    _screen_from_callback(c,f"✅ Destination changed to {target}.",reply_markup=main_menu(c.message.chat.id))
 
 
 def _handle_auto_edit_field(m, state):
@@ -7563,7 +7610,7 @@ def fund_admin_menu(m):
 def fund_admin_add_cb(c):
     if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id, "Admin only", show_alert=True)
     clear_state(c.from_user.id); update_state(c.from_user.id, flow="fund_admin_add", step="name")
-    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id, "✏️ Enter method name. Example: Binance / Bybit / USD Wallet / Nigerian Bank:", reply_markup=back_kb())
+    bot.answer_callback_query(c.id); _screen_from_callback(c, "✏️ Enter method name. Example: Binance / Bybit / USD Wallet / Nigerian Bank:", reply_markup=_screen_back_kb())
 
 
 def _handle_fund_admin_add(m, state):
@@ -7602,7 +7649,7 @@ def fund_admin_method_cb(c):
     kb.add(types.InlineKeyboardButton("🗑 Delete",callback_data=f"fund_admin_delete:{mid}"))
     kb.add(types.InlineKeyboardButton("⬅️ Back",callback_data="fund_admin_back"))
     bot.answer_callback_query(c.id)
-    bot.send_message(c.from_user.id,_fund_method_text(row)+f"\n\nStatus: {'ACTIVE' if row['active'] else 'DISABLED'}",parse_mode='HTML',reply_markup=kb)
+    _screen_from_callback(c,_fund_method_text(row)+f"\n\nStatus: {'ACTIVE' if row['active'] else 'DISABLED'}",parse_mode='HTML',reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("fund_admin_toggle:"))
 @safe_handler
@@ -9078,7 +9125,7 @@ def otp_admin_active(c):
         kb.add(types.InlineKeyboardButton(f"{r['emoji']} {r['service_name']} • {int(r['live_countries'])} countries",callback_data=f"otp_admin_svc:{r['service_code']}"))
     kb.row(types.InlineKeyboardButton('⬅️ Back to Quick OTP Settings',callback_data='otp_admin_back'))
     text='📊 <b>ACTIVE SERVICES</b>\n\nOnly services with at least one country that is configured, profitable, and currently in stock are listed here.\n\n' + (f'🟢 {len(live)} active service(s).' if live else '⚪ No service is currently live for users.')
-    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,text,parse_mode='HTML',reply_markup=kb)
+    bot.answer_callback_query(c.id); _screen_from_callback(c,text,parse_mode='HTML',reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data=='otp_admin_back')
 @safe_handler
@@ -9091,16 +9138,16 @@ def otp_admin_back(c):
 def otp_admin_find_service(c):
     if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
     clear_state(c.from_user.id); update_state(c.from_user.id,flow='otp_find_service',step=None)
-    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,'🔎 <b>FIND GRIZZLY SERVICE</b>\n\nSend the service name or code.\nExamples: <code>WhatsApp</code>, <code>Telegram</code>, <code>wa</code>, <code>tg</code>',parse_mode='HTML',reply_markup=back_kb())
+    bot.answer_callback_query(c.id); _screen_from_callback(c,'🔎 <b>FIND GRIZZLY SERVICE</b>\n\nSend the service name or code.\nExamples: <code>WhatsApp</code>, <code>Telegram</code>, <code>wa</code>, <code>tg</code>',parse_mode='HTML',reply_markup=_screen_back_kb())
 
 def _handle_otp_find_service(m,state):
     if not is_super_admin(m.chat.id): clear_state(m.chat.id); return
     q=m.text.strip().lower()
     rows=fetchall('SELECT * FROM otp_services WHERE lower(service_name) LIKE ? OR lower(service_code) LIKE ? ORDER BY service_name LIMIT 30',(f'%{q}%',f'%{q}%'))
-    if not rows: return bot.send_message(m.chat.id,'❌ No matching service found. Try the exact Grizzly service code or a shorter name.')
+    if not rows: return _screen_send_for_chat(m.chat.id,'❌ No matching service found. Try the exact Grizzly service code or a shorter name.')
     kb=types.InlineKeyboardMarkup()
     for r in rows: kb.add(types.InlineKeyboardButton(f"{r['emoji']} {r['service_name']}",callback_data=f"otp_admin_svc:{r['service_code']}"))
-    clear_state(m.chat.id); bot.send_message(m.chat.id,f'🔎 <b>Matches for:</b> {html.escape(m.text.strip())}\n\nSelect a service:',parse_mode='HTML',reply_markup=kb)
+    clear_state(m.chat.id); _screen_send_for_chat(m.chat.id,f'🔎 <b>Matches for:</b> {html.escape(m.text.strip())}\n\nSelect a service:',parse_mode='HTML',reply_markup=kb)
 
 _FLOW_ROUTES[('otp_find_service',None)] = _handle_otp_find_service
 
@@ -9118,7 +9165,7 @@ def otp_admin_services(c):
     if (page+1)*per<total: nav.append(types.InlineKeyboardButton('Next ➡️',callback_data=f'otp_admin_services:{page+1}'))
     if nav: kb.row(*nav)
     kb.row(types.InlineKeyboardButton('🔄 Sync',callback_data='otp_admin_sync_services'))
-    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,f'🧩 <b>GRIZZLY SERVICES</b>\n\nShowing {page*per+1 if total else 0}-{min((page+1)*per,total)} of {total:,}.\n\nSelect a service to configure its countries and profit.',parse_mode='HTML',reply_markup=kb)
+    bot.answer_callback_query(c.id); _screen_from_callback(c,f'🧩 <b>GRIZZLY SERVICES</b>\n\nShowing {page*per+1 if total else 0}-{min((page+1)*per,total)} of {total:,}.\n\nSelect a service to configure its countries and profit.',parse_mode='HTML',reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_admin_svc:'))
 @safe_handler
@@ -9178,7 +9225,7 @@ def otp_admin_country_search(c):
     clear_state(c.from_user.id)
     update_state(c.from_user.id,flow='otp_find_country',step=None,otp_service=service)
     bot.answer_callback_query(c.id)
-    bot.send_message(c.from_user.id,
+    _screen_from_callback(c,
         f'{svc["emoji"]} <b>SEARCH COUNTRY • {html.escape(str(svc["service_name"]))}</b>\n\n'
         '🌍 Send a country name or code.\n'
         'Examples: <code>Nigeria</code>, <code>Ghana</code>, <code>234</code>',
@@ -9189,7 +9236,7 @@ def _handle_otp_find_country(m,state):
     service=state.get('otp_service')
     svc=fetchone('SELECT * FROM otp_services WHERE service_code=?',(service,))
     if not svc:
-        clear_state(m.chat.id); return bot.send_message(m.chat.id,'❌ Service not found.')
+        clear_state(m.chat.id); return _screen_send_for_chat(m.chat.id,'❌ Service not found.')
     try:
         otp_sync_countries(); _otp_ensure_service_countries(service)
     except Exception as exc:
@@ -9197,9 +9244,9 @@ def _handle_otp_find_country(m,state):
     q=m.text.strip().lower()
     rows=fetchall("SELECT * FROM otp_service_countries WHERE service_code=? AND (lower(name) LIKE ? OR lower(country_code) LIKE ?) ORDER BY name LIMIT 30",(service,f'%{q}%',f'%{q}%'))
     if not rows:
-        return bot.send_message(m.chat.id,
+        return _screen_send_for_chat(m.chat.id,
             f'❌ No country found for <b>{html.escape(m.text.strip())}</b>.\n\n'
-            'Try the full country name or country code.',parse_mode='HTML',reply_markup=back_kb())
+            'Try the full country name or country code.',parse_mode='HTML',reply_markup=_screen_back_kb())
     kb=types.InlineKeyboardMarkup()
     svc_cfg=fetchone('SELECT * FROM otp_services WHERE service_code=?',(service,))
     for r in rows:
@@ -9209,7 +9256,7 @@ def _handle_otp_find_country(m,state):
     kb.add(types.InlineKeyboardButton('🔎 Search Another Country',callback_data=f'otp_admin_country_search:{service}'))
     kb.add(types.InlineKeyboardButton(f'⬅️ Back to {svc["service_name"]}',callback_data=f'otp_admin_svc:{service}'))
     clear_state(m.chat.id)
-    bot.send_message(m.chat.id,
+    _screen_send_for_chat(m.chat.id,
         f'🔎 <b>COUNTRY RESULTS • {html.escape(str(svc["service_name"]))}</b>\n\n'
         f'Matches for: <code>{html.escape(m.text.strip())}</code>\n\n'
         'Select a country to manage its price, profit, stock visibility, or activation.',
@@ -9284,7 +9331,7 @@ def otp_profit_cb(c):
     kb=types.InlineKeyboardMarkup()
     for pct in (5,10,15,30,50): kb.add(types.InlineKeyboardButton(f'➕ {pct}%',callback_data=f'otp_profit_set:{service}:{code}:{pct}'))
     kb.add(types.InlineKeyboardButton('✍️ Manual percentage',callback_data=f'otp_profit_manual:{service}:{code}'))
-    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,f'📈 <b>{r["name"]}</b>\n\nChoose profit above the live Grizzly cost:',parse_mode='HTML',reply_markup=kb)
+    bot.answer_callback_query(c.id); _screen_from_callback(c,f'📈 <b>{r["name"]}</b>\n\nChoose profit above the live Grizzly cost:',parse_mode='HTML',reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_profit_set:'))
 @safe_handler
@@ -9301,16 +9348,16 @@ def otp_profit_manual_cb(c):
     _,service,code=c.data.split(':',2); r=fetchone('SELECT name FROM otp_service_countries WHERE service_code=? AND country_code=?',(service,code))
     if not r: return bot.answer_callback_query(c.id,'Not found',show_alert=True)
     clear_state(c.from_user.id); update_state(c.from_user.id,flow='otp_profit_manual',step=None,otp_service=service,otp_country=code)
-    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,f'✍️ Send profit percentage for <b>{r["name"]}</b>.\nExample: <code>22.5</code>',parse_mode='HTML',reply_markup=back_kb())
+    bot.answer_callback_query(c.id); _screen_from_callback(c,f'✍️ Send profit percentage for <b>{r["name"]}</b>.\nExample: <code>22.5</code>',parse_mode='HTML',reply_markup=_screen_back_kb())
 
 def _handle_otp_profit_manual(m,state):
     if not is_super_admin(m.chat.id): clear_state(m.chat.id); return
     service=state.get('otp_service'); code=state.get('otp_country')
     try: pct=float(m.text.strip())
-    except Exception: return bot.send_message(m.chat.id,'❌ Send a valid percentage, e.g. 25 or 22.5.')
-    if pct<=0 or pct>1000: return bot.send_message(m.chat.id,'❌ Percentage must be greater than 0 and at most 1000%.')
+    except Exception: return _screen_send_for_chat(m.chat.id,'❌ Send a valid percentage, e.g. 25 or 22.5.')
+    if pct<=0 or pct>1000: return _screen_send_for_chat(m.chat.id,'❌ Percentage must be greater than 0 and at most 1000%.')
     with db_tx() as conn: conn.execute('UPDATE otp_service_countries SET markup_percent=?,markup_fixed=0,explicit_price=NULL,profit_active=1,enabled=1,updated_at=? WHERE service_code=? AND country_code=?',(pct,_otp_now(),service,code))
-    clear_state(m.chat.id); bot.send_message(m.chat.id,f'✅ Profit set to {pct:g}%. This service/country is now 🟢 ACTIVE for users.',reply_markup=main_menu(m.chat.id))
+    clear_state(m.chat.id); _screen_send_for_chat(m.chat.id,f'✅ Profit set to {pct:g}%. This service/country is now 🟢 ACTIVE for users.',reply_markup=main_menu(m.chat.id))
 
 _FLOW_ROUTES[('otp_profit_manual',None)] = _handle_otp_profit_manual
 
@@ -9326,7 +9373,7 @@ def otp_global_profit_cb(c):
     kb.row(types.InlineKeyboardButton('➖ 5%',callback_data=f'otp_global_adjust:{service}:-5'),types.InlineKeyboardButton('➖ 10%',callback_data=f'otp_global_adjust:{service}:-10'))
     kb.add(types.InlineKeyboardButton('✍️ Set exact %',callback_data=f'otp_global_manual:{service}'))
     kb.add(types.InlineKeyboardButton('🧹 Remove / OFF',callback_data=f'otp_global_clear:{service}'))
-    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,f'📈 <b>GLOBAL PROFIT • {html.escape(svc["service_name"])}</b>\n\nCurrent: <b>{current}</b>\n\nThis applies to every country in this service except countries with a manual price. Manual-price countries are excluded and must be priced separately.',parse_mode='HTML',reply_markup=kb)
+    bot.answer_callback_query(c.id); _screen_from_callback(c,f'📈 <b>GLOBAL PROFIT • {html.escape(svc["service_name"])}</b>\n\nCurrent: <b>{current}</b>\n\nThis applies to every country in this service except countries with a manual price. Manual-price countries are excluded and must be priced separately.',parse_mode='HTML',reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_global_adjust:'))
 @safe_handler
@@ -9357,19 +9404,19 @@ def otp_global_manual_cb(c):
     service=c.data.split(':',1)[1]; svc=fetchone('SELECT service_name FROM otp_services WHERE service_code=?',(service,))
     if not svc: return bot.answer_callback_query(c.id,'Service not found.',show_alert=True)
     clear_state(c.from_user.id); update_state(c.from_user.id,flow='otp_global_manual',step=None,otp_service=service)
-    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,f'✍️ Send exact global profit percentage for <b>{html.escape(svc["service_name"])}</b>.\nExample: <code>25</code>\nUse <code>0</code> to keep prices at Grizzly cost (countries still need to be above cost to show users).',parse_mode='HTML',reply_markup=back_kb())
+    bot.answer_callback_query(c.id); _screen_from_callback(c,f'✍️ Send exact global profit percentage for <b>{html.escape(svc["service_name"])}</b>.\nExample: <code>25</code>\nUse <code>0</code> to keep prices at Grizzly cost (countries still need to be above cost to show users).',parse_mode='HTML',reply_markup=_screen_back_kb())
 
 def _handle_otp_global_manual(m,state):
     if not is_super_admin(m.chat.id): clear_state(m.chat.id); return
     service=state.get('otp_service')
     try: pct=float(m.text.strip())
-    except Exception: return bot.send_message(m.chat.id,'❌ Send a valid percentage, e.g. 25 or 12.5.')
-    if pct<0 or pct>1000: return bot.send_message(m.chat.id,'❌ Percentage must be between 0 and 1000%.')
+    except Exception: return _screen_send_for_chat(m.chat.id,'❌ Send a valid percentage, e.g. 25 or 12.5.')
+    if pct<0 or pct>1000: return _screen_send_for_chat(m.chat.id,'❌ Percentage must be between 0 and 1000%.')
     with db_tx() as conn:
         conn.execute('UPDATE otp_services SET global_profit_percent=?,updated_at=? WHERE service_code=?',(pct,_otp_now(),service))
         conn.execute('UPDATE otp_service_countries SET enabled=1,profit_active=1,updated_at=? WHERE service_code=? AND explicit_price IS NULL',(_otp_now(),service))
     _otp_post_universal_price_update(service,pct)
-    clear_state(m.chat.id); bot.send_message(m.chat.id,f'✅ Global profit set to {pct:g}% for this service. Manual-price countries remain excluded from this rule.',reply_markup=main_menu(m.chat.id))
+    clear_state(m.chat.id); _screen_send_for_chat(m.chat.id,f'✅ Global profit set to {pct:g}% for this service. Manual-price countries remain excluded from this rule.',reply_markup=main_menu(m.chat.id))
 
 _FLOW_ROUTES[('otp_global_manual',None)] = _handle_otp_global_manual
 
@@ -9388,20 +9435,20 @@ def otp_set_price_cb(c):
     _,service,code=c.data.split(':',2); r=fetchone('SELECT * FROM otp_service_countries WHERE service_code=? AND country_code=?',(service,code))
     if not r: return bot.answer_callback_query(c.id,'Not found',show_alert=True)
     clear_state(c.from_user.id); update_state(c.from_user.id,flow='otp_set_price',step=None,otp_service=service,otp_country=code)
-    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,f'💰 Send the final selling price in USDT for <b>{r["name"]}</b>.\nCurrent: {_otp_price(r,fetchone('SELECT * FROM otp_services WHERE service_code=?',(service,))):.2f}\nExample: <code>0.85</code>',parse_mode='HTML',reply_markup=back_kb())
+    bot.answer_callback_query(c.id); _screen_from_callback(c,f'💰 Send the final selling price in USDT for <b>{r["name"]}</b>.\nCurrent: {_otp_price(r,fetchone('SELECT * FROM otp_services WHERE service_code=?',(service,))):.2f}\nExample: <code>0.85</code>',parse_mode='HTML',reply_markup=_screen_back_kb())
 
 def _handle_otp_set_price(m,state):
     if not is_super_admin(m.chat.id): clear_state(m.chat.id); return
     service=state.get('otp_service'); code=state.get('otp_country')
     try: price=round(float(m.text.strip()),2)
-    except: return bot.send_message(m.chat.id,'❌ Invalid price. Send a number like 0.85')
-    if price<=0: return bot.send_message(m.chat.id,'❌ Price must be greater than 0.')
+    except: return _screen_send_for_chat(m.chat.id,'❌ Invalid price. Send a number like 0.85')
+    if price<=0: return _screen_send_for_chat(m.chat.id,'❌ Price must be greater than 0.')
     r=fetchone('SELECT grizzly_cost FROM otp_service_countries WHERE service_code=? AND country_code=?',(service,code))
-    if not r: return bot.send_message(m.chat.id,'❌ Country not found.')
-    if price<=float(r['grizzly_cost'] or 0): return bot.send_message(m.chat.id,f'❌ User price must be above Grizzly cost ({float(r["grizzly_cost"] or 0):.4f} USDT).')
+    if not r: return _screen_send_for_chat(m.chat.id,'❌ Country not found.')
+    if price<=float(r['grizzly_cost'] or 0): return _screen_send_for_chat(m.chat.id,f'❌ User price must be above Grizzly cost ({float(r["grizzly_cost"] or 0):.4f} USDT).')
     with db_tx() as conn: conn.execute('UPDATE otp_service_countries SET explicit_price=?,markup_percent=0,markup_fixed=0,profit_active=1,enabled=1,updated_at=? WHERE service_code=? AND country_code=?',(price,_otp_now(),service,code))
     _otp_post_country_price_update(service,code,'PRICE UPDATED')
-    clear_state(m.chat.id); bot.send_message(m.chat.id,f'✅ Final user price updated to {price:.2f} USDT. 🟢 Active.',reply_markup=main_menu(m.chat.id))
+    clear_state(m.chat.id); _screen_send_for_chat(m.chat.id,f'✅ Final user price updated to {price:.2f} USDT. 🟢 Active.',reply_markup=main_menu(m.chat.id))
 
 _FLOW_ROUTES[('otp_set_price',None)] = _handle_otp_set_price
 
@@ -9415,7 +9462,7 @@ def otp_admin_alerts(c):
     for r in rows:
         arrow='📈' if r['direction']=='increased' else '📉'
         lines.append(f'{arrow} {r["service_name"] or r["service_code"]} • {r["country_name"]}: {float(r["old_cost"]):.4f} → {float(r["new_cost"]):.4f} USDT')
-    bot.answer_callback_query(c.id); bot.send_message(c.from_user.id,'\n'.join(lines),parse_mode='HTML')
+    bot.answer_callback_query(c.id); _screen_from_callback(c,'\n'.join(lines),parse_mode='HTML')
 
 # OTP worker: keep the existing safe reconciliation/refund behavior, but use the selected service.
 def _otp_price_watcher():
