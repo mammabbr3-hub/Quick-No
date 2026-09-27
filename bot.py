@@ -2203,7 +2203,7 @@ BRAND = "✦ Mobile Business Hub 🤖"
 # result/record messages are NOT tracked, so they remain visible.
 _AUTO_OPTION_MESSAGES_LOCK = threading.RLock()
 _AUTO_OPTION_MESSAGES = {}  # chat_id -> message_id
-_AUTO_DELETE_OPTION_MESSAGES = True
+_AUTO_DELETE_OPTION_MESSAGES = False
 
 def _is_reply_keyboard_markup(reply_markup):
     return isinstance(reply_markup, types.ReplyKeyboardMarkup)
@@ -2230,41 +2230,13 @@ def _forget_tracked_option_message(chat_id, message_id=None):
             _AUTO_OPTION_MESSAGES.pop(key, None)
 
 def _delete_previous_option_message(chat_id, keep_message_id=None):
-    """Delete an old navigation message only when explicitly safe to do so.
-
-    This helper is intentionally NOT called before a handler runs. Deleting a
-    reply-keyboard message before the replacement menu is successfully sent can
-    leave the user/admin with no usable keyboard.
-    """
-    if not _AUTO_DELETE_OPTION_MESSAGES:
-        return
-    message_id = _get_tracked_option_message_id(chat_id)
-    if not message_id or (keep_message_id is not None and message_id == keep_message_id):
-        return
-    _forget_tracked_option_message(chat_id, message_id)
-    try:
-        bot.delete_message(chat_id, message_id)
-    except Exception:
-        logger.debug("Could not auto-delete option message %s for %s", message_id, chat_id, exc_info=True)
+    # Message retention policy: bot-generated messages are kept for tracking.
+    # Only an explicit, dedicated Work-explanation cleanup may delete a message.
+    return
 
 def _delete_old_option_after_success(chat_id, old_message_id, keep_message_id=None):
-    """Delete the previous menu only after a replacement menu was created.
-
-    If the action failed, or produced no replacement keyboard, the old menu is
-    deliberately retained so the user/admin is never left without navigation.
-    """
-    if not old_message_id or not _AUTO_DELETE_OPTION_MESSAGES:
-        return
-    new_message_id = _get_tracked_option_message_id(chat_id)
-    if not new_message_id or new_message_id == old_message_id:
-        return
-    if keep_message_id is not None and old_message_id == keep_message_id:
-        return
-    _forget_tracked_option_message(chat_id, old_message_id)
-    try:
-        bot.delete_message(chat_id, old_message_id)
-    except Exception:
-        logger.debug("Could not auto-delete old option message %s for %s", old_message_id, chat_id, exc_info=True)
+    # Never auto-delete bot-generated navigation/result messages.
+    return
 
 # Wrap send_message so every Reply Keyboard menu is automatically registered.
 # This covers main menu, Back/Refresh menus, admin menus, and other navigation
@@ -2412,13 +2384,10 @@ def _maintenance_allowed(update, chat_id) -> bool:
 
 
 def _show_wait_notice(chat_id):
-    """Show a short-lived, clear waiting message while a button action runs.
+    """Show the standard temporary acknowledgement before the action starts.
 
-    Telegram's native callback popup (answerCallbackQuery with show_alert=True)
-    is available only for inline callback buttons. The main menu uses reply
-    keyboard buttons, so those cannot display that native popup. This temporary
-    message gives both button types the same visible "Please wait" feedback and
-    is removed automatically when the action finishes.
+    It is removed at the exact action-start boundary; tracking/result messages
+    are never removed by this mechanism.
     """
     try:
         return bot.send_message(
@@ -2432,14 +2401,14 @@ def _show_wait_notice(chat_id):
 
 
 def _remove_wait_notice(chat_id, message):
+    # Only the dedicated temporary Please-wait notice may be removed.
+    # All generated/result/tracking messages remain permanently available.
     if not message:
         return
     try:
         bot.delete_message(chat_id, message.message_id)
     except Exception:
-        # The message may already have been deleted or Telegram may reject a
-        # very fast cleanup. Never let cleanup hide the real handler result.
-        logger.debug("Could not remove wait notice %s for %s", getattr(message, "message_id", None), chat_id, exc_info=True)
+        logger.debug("Could not remove temporary wait notice", exc_info=True)
 
 
 def safe_handler(func):
@@ -2481,6 +2450,11 @@ def safe_handler(func):
             keep_message_id = getattr(update.message, "message_id", None)
 
         wait_notice = _show_wait_notice(chat_id)
+        # The wait notice is intentionally temporary: show it first so the
+        # user knows the tap was received, then remove it at the exact
+        # boundary where the real action starts. Tracking/result messages
+        # are never affected by this.
+        _remove_wait_notice(chat_id, wait_notice)
         succeeded = False
         try:
             result = func(update, *args, **kwargs)
@@ -7006,21 +6980,8 @@ def _receive_work_proof(m, state):
 
 
 def _delete_submission_admin_messages(sub_id):
-    """Delete the proof (photo/video/document) that was sent to every
-    admin's chat for this submission. Called once the submission has
-    been posted to the work channel, so admin chats don't fill up with
-    old submissions."""
-    rows = fetchall("SELECT admin_id, message_id FROM submission_admin_msgs WHERE sub_id=?", (sub_id,))
-    for row in rows:
-        try:
-            bot.delete_message(row["admin_id"], row["message_id"])
-        except Exception:
-            # Message may already be gone, too old to delete, or the
-            # admin may have blocked/left — safe to ignore.
-            logger.exception("Failed to delete submission %s message for admin %s", sub_id, row["admin_id"])
-    with db_tx() as conn:
-        conn.execute("DELETE FROM submission_admin_msgs WHERE sub_id=?", (sub_id,))
-
+    # Keep submitted-work messages for audit/tracking; never auto-delete them.
+    return
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("sub_approve_"))
 @safe_handler
@@ -7309,18 +7270,8 @@ def _handle_bank_write(m, state):
 
 
 def _delete_bank_admin_messages(bank_id):
-    """Delete the pending-approval message sent to every admin for this
-    bank submission, once it has been approved/declined, so admin
-    chats don't fill up with old requests."""
-    rows = fetchall("SELECT admin_id, message_id FROM bank_admin_msgs WHERE bank_id=?", (bank_id,))
-    for row in rows:
-        try:
-            bot.delete_message(row["admin_id"], row["message_id"])
-        except Exception:
-            logger.exception("Failed to delete bank submission %s message for admin %s", bank_id, row["admin_id"])
-    with db_tx() as conn:
-        conn.execute("DELETE FROM bank_admin_msgs WHERE bank_id=?", (bank_id,))
-
+    # Keep bank-submission messages for audit/tracking; never auto-delete them.
+    return
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("bank_approve_"))
 @safe_handler
@@ -8162,16 +8113,36 @@ def _otp_http(action, **params):
     try: data=json.loads(body)
     except Exception: data=None
     if isinstance(data,dict):
-        activation_id=data.get('activationId') or data.get('activation_id') or data.get('id')
-        phone=data.get('phoneNumber') or data.get('phone_number')
+        # Grizzly V2 responses are JSON. Keep both the provider status and
+        # activation payload so every activation can be tracked independently.
+        activation_id=(data.get('activationId') or data.get('activation_id')
+                       or data.get('id') or (data.get('activation') or {}).get('activationId')
+                       if isinstance(data.get('activation'),dict) else
+                       data.get('activationId') or data.get('activation_id') or data.get('id'))
+        phone=(data.get('phoneNumber') or data.get('phone_number')
+               or (data.get('activation') or {}).get('phoneNumber')
+               if isinstance(data.get('activation'),dict) else
+               data.get('phoneNumber') or data.get('phone_number'))
         cost=data.get('activationCost') or data.get('activation_cost') or data.get('cost')
+        status_value=data.get('status') or data.get('state') or data.get('activationStatus')
         sms=data.get('sms') if isinstance(data.get('sms'),dict) else {}
-        otp=sms.get('code') or data.get('code') or data.get('otp')
-        if activation_id and phone: return {'status':'ok','raw':body,'activation_id':str(activation_id),'phone':str(phone),'cost':cost}
-        if otp: return {'status':'ok','raw':body,'otp':str(otp)}
+        if not sms and isinstance(data.get('data'),dict) and isinstance(data['data'].get('sms'),dict):
+            sms=data['data']['sms']
+        otp=(sms.get('code') or sms.get('otp') or data.get('code') or
+             data.get('otp') or data.get('smsCode'))
+        provider_status=str(status_value or '').upper().strip()
+        if activation_id and phone:
+            return {'status':'ok','raw':body,'activation_id':str(activation_id),
+                    'phone':str(phone),'cost':cost,'provider_status':provider_status,
+                    'can_get_another_sms':data.get('canGetAnotherSms')}
+        if otp:
+            return {'status':'ok','raw':body,'otp':str(otp),
+                    'provider_status':provider_status,'sms':sms}
+        if provider_status in {'STATUS_CANCEL','STATUS_CANCELLED','NO_ACTIVATION','ACCESS_CANCEL','ACCESS_CANCEL_ALREADY','STATUS_OK','STATUS_WAIT_CODE','STATUS_WAIT_RETRY','ACCESS_ACTIVATION'}:
+            return {'status':provider_status,'raw':body,'provider_status':provider_status,'data':data}
         # Catalogue/price endpoints legitimately return a plain JSON object
         # without a status field, so do not classify those as errors.
-        return {'status':str(data.get('status') or 'ok').lower(),'raw':body,'data':data}
+        return {'status':str(status_value or 'ok').lower(),'raw':body,'data':data,'provider_status':provider_status}
     if body.startswith('ACCESS_NUMBER:') or body.startswith('ACCESS_NUMBER_V2:'):
         p=body.split(':',2); return {'status':'ok','raw':body,'activation_id':p[1],'phone':p[2]} if len(p)==3 else {'status':'error','raw':body}
     if body.startswith('STATUS_OK:'): return {'status':'ok','raw':body,'otp':body.split(':',1)[1]}
@@ -8603,6 +8574,7 @@ def _otp_create_activation(user_id,service_code,country_code,source_chat_id):
     activation_id=result['activation_id']; phone=result['phone']; raw_cost=float(result.get('cost') or row['grizzly_cost'] or 0)
     with db_tx() as conn:
         conn.execute('UPDATE otp_orders SET status="waiting",phone_number=?,activation_id=?,raw_cost=?,updated_at=? WHERE order_id=?',(phone,activation_id,raw_cost,_otp_now(),order_id))
+        logger.info('Quick OTP activation created order=%s activation_id=%s phone=%s service=%s country=%s',order_id,activation_id,phone,service_code,row['country_code'])
         conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",(str(user_id),"OTP_PURCHASE",str(user_id),price,order_id,f'service={service_name}; country={row["name"]}; provider_cost={raw_cost:.6f}',_otp_now()))
     return fetchone('SELECT o.*,s.service_name FROM otp_orders o LEFT JOIN otp_services s ON s.service_code=o.service_code WHERE o.order_id=?',(order_id,)),None
 
@@ -8775,24 +8747,24 @@ def otp_new_cb(c):
         return bot.answer_callback_query(c.id,'This OTP request is no longer available.',show_alert=True)
     service,code=old['service_code'],old['country_code']
 
-    # IMPORTANT: Get New Number does NOT cancel the previous activation.
-    # Every requested number gets its own independent 5-minute manual-cancel
-    # window and 20-minute automatic expiry window. The previous number remains
-    # active until its own OTP arrives, the user cancels it after 5 minutes, or
-    # its 20-minute expiry is reached.
+    # IMPORTANT: this is a NEW Grizzly activation. The old activation is never
+    # cancelled, released, refunded, edited, or reused by this action.
     bot.answer_callback_query(c.id,'Getting a new number…')
-    result,msg=_otp_create_activation(c.from_user.id,service,code,c.message.chat.id)
+    try:
+        result,msg=_otp_create_activation(c.from_user.id,service,code,c.message.chat.id)
+    except Exception as exc:
+        logger.exception('Quick OTP new-number creation failed: %s',exc)
+        return bot.send_message(c.message.chat.id,'⚠️ We could not request the new number right now. Please try again.',parse_mode='HTML')
     if not result:
-        # The old activation was already released/refunded, so report the
-        # failure without charging the user again.
-        return bot.answer_callback_query(c.id, str(msg)[:190], show_alert=True)
+        return bot.send_message(c.message.chat.id,str(msg),parse_mode='HTML')
 
-    # Reuse the SAME Telegram message for the new number instead of creating
-    # another waiting message. This keeps the OTP screen clean.
+    # Give the new activation its own permanent tracking message. The worker
+    # polls by activation_id, so old and new numbers can receive OTPs independently.
     text=_otp_waiting_text(dict(result),1200,300)
-    _otp_update_message(c.message.chat.id,c.message.message_id,text,_otp_kb(result['order_id'],service,code,300))
+    sent=bot.send_message(c.message.chat.id,text,parse_mode='HTML',reply_markup=_otp_kb(result['order_id'],service,code,300))
     with db_tx() as conn:
-        conn.execute('UPDATE otp_orders SET chat_id=?,message_id=?,updated_at=? WHERE order_id=?',(str(c.message.chat.id),c.message.message_id,_otp_now(),result['order_id']))
+        conn.execute('UPDATE otp_orders SET chat_id=?,message_id=?,updated_at=? WHERE order_id=?',
+                     (str(sent.chat.id),sent.message_id,_otp_now(),result['order_id']))
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_cancel:'))
 @safe_handler
@@ -8813,8 +8785,8 @@ def otp_cancel_cb(c):
         conn.execute('UPDATE otp_orders SET status="cancelled",refunded=1,updated_at=? WHERE order_id=?',(_otp_now(),order_id))
         conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",(str(cur['user_id']),"OTP_REFUND",str(cur['user_id']),cur['selling_price'],order_id,"manual cancel",_otp_now()))
     bot.answer_callback_query(c.id,'Cancelled and refunded.')
-    try: bot.delete_message(o['chat_id'],o['message_id'])
-    except Exception: pass
+    try: _otp_update_message(o['chat_id'],o['message_id'],f'❌ <b>OTP REQUEST CANCELLED</b>\n\n🆔 Request ID: <code>{html.escape(str(o["order_id"]))}</code>\n\n💰 Your refund has been processed.',types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{o["order_id"]}')))
+    except Exception: logger.exception('Could not update cancelled OTP message')
 
 @bot.message_handler(func=lambda m: m.text == '📱 Quick OTP Settings' and is_super_admin(m.chat.id))
 @safe_handler
@@ -8936,6 +8908,55 @@ def _otp_admin_show_countries(chat_id, service, page, svc):
     kb.row(types.InlineKeyboardButton('⬅️ Services',callback_data='otp_admin_services:0'))
     bot.send_message(chat_id,f'{svc["emoji"]} <b>{html.escape(svc["service_name"])}</b>\n\n🌍 Configure a country below.\n🟢 = visible to users\n⚪ = hidden until profit is activated.\n💹 Prices/stock refreshed from Grizzly for this page.\n📄 Page {page+1}/{max(1,(total+per-1)//per)}',parse_mode='HTML',reply_markup=kb)
 
+@bot.callback_query_handler(func=lambda c: c.data.startswith('otp_admin_country_search:'))
+@safe_handler
+def otp_admin_country_search(c):
+    if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
+    service=c.data.split(':',1)[1]
+    svc=fetchone('SELECT service_name,emoji FROM otp_services WHERE service_code=?',(service,))
+    if not svc: return bot.answer_callback_query(c.id,'Service not found.',show_alert=True)
+    clear_state(c.from_user.id)
+    update_state(c.from_user.id,flow='otp_find_country',step=None,otp_service=service)
+    bot.answer_callback_query(c.id)
+    bot.send_message(c.from_user.id,
+        f'{svc["emoji"]} <b>SEARCH COUNTRY • {html.escape(str(svc["service_name"]))}</b>\n\n'
+        '🌍 Send a country name or code.\n'
+        'Examples: <code>Nigeria</code>, <code>Ghana</code>, <code>234</code>',
+        parse_mode='HTML',reply_markup=back_kb())
+
+def _handle_otp_find_country(m,state):
+    if not is_super_admin(m.chat.id): clear_state(m.chat.id); return
+    service=state.get('otp_service')
+    svc=fetchone('SELECT * FROM otp_services WHERE service_code=?',(service,))
+    if not svc:
+        clear_state(m.chat.id); return bot.send_message(m.chat.id,'❌ Service not found.')
+    try:
+        otp_sync_countries(); _otp_ensure_service_countries(service)
+    except Exception as exc:
+        logger.warning('Country catalogue sync failed during search for %s: %s',service,exc)
+    q=m.text.strip().lower()
+    rows=fetchall("SELECT * FROM otp_service_countries WHERE service_code=? AND (lower(name) LIKE ? OR lower(country_code) LIKE ?) ORDER BY name LIMIT 30",(service,f'%{q}%',f'%{q}%'))
+    if not rows:
+        return bot.send_message(m.chat.id,
+            f'❌ No country found for <b>{html.escape(m.text.strip())}</b>.\n\n'
+            'Try the full country name or country code.',parse_mode='HTML',reply_markup=back_kb())
+    kb=types.InlineKeyboardMarkup()
+    svc_cfg=fetchone('SELECT * FROM otp_services WHERE service_code=?',(service,))
+    for r in rows:
+        status='🟢' if _otp_profit_active(r,svc_cfg) else '⚪'
+        price='N/A' if r['grizzly_cost'] is None else f'{_otp_price(r,svc_cfg):.2f} USDT'
+        kb.add(types.InlineKeyboardButton(f'{status} {r["flag"]} {r["name"]} • {price}',callback_data=f'otp_admin_sc:{service}:{r["country_code"]}'))
+    kb.add(types.InlineKeyboardButton('🔎 Search Another Country',callback_data=f'otp_admin_country_search:{service}'))
+    kb.add(types.InlineKeyboardButton(f'⬅️ Back to {svc["service_name"]}',callback_data=f'otp_admin_svc:{service}'))
+    clear_state(m.chat.id)
+    bot.send_message(m.chat.id,
+        f'🔎 <b>COUNTRY RESULTS • {html.escape(str(svc["service_name"]))}</b>\n\n'
+        f'Matches for: <code>{html.escape(m.text.strip())}</code>\n\n'
+        'Select a country to manage its price, profit, stock visibility, or activation.',
+        parse_mode='HTML',reply_markup=kb)
+
+_FLOW_ROUTES[('otp_find_country',None)] = _handle_otp_find_country
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_admin_countries:'))
 @safe_handler
 def otp_admin_countries_page(c):
@@ -8960,6 +8981,7 @@ def otp_admin_sc(c):
     kb.add(types.InlineKeyboardButton('💵 Manual Price',callback_data=f'otp_set_price:{service}:{code}'))
     if r['explicit_price'] is not None:
         kb.add(types.InlineKeyboardButton('🧹 Remove Manual Price',callback_data=f'otp_clear_price:{service}:{code}'))
+    kb.add(types.InlineKeyboardButton('🔎 Search Country',callback_data=f'otp_admin_country_search:{service}'))
     kb.add(types.InlineKeyboardButton('📈 Service Global %',callback_data=f'otp_global_profit:{service}'))
     kb.add(types.InlineKeyboardButton('🔴 Turn OFF Service' if svc and int(svc['enabled']) else '🟢 Turn ON Service',callback_data=f'otp_service_toggle:{service}'))
     kb.add(types.InlineKeyboardButton('🔴 Hide Country' if r['enabled'] else '🟢 Activate Country',callback_data=f'otp_toggle:{service}:{code}'))
@@ -9166,8 +9188,13 @@ def _otp_worker():
                         if cur:
                             adjust_balance(conn,cur['user_id'],'usdt',float(cur['selling_price']),'OTP_REFUND',reason=f'Quick OTP auto cancel {o["order_id"]}',related_txn=o['order_id'],processed_by=cur['user_id'])
                             conn.execute('UPDATE otp_orders SET status="expired",refunded=1,updated_at=? WHERE order_id=?',(_otp_now(),o['order_id']))
-                    try: bot.delete_message(o['chat_id'],o['message_id'])
-                    except Exception: pass
+                    try:
+                        _otp_update_message(
+                            o['chat_id'], o['message_id'],
+                            f'⌛ <b>OTP REQUEST EXPIRED</b>\n\n🆔 Request ID: <code>{html.escape(str(o["order_id"]))}</code>\n\n💰 Your refund has been processed because no OTP was received within 20 minutes.',
+                            types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{o["order_id"]}'))
+                        )
+                    except Exception: logger.exception('Could not update expired OTP message')
                     continue
                 if o['chat_id'] and o['message_id']:
                     _otp_update_message(o['chat_id'],o['message_id'],_otp_waiting_text(o,auto,manual),_otp_kb(o['order_id'],o['service_code'],o['country_code'],manual))
@@ -9176,6 +9203,7 @@ def _otp_worker():
                     try: r=_otp_http('getStatusV2',id=o['activation_id'])
                     except Exception: continue
                     if r.get('otp'):
+                        logger.info('Quick OTP code received order=%s activation_id=%s',o['order_id'],o['activation_id'])
                         otp=r['otp']
                         try: _otp_http('setStatus',id=o['activation_id'],status='6')
                         except Exception: pass
@@ -9204,14 +9232,19 @@ def _otp_worker():
                             )
                         except Exception as exc:
                             logger.warning('OTP received UI update/notification failed: %s',exc)
-                    elif r.get('raw') in {'STATUS_CANCEL','NO_ACTIVATION'}:
+                    elif r.get('provider_status') in {'STATUS_CANCEL','STATUS_CANCELLED','NO_ACTIVATION','ACCESS_CANCEL','ACCESS_CANCEL_ALREADY'} or r.get('raw') in {'STATUS_CANCEL','NO_ACTIVATION','ACCESS_CANCEL','ACCESS_CANCEL_ALREADY'}:
                         with db_tx() as conn:
                             cur=conn.execute('SELECT * FROM otp_orders WHERE order_id=? AND status="waiting" AND refunded=0',(o['order_id'],)).fetchone()
                             if cur:
                                 adjust_balance(conn,cur['user_id'],'usdt',float(cur['selling_price']),'OTP_REFUND',reason=f'Quick OTP provider cancel {o["order_id"]}',related_txn=o['order_id'],processed_by=cur['user_id'])
                                 conn.execute('UPDATE otp_orders SET status="cancelled",refunded=1,updated_at=? WHERE order_id=?',(_otp_now(),o['order_id']))
-                        try: bot.delete_message(o['chat_id'],o['message_id'])
-                        except Exception: pass
+                        try:
+                            _otp_update_message(
+                                o['chat_id'], o['message_id'],
+                                f'❌ <b>OTP REQUEST CANCELLED</b>\n\n🆔 Request ID: <code>{html.escape(str(o["order_id"]))}</code>\n\n💰 Your refund has been processed.',
+                                types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{o["order_id"]}'))
+                            )
+                        except Exception: logger.exception('Could not update provider-cancelled OTP message')
             live={x['order_id'] for x in active}; last_status={k:v for k,v in last_status.items() if k in live}
         except Exception: logger.exception('Quick OTP worker error')
         time.sleep(1)
@@ -9226,13 +9259,14 @@ def generic_state_router(m):
         return  # No active flow and no menu button matched — nothing to do.
 
     flow_feature = {
+        "otp_find_country": None,
         "fund_wallet": "fund_wallet",
         "withdraw": "withdraw",
         "bank": "withdrawal_payment_details",
         "support": "support",
         "work": "submit_work",
         "custom_handle_input": None,
-    }.get(flow, "__admin__" if flow and (flow.startswith("admin_") or flow.startswith("otp_find_service")) else None)
+    }.get(flow, "__admin__" if flow and (flow.startswith("admin_") or flow.startswith("otp_find_service") or flow.startswith("otp_find_country")) else None)
     if flow_feature and flow_feature != "__admin__" and not is_feature_enabled(flow_feature, m.chat.id):
         clear_state(m.chat.id)
         bot.send_message(m.chat.id, "🚫 This feature is currently unavailable. Please choose another option.", reply_markup=main_menu(m.chat.id))
