@@ -8687,7 +8687,11 @@ def _otp_kb(order_id,service_code,country_code,manual_remaining, phone_number=No
         except Exception:
             pass
     kb.row(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{order_id}'))
-    kb.row(types.InlineKeyboardButton(label,callback_data=f'otp_cancel:{order_id}'))
+    # Manual cancel must not be offered before the 5-minute threshold.
+    # The countdown remains visible in the waiting text; once it reaches zero
+    # the real Cancel button is added.
+    if manual_remaining <= 0:
+        kb.row(types.InlineKeyboardButton(label,callback_data=f'otp_cancel:{order_id}'))
     return kb
 
 def _otp_create_activation(user_id,service_code,country_code,source_chat_id):
@@ -9434,10 +9438,22 @@ def _otp_worker():
                     continue
                 if o['chat_id'] and o['message_id']:
                     _otp_update_message(o['chat_id'],o['message_id'],_otp_waiting_text(o,auto,manual),_otp_kb(o['order_id'],o['service_code'],o['country_code'],manual,o.get('phone_number')))
-                if elapsed-last_status.get(o['order_id'],-999)>=5:
+                if elapsed-last_status.get(o['order_id'],-999)>=3:
                     last_status[o['order_id']]=elapsed
                     try: r=_otp_http('getStatusV2',id=o['activation_id'])
                     except Exception: continue
+                    # The API poll is also a synchronization point for the
+                    # waiting card. Recalculate the timers immediately after
+                    # every status check, whether an OTP was found or not.
+                    if not r.get('otp') and o['chat_id'] and o['message_id']:
+                        try:
+                            fresh_now=datetime.now(timezone.utc)
+                            fresh_elapsed=(fresh_now-datetime.fromisoformat(o['created_at'])).total_seconds()
+                            fresh_auto=max(0,1200-int(fresh_elapsed)); fresh_manual=max(0,300-int(fresh_elapsed))
+                            fresh=dict(o)
+                            _otp_update_message(o['chat_id'],o['message_id'],_otp_waiting_text(fresh,fresh_auto,fresh_manual),_otp_kb(o['order_id'],o['service_code'],o['country_code'],fresh_manual,o.get('phone_number')))
+                        except Exception:
+                            logger.warning('OTP waiting-clock sync after status check failed for order=%s',o['order_id'])
                     if r.get('otp'):
                         logger.info('Quick OTP code received order=%s activation_id=%s',o['order_id'],o['activation_id'])
                         otp=r['otp']
