@@ -3188,6 +3188,7 @@ def _community_settings_text():
         "",
         "Configure the two required user join points and the internal destinations.",
         "👥 User Group + 📢 User Channel are mandatory for normal users.",
+        "📝 Each destination is configured in 2 separate steps: Chat ID first, then Join/Invite link.",
         "",
     ]
     for k in COMMUNITY_KEYS:
@@ -3298,62 +3299,54 @@ def community_set_cb(c):
     if kind not in COMMUNITY_KEYS:
         return
     clear_state(c.message.chat.id)
-    update_state(c.message.chat.id, flow="community_set", step="value", kind=kind)
+    update_state(c.message.chat.id, flow="community_set", step="id", kind=kind)
     bot.answer_callback_query(c.id)
     current = _community_get(kind)
+    current_id = current.get("id") or ""
     current_link = current.get("link") or ""
     _screen_from_callback(
         c,
         f"✏️ <b>{COMMUNITY_LABELS[kind]}</b>\n\n"
-        "Send the Telegram numeric chat ID and optional link in one line:\n\n"
-        "<code>-1001234567890 | https://t.me/example</code>\n\n"
-        "You can also use a public handle such as <code>@example</code>.\n"
-        "For a private group/channel, paste its invite link.\n"
-        f"Current link: <code>{html.escape(current_link or 'auto/public if available')}</code>\n\n"
+        "<b>Step 1 of 2 — Chat ID</b>\n"
+        "Send the Telegram numeric chat ID only. Do not add the link on this step.\n\n"
+        "Example: <code>-1001234567890</code>\n\n"
+        "The bot will check that it can access the chat and that the chat type is correct.\n"
+        f"Current ID: <code>{html.escape(str(current_id or 'not set'))}</code>\n\n"
         "The bot must already be a member/admin of the target chat.",
         parse_mode="HTML",
         reply_markup=back_kb(),
     )
 
-def _handle_community_set(m, state):
-    if not is_super_admin(m.chat.id):
-        clear_state(m.chat.id)
-        return
+
+def _community_save_after_link(m, state, cid, link):
+    """Finish a community destination after ID and link were collected separately."""
     kind = state.get("kind")
     if kind not in COMMUNITY_KEYS:
         clear_state(m.chat.id)
         return
 
-    raw = (m.text or "").strip()
-    parts = [x.strip() for x in raw.split("|", 1)]
-    cid = parts[0] if parts else ""
-    link = parts[1] if len(parts) > 1 else ""
-
-    if not cid.lstrip("-").isdigit() or not cid.startswith("-100"):
-        _screen_send_for_chat(
-            m.chat.id,
-            "❌ Invalid Telegram supergroup/channel ID. It should look like <code>-1001234567890</code>.",
-            parse_mode="HTML",
-            reply_markup=back_kb(),
-        )
-        return
-
     try:
-        normalized_link = _community_normalize_link(link)
+        normalized_link = "" if str(link).strip().upper() == "SKIP" else _community_normalize_link(link)
         chat = bot.get_chat(int(cid))
         chat_type = str(getattr(chat, "type", "") or "")
         if kind == "user_group" and chat_type not in ("group", "supergroup"):
             raise ValueError("User Group must be a Telegram group/supergroup.")
         if kind == "user_channel" and chat_type != "channel":
             raise ValueError("User Channel must be a Telegram channel.")
+
+        # For public chats we can derive a t.me URL from the username.
+        # For private required onboarding chats, the admin must supply an invite link.
         if not normalized_link:
             normalized_link = _community_effective_link(kind, chat)
             if kind in COMMUNITY_JOIN_KEYS and not normalized_link:
-                raise ValueError("This required community has no public username. Please provide its private invite link.")
+                raise ValueError(
+                    "This required Group/Channel has no public username. "
+                    "Send its private invite link now."
+                )
     except ValueError as exc:
         _screen_send_for_chat(
             m.chat.id,
-            f"❌ {html.escape(str(exc))}",
+            f"❌ {html.escape(str(exc))}\n\nPlease send the link again, or send <code>SKIP</code> only when the chat has a public username.",
             parse_mode="HTML",
             reply_markup=back_kb(),
         )
@@ -3362,7 +3355,7 @@ def _handle_community_set(m, state):
         logger.exception("Could not validate community destination %s", cid)
         _screen_send_for_chat(
             m.chat.id,
-            "❌ The bot cannot access that chat. Add the bot to the group/channel first, then try again.",
+            "❌ The bot cannot access that chat. Confirm the numeric ID is correct and that the bot is already a member/admin, then send the ID again.",
             reply_markup=back_kb(),
         )
         return
@@ -3380,8 +3373,94 @@ def _handle_community_set(m, state):
         reply_markup=main_menu(m.chat.id),
     )
 
+
+def _handle_community_set(m, state):
+    if not is_super_admin(m.chat.id):
+        clear_state(m.chat.id)
+        return
+    kind = state.get("kind")
+    step = state.get("step")
+    if kind not in COMMUNITY_KEYS:
+        clear_state(m.chat.id)
+        return
+
+    raw = (m.text or "").strip()
+
+    if step == "id":
+        # Telegram basic groups use negative IDs; supergroups/channels usually
+        # use -100... IDs. Do not incorrectly reject a valid basic-group ID.
+        if not raw.lstrip("-").isdigit() or not raw.startswith("-") or int(raw) >= 0:
+            _screen_send_for_chat(
+                m.chat.id,
+                "❌ Invalid Telegram chat ID. Send the numeric negative chat ID only, for example <code>-1001234567890</code>.",
+                parse_mode="HTML",
+                reply_markup=back_kb(),
+            )
+            return
+
+        cid = int(raw)
+        try:
+            chat = bot.get_chat(cid)
+            chat_type = str(getattr(chat, "type", "") or "")
+            if kind == "user_group" and chat_type not in ("group", "supergroup"):
+                raise ValueError("User Group must be a Telegram group/supergroup.")
+            if kind == "user_channel" and chat_type != "channel":
+                raise ValueError("User Channel must be a Telegram channel.")
+        except ValueError as exc:
+            _screen_send_for_chat(
+                m.chat.id,
+                f"❌ {html.escape(str(exc))}",
+                parse_mode="HTML",
+                reply_markup=back_kb(),
+            )
+            return
+        except Exception:
+            logger.exception("Could not validate community destination %s", cid)
+            _screen_send_for_chat(
+                m.chat.id,
+                "❌ The bot cannot access that chat. Confirm the ID is correct and that the bot is already a member/admin of the target chat, then send the ID again.",
+                reply_markup=back_kb(),
+            )
+            return
+
+        # Keep the ID in the FSM only until the second step is completed.
+        update_state(m.chat.id, step="link", kind=kind, cid=str(cid))
+        current_link = _community_link(kind)
+        _screen_send_for_chat(
+            m.chat.id,
+            f"✅ Chat ID verified: <code>{cid}</code>\n\n"
+            "<b>Step 2 of 2 — Join Link</b>\n"
+            "Now send the Group/Channel link separately.\n\n"
+            "Public: <code>https://t.me/example</code> or <code>@example</code>\n"
+            "Private: paste the invite link, e.g. <code>https://t.me/+AbCd...</code>\n\n"
+            "If it is a public chat and the bot can detect its username, send <code>SKIP</code>.\n"
+            f"Current saved link: <code>{html.escape(current_link or 'not set')}</code>",
+            parse_mode="HTML",
+            reply_markup=back_kb(),
+        )
+        return
+
+    if step == "link":
+        cid = state.get("cid")
+        if not cid:
+            clear_state(m.chat.id)
+            bot.send_message(m.chat.id, "⚠️ The community setup session expired. Please open Community Settings and start again.", reply_markup=main_menu(m.chat.id))
+            return
+        _community_save_after_link(m, state, int(cid), raw)
+        return
+
+    clear_state(m.chat.id)
+    bot.send_message(m.chat.id, "⚠️ The community setup session expired. Please start again.", reply_markup=main_menu(m.chat.id))
+
 def _user_join_requirements():
-    return [("user_group", "👥 Group"), ("user_channel", "📢 Channel")]
+    # These are the only two destinations that normal users must join before
+    # they can use the bot. Internal work/support/audit destinations are not
+    # onboarding requirements.
+    return [
+        ("user_group", "👥 Join Our Group"),
+        ("user_channel", "📢 Join Our Channel"),
+    ]
+
 
 def _user_is_joined(chat_id):
     missing = []
@@ -3389,7 +3468,6 @@ def _user_is_joined(chat_id):
         cid = _community_id(kind)
         link = _community_link(kind)
         if not cid:
-            # Mandatory destinations must never silently bypass the gate.
             missing.append((kind, label, link))
             continue
         try:
@@ -3405,8 +3483,9 @@ def _user_is_joined(chat_id):
             missing.append((kind, label, _community_effective_link(kind)))
     return missing
 
+
 def _join_gate(chat_id, message=None):
-    """Require both public onboarding destinations before normal bot access."""
+    """Require both onboarding destinations before normal bot access."""
     if is_admin(chat_id):
         return True
 
@@ -3414,26 +3493,30 @@ def _join_gate(chat_id, message=None):
     if not missing:
         return True
 
-    # If the community is not configured correctly, don't expose a broken
-    # Join button. Tell the user the service is being configured instead.
-    has_unusable_requirement = any(not link for _, _, link in missing)
+    # Always present both onboarding buttons when their links are configured.
+    # This fixes the old UI where users could see only "I Joined" after one
+    # requirement was already satisfied.
+    configured = {kind: (label, link) for kind, label, link in missing}
     kb = types.InlineKeyboardMarkup()
-    for kind, label, link in missing:
+    for kind, label in _user_join_requirements():
+        link = configured.get(kind, (label, _community_effective_link(kind)))[1]
         if link:
-            kb.add(types.InlineKeyboardButton(f"➡️ Join {label}", url=link))
-    kb.add(types.InlineKeyboardButton("✅ I Joined — Check Again", callback_data="community_join_check"))
+            kb.add(types.InlineKeyboardButton(label, url=link))
+
+    kb.add(types.InlineKeyboardButton("✅ I've Joined — Check Again", callback_data="community_join_check"))
 
     text = (
-        "🔐 <b>Community Join Required</b>\n\n"
-        "Before using the bot, please join both the required community spaces below:\n\n"
-        "1️⃣ 👥 <b>Group</b>\n"
-        "2️⃣ 📢 <b>Channel</b>\n\n"
-        "After joining both, tap <b>✅ I Joined — Check Again</b>."
+        "🔐 <b>Join Required Before Using the Bot</b>\n\n"
+        "Please join both of these official community spaces first:\n\n"
+        "👥 <b>Group</b>\n"
+        "📢 <b>Channel</b>\n\n"
+        "Use the two Join buttons above, then tap <b>✅ I've Joined — Check Again</b>."
     )
-    if has_unusable_requirement:
+
+    if any(not link for _, _, link in missing):
         text += (
-            "\n\n⚠️ One of the required Join links is not configured correctly yet. "
-            "Please try again shortly."
+            "\n\n⚠️ One required community link is not configured yet. "
+            "The administrator needs to finish Community Settings."
         )
 
     try:
@@ -3452,6 +3535,7 @@ def _join_gate(chat_id, message=None):
         if message is not None:
             bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
     return False
+
 
 @bot.callback_query_handler(func=lambda c: c.data == "community_join_check")
 @safe_handler
