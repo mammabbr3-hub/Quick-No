@@ -1,3 +1,0 @@
-pyTelegramBotAPI>=4.26.0
-pycountry>=24.6.1
-countryinfo>=0.1.2
