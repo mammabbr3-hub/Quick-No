@@ -1,0 +1,39 @@
+MOBILE DIGITAL HUB — COMMUNITY COMPLETE AUDIT / FIX
+Date: 2026-09-28
+
+Scope:
+- Community Settings and all configured destinations.
+- Required user onboarding: User Group + User Channel.
+- Membership verification and "I Joined — Check Again" flow.
+- Global enforcement so users cannot bypass the join gate through old menus/callbacks.
+
+Fixes:
+1. User Group and User Channel are explicit mandatory join points.
+2. Join buttons are generated for every missing requirement.
+3. "I Joined — Check Again" performs a fresh Telegram membership check.
+4. Membership accepts member/administrator/creator and restricted members whose
+   is_member flag is true; left/kicked/non-member states are rejected.
+5. Membership-check errors fail closed instead of granting access.
+6. The join gate is enforced globally for normal user handlers, not only /start.
+7. Admins remain exempt so Community Settings and system administration remain usable.
+8. Repeated verification edits the existing onboarding message instead of stacking
+   unnecessary gate messages.
+9. Public @handles are accepted and normalized to https://t.me/... .
+10. Public chat usernames can be auto-used as the join link when no link is supplied.
+11. Private required communities must have an invite link configured.
+12. Community destination setup validates Telegram chat IDs and expected chat types:
+    User Group = group/supergroup; User Channel = channel.
+13. Added a Full Community Check that verifies IDs, chat types, links and bot
+    membership status for the required destinations.
+14. Internal destinations (Submission, Approved Work, Bank Store, Support, Audit)
+    remain internal and are never treated as user join requirements.
+15. Existing non-community bot features were not intentionally redesigned.
+
+Validation:
+- Python compile: PASS
+- Single Community Settings section: PASS
+- Required join keys present: PASS
+- Join/check callback present: PASS
+- Global join gate present: PASS
+- Membership status handling present: PASS
+- Public @handle normalization present: PASS

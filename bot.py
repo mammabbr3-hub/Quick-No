@@ -2950,6 +2950,17 @@ def safe_handler(func):
             except Exception:
                 logger.exception("Failed to send ban notice to %s", chat_id)
             return
+
+        # Community onboarding gate: normal users must remain members of both
+        # required destinations. /start and the verification callback are
+        # allowed through so onboarding can be displayed/re-checked.
+        if (
+            not is_admin(chat_id)
+            and func.__name__ not in {"start", "community_join_check_cb"}
+            and not _join_gate(chat_id)
+        ):
+            return
+
         # System-wide maintenance gate. Admins remain fully operational;
         # users can still open and complete Support requests.
         if maintenance_enabled() and not is_admin(chat_id):
@@ -3111,6 +3122,9 @@ COMMUNITY_LABELS = {
     "support_channel": "🎧 Support Channel",
     "audit_channel": "🔐 Audit Channel",
 }
+# These two are the public onboarding requirements. Internal destinations
+# are deliberately excluded from the join gate.
+COMMUNITY_JOIN_KEYS = ("user_group", "user_channel")
 
 def _community_get(kind):
     raw = get_setting(COMMUNITY_KEYS[kind], "") or ""
@@ -3121,8 +3135,24 @@ def _community_get(kind):
         # Backward-compatible: allow a plain numeric chat id.
         return {"id": raw} if str(raw).strip() else {}
 
+def _community_normalize_link(link):
+    link = (link or "").strip()
+    if not link:
+        return ""
+    if link.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]{5,32}", link):
+        return f"https://t.me/{link[1:]}"
+    if re.match(r"^https?://t\.me/[A-Za-z0-9_+/?.=-]+$", link):
+        return link
+    if re.match(r"^tg://", link):
+        return link
+    raise ValueError("Invalid Telegram link. Use @username, https://t.me/username, or a private invite link.")
+
 def _community_set(kind, chat_id, link="", admin_id=None):
-    set_setting(COMMUNITY_KEYS[kind], json.dumps({"id": str(chat_id), "link": (link or "").strip()}), admin_id)
+    set_setting(
+        COMMUNITY_KEYS[kind],
+        json.dumps({"id": str(chat_id), "link": _community_normalize_link(link)}),
+        admin_id,
+    )
 
 def _community_id(kind):
     v = _community_get(kind).get("id")
@@ -3134,15 +3164,76 @@ def _community_id(kind):
 def _community_link(kind):
     return str(_community_get(kind).get("link") or "").strip()
 
+def _community_effective_link(kind, chat=None):
+    """Return configured invite/public link, or derive a public t.me link."""
+    saved = _community_link(kind)
+    if saved:
+        return saved
+    try:
+        if chat is None:
+            cid = _community_id(kind)
+            if not cid:
+                return ""
+            chat = bot.get_chat(cid)
+        username = getattr(chat, "username", None)
+        if username:
+            return f"https://t.me/{username}"
+    except Exception:
+        logger.exception("Could not resolve public link for community %s", kind)
+    return ""
+
 def _community_settings_text():
-    lines=["⚙️ <b>COMMUNITY SETTINGS</b>", "", "Configure where users must join, where public broadcasts/prices are posted, and where internal business records are delivered.", ""]
+    lines = [
+        "⚙️ <b>COMMUNITY SETTINGS</b>",
+        "",
+        "Configure the two required user join points and the internal destinations.",
+        "👥 User Group + 📢 User Channel are mandatory for normal users.",
+        "",
+    ]
     for k in COMMUNITY_KEYS:
-        d=_community_get(k); cid=d.get("id") or "Not set"; link=d.get("link") or "—"
-        lines.append(f"{COMMUNITY_LABELS[k]}\n🆔 <code>{html.escape(str(cid))}</code>\n🔗 {html.escape(str(link))}")
+        d = _community_get(k)
+        cid = d.get("id") or "Not set"
+        link = d.get("link") or "Auto/public link if available"
+        required = " • <b>REQUIRED</b>" if k in COMMUNITY_JOIN_KEYS else ""
+        lines.append(f"{COMMUNITY_LABELS[k]}{required}\n🆔 <code>{html.escape(str(cid))}</code>\n🔗 {html.escape(str(link))}")
         lines.append("")
-    lines.append("ℹ️ User Group + User Channel are the required join points. User Channel is reserved for public Broadcast + Price/Stock announcements. Approved Work has its own destination. Internal channels are never shown as join requirements.")
-    lines.append("🔐 Audit Channel: create a private Telegram channel, add this bot as an administrator, then save its -100… chat ID above. SQLite remains the source of truth; the bot automatically delivers every new audit event to this channel and retries failed deliveries.")
+    lines.append(
+        "ℹ️ Internal destinations are not join requirements. "
+        "The bot must be a member/admin of every configured destination; "
+        "for the required Group/Channel, users receive Join buttons before accessing the bot."
+    )
+    lines.append(
+        "🔐 Audit Channel stores durable audit events. SQLite remains the source of truth "
+        "and failed deliveries are retried automatically."
+    )
     return "\n".join(lines)
+
+def _community_check_one(kind):
+    cid = _community_id(kind)
+    if not cid:
+        return False, f"❌ {COMMUNITY_LABELS[kind]}: ID not set"
+    try:
+        chat = bot.get_chat(cid)
+        chat_type = str(getattr(chat, "type", "") or "")
+        title = getattr(chat, "title", None) or getattr(chat, "username", None) or str(cid)
+        link = _community_effective_link(kind, chat)
+
+        if kind == "user_group" and chat_type not in ("group", "supergroup"):
+            return False, f"❌ {COMMUNITY_LABELS[kind]}: wrong chat type ({chat_type or 'unknown'}); use a group/supergroup"
+        if kind == "user_channel" and chat_type != "channel":
+            return False, f"❌ {COMMUNITY_LABELS[kind]}: wrong chat type ({chat_type or 'unknown'}); use a channel"
+        if kind != "user_group" and kind != "user_channel" and chat_type not in ("group", "supergroup", "channel"):
+            return False, f"❌ {COMMUNITY_LABELS[kind]}: unsupported chat type ({chat_type or 'unknown'})"
+
+        if kind in COMMUNITY_JOIN_KEYS and not link:
+            return False, f"⚠️ {COMMUNITY_LABELS[kind]}: no Join link/username configured"
+
+        # get_chat proves the bot can resolve the destination; membership
+        # is separately checked where Telegram exposes it reliably.
+        return True, f"✅ {COMMUNITY_LABELS[kind]}: {html.escape(str(title))} ({chat_type})"
+    except Exception as exc:
+        logger.warning("Community check failed for %s (%s): %s", kind, cid, exc)
+        return False, f"⚠️ {COMMUNITY_LABELS[kind]}: bot cannot access chat {cid}"
 
 @bot.message_handler(func=lambda m: m.text == "⚙️ Community Settings" and is_super_admin(m.chat.id))
 @safe_handler
@@ -3150,108 +3241,243 @@ def admin_community_settings(m):
     if not is_super_admin(m.chat.id):
         return
     clear_state(m.chat.id)
-    kb=types.InlineKeyboardMarkup()
+    kb = types.InlineKeyboardMarkup()
     for k in COMMUNITY_KEYS:
         kb.add(types.InlineKeyboardButton(f"✏️ {COMMUNITY_LABELS[k]}", callback_data=f"comm_set:{k}"))
-    kb.add(types.InlineKeyboardButton("🧪 Check Configuration", callback_data="comm_check_config"))
+    kb.add(types.InlineKeyboardButton("🧪 Full Community Check", callback_data="comm_check_config"))
     kb.add(types.InlineKeyboardButton("🔄 Refresh", callback_data="comm_refresh"))
     bot.send_message(m.chat.id, _community_settings_text(), parse_mode="HTML", reply_markup=kb)
 
-@bot.callback_query_handler(func=lambda c: c.data in ("comm_refresh","comm_check_config"))
+@bot.callback_query_handler(func=lambda c: c.data in ("comm_refresh", "comm_check_config"))
 @safe_handler
 def community_refresh_cb(c):
-    if not is_super_admin(c.message.chat.id): return
+    if not is_super_admin(c.message.chat.id):
+        return
     if c.data == "comm_check_config":
-        results=[]
+        results = []
         for k in COMMUNITY_KEYS:
-            cid=_community_id(k)
+            ok, result = _community_check_one(k)
+            results.append(result)
+
+        # Verify the bot can actually query membership for the required points.
+        for k in COMMUNITY_JOIN_KEYS:
+            cid = _community_id(k)
             if not cid:
-                results.append(f"❌ {COMMUNITY_LABELS[k]}: ID not set")
                 continue
             try:
-                ch=bot.get_chat(cid)
-                results.append(f"✅ {COMMUNITY_LABELS[k]}: {ch.title or cid}")
-            except Exception as e:
-                results.append(f"⚠️ {COMMUNITY_LABELS[k]}: bot cannot access this chat ({cid})")
+                me = bot.get_me()
+                bot_member = bot.get_chat_member(cid, me.id)
+                status = str(bot_member.status)
+                if status in ("left", "kicked"):
+                    results.append(f"❌ {COMMUNITY_LABELS[k]}: bot is not a member/admin")
+                elif k == "user_channel" and status not in ("administrator", "creator"):
+                    results.append(f"⚠️ {COMMUNITY_LABELS[k]}: bot status is {status}; administrator is recommended for reliable membership checks")
+                else:
+                    results.append(f"✅ {COMMUNITY_LABELS[k]}: bot membership status = {status}")
+            except Exception:
+                logger.exception("Could not verify bot membership in %s", k)
+                results.append(f"⚠️ {COMMUNITY_LABELS[k]}: could not verify bot membership")
+
         bot.answer_callback_query(c.id, "Configuration checked.")
-        _screen_from_callback(c, "🔎 <b>COMMUNITY CHECK</b>\n\n"+"\n".join(results), parse_mode="HTML")
+        _screen_from_callback(c, "🔎 <b>FULL COMMUNITY CHECK</b>\n\n" + "\n".join(results), parse_mode="HTML")
     else:
         bot.answer_callback_query(c.id)
-    admin_community_settings(c.message)
+        kb = types.InlineKeyboardMarkup()
+        for k in COMMUNITY_KEYS:
+            kb.add(types.InlineKeyboardButton(f"✏️ {COMMUNITY_LABELS[k]}", callback_data=f"comm_set:{k}"))
+        kb.add(types.InlineKeyboardButton("🧪 Full Community Check", callback_data="comm_check_config"))
+        kb.add(types.InlineKeyboardButton("🔄 Refresh", callback_data="comm_refresh"))
+        _screen_from_callback(c, _community_settings_text(), parse_mode="HTML", reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("comm_set:"))
 @safe_handler
 def community_set_cb(c):
-    if not is_super_admin(c.message.chat.id): return
-    kind=c.data.split(":",1)[1]
-    if kind not in COMMUNITY_KEYS: return
+    if not is_super_admin(c.message.chat.id):
+        return
+    kind = c.data.split(":", 1)[1]
+    if kind not in COMMUNITY_KEYS:
+        return
     clear_state(c.message.chat.id)
     update_state(c.message.chat.id, flow="community_set", step="value", kind=kind)
     bot.answer_callback_query(c.id)
-    current=_community_get(kind)
-    _screen_from_callback(c,
+    current = _community_get(kind)
+    current_link = current.get("link") or ""
+    _screen_from_callback(
+        c,
         f"✏️ <b>{COMMUNITY_LABELS[kind]}</b>\n\n"
-        "Send the Telegram numeric chat ID and optional invite/public link in one line:\n\n"
+        "Send the Telegram numeric chat ID and optional link in one line:\n\n"
         "<code>-1001234567890 | https://t.me/example</code>\n\n"
-        "For internal admin-only channels, the link is optional.\n"
-        "The bot must already be a member/admin of the target chat.", parse_mode="HTML", reply_markup=back_kb())
+        "You can also use a public handle such as <code>@example</code>.\n"
+        "For a private group/channel, paste its invite link.\n"
+        f"Current link: <code>{html.escape(current_link or 'auto/public if available')}</code>\n\n"
+        "The bot must already be a member/admin of the target chat.",
+        parse_mode="HTML",
+        reply_markup=back_kb(),
+    )
 
-def _handle_community_set(m,state):
-    if not is_super_admin(m.chat.id): clear_state(m.chat.id); return
-    kind=state.get("kind")
-    raw=(m.text or "").strip()
-    parts=[x.strip() for x in raw.split("|",1)]
-    cid=parts[0] if parts else ""
-    link=parts[1] if len(parts)>1 else ""
+def _handle_community_set(m, state):
+    if not is_super_admin(m.chat.id):
+        clear_state(m.chat.id)
+        return
+    kind = state.get("kind")
+    if kind not in COMMUNITY_KEYS:
+        clear_state(m.chat.id)
+        return
+
+    raw = (m.text or "").strip()
+    parts = [x.strip() for x in raw.split("|", 1)]
+    cid = parts[0] if parts else ""
+    link = parts[1] if len(parts) > 1 else ""
+
     if not cid.lstrip("-").isdigit() or not cid.startswith("-100"):
-        _screen_send_for_chat(m.chat.id,"❌ Invalid Telegram supergroup/channel ID. It should look like <code>-1001234567890</code>.",parse_mode="HTML")
+        _screen_send_for_chat(
+            m.chat.id,
+            "❌ Invalid Telegram supergroup/channel ID. It should look like <code>-1001234567890</code>.",
+            parse_mode="HTML",
+            reply_markup=back_kb(),
+        )
         return
+
     try:
-        chat=bot.get_chat(int(cid))
-    except Exception:
-        _screen_send_for_chat(m.chat.id,"❌ Bot cannot access that chat. Add the bot to the group/channel first, then try again.")
+        normalized_link = _community_normalize_link(link)
+        chat = bot.get_chat(int(cid))
+        chat_type = str(getattr(chat, "type", "") or "")
+        if kind == "user_group" and chat_type not in ("group", "supergroup"):
+            raise ValueError("User Group must be a Telegram group/supergroup.")
+        if kind == "user_channel" and chat_type != "channel":
+            raise ValueError("User Channel must be a Telegram channel.")
+        if not normalized_link:
+            normalized_link = _community_effective_link(kind, chat)
+            if kind in COMMUNITY_JOIN_KEYS and not normalized_link:
+                raise ValueError("This required community has no public username. Please provide its private invite link.")
+    except ValueError as exc:
+        _screen_send_for_chat(
+            m.chat.id,
+            f"❌ {html.escape(str(exc))}",
+            parse_mode="HTML",
+            reply_markup=back_kb(),
+        )
         return
-    _community_set(kind,cid,link,m.chat.id)
+    except Exception:
+        logger.exception("Could not validate community destination %s", cid)
+        _screen_send_for_chat(
+            m.chat.id,
+            "❌ The bot cannot access that chat. Add the bot to the group/channel first, then try again.",
+            reply_markup=back_kb(),
+        )
+        return
+
+    _community_set(kind, cid, normalized_link, m.chat.id)
     clear_state(m.chat.id)
-    _screen_send_for_chat(m.chat.id,f"✅ {COMMUNITY_LABELS[kind]} saved.\n\nTitle: {html.escape(chat.title or str(cid))}\nID: <code>{cid}</code>",parse_mode="HTML",reply_markup=main_menu(m.chat.id))
+    _screen_send_for_chat(
+        m.chat.id,
+        f"✅ {COMMUNITY_LABELS[kind]} saved.\n\n"
+        f"Title: {html.escape(chat.title or getattr(chat, 'username', None) or str(cid))}\n"
+        f"Type: <code>{html.escape(chat_type)}</code>\n"
+        f"ID: <code>{cid}</code>\n"
+        f"Link: {html.escape(normalized_link or '—')}",
+        parse_mode="HTML",
+        reply_markup=main_menu(m.chat.id),
+    )
 
 def _user_join_requirements():
-    return [("user_group","👥 Group"),("user_channel","📢 Channel")]
+    return [("user_group", "👥 Group"), ("user_channel", "📢 Channel")]
 
 def _user_is_joined(chat_id):
-    missing=[]
-    for kind,label in _user_join_requirements():
-        cid=_community_id(kind)
-        if not cid: continue
+    missing = []
+    for kind, label in _user_join_requirements():
+        cid = _community_id(kind)
+        link = _community_link(kind)
+        if not cid:
+            # Mandatory destinations must never silently bypass the gate.
+            missing.append((kind, label, link))
+            continue
         try:
-            member=bot.get_chat_member(cid, chat_id)
-            status=str(member.status)
-            if status in ("left","kicked","restricted") and not (status=="restricted" and getattr(member,"is_member",False)):
-                missing.append((kind,label,_community_link(kind)))
+            member = bot.get_chat_member(cid, chat_id)
+            status = str(getattr(member, "status", "") or "")
+            is_member = bool(getattr(member, "is_member", False))
+            joined = status in ("member", "administrator", "creator") or (status == "restricted" and is_member)
+            if not joined:
+                missing.append((kind, label, _community_effective_link(kind)))
         except Exception:
-            missing.append((kind,label,_community_link(kind)))
+            logger.exception("Membership check failed: user=%s community=%s", chat_id, kind)
+            # Fail closed: a membership check failure must not grant access.
+            missing.append((kind, label, _community_effective_link(kind)))
     return missing
 
-def _join_gate(chat_id):
-    if is_admin(chat_id): return True
-    missing=_user_is_joined(chat_id)
-    if not missing: return True
-    kb=types.InlineKeyboardMarkup()
-    for kind,label,link in missing:
+def _join_gate(chat_id, message=None):
+    """Require both public onboarding destinations before normal bot access."""
+    if is_admin(chat_id):
+        return True
+
+    missing = _user_is_joined(chat_id)
+    if not missing:
+        return True
+
+    # If the community is not configured correctly, don't expose a broken
+    # Join button. Tell the user the service is being configured instead.
+    has_unusable_requirement = any(not link for _, _, link in missing)
+    kb = types.InlineKeyboardMarkup()
+    for kind, label, link in missing:
         if link:
             kb.add(types.InlineKeyboardButton(f"➡️ Join {label}", url=link))
     kb.add(types.InlineKeyboardButton("✅ I Joined — Check Again", callback_data="community_join_check"))
-    bot.send_message(chat_id,"🔐 <b>Join Required</b>\n\nPlease join the required Group and Channel, then tap <b>✅ I Joined — Check Again</b>.",parse_mode="HTML",reply_markup=kb)
+
+    text = (
+        "🔐 <b>Community Join Required</b>\n\n"
+        "Before using the bot, please join both the required community spaces below:\n\n"
+        "1️⃣ 👥 <b>Group</b>\n"
+        "2️⃣ 📢 <b>Channel</b>\n\n"
+        "After joining both, tap <b>✅ I Joined — Check Again</b>."
+    )
+    if has_unusable_requirement:
+        text += (
+            "\n\n⚠️ One of the required Join links is not configured correctly yet. "
+            "Please try again shortly."
+        )
+
+    try:
+        if message is not None:
+            bot.edit_message_text(
+                text,
+                chat_id,
+                message.message_id,
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+        else:
+            bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        logger.exception("Could not display community join gate to %s", chat_id)
+        if message is not None:
+            bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
     return False
 
 @bot.callback_query_handler(func=lambda c: c.data == "community_join_check")
 @safe_handler
 def community_join_check_cb(c):
-    if _join_gate(c.message.chat.id):
-        bot.answer_callback_query(c.id,"✅ Membership confirmed.")
-        _screen_from_callback(c,"✅ You have joined the required communities.",reply_markup=main_menu(c.message.chat.id))
-    else:
-        bot.answer_callback_query(c.id,"⚠️ You still need to join both.",show_alert=True)
+    if is_admin(c.message.chat.id):
+        bot.answer_callback_query(c.id, "✅ Admin access confirmed.")
+        _screen_from_callback(c, "🏠 Main Menu", reply_markup=main_menu(c.message.chat.id))
+        return
+
+    missing = _user_is_joined(c.message.chat.id)
+    if not missing:
+        bot.answer_callback_query(c.id, "✅ Membership confirmed.")
+        _screen_from_callback(
+            c,
+            "✅ <b>Membership confirmed.</b>\n\nYou have joined the required Group and Channel.",
+            parse_mode="HTML",
+            reply_markup=main_menu(c.message.chat.id),
+        )
+        return
+
+    bot.answer_callback_query(
+        c.id,
+        "⚠️ Please join both the Group and Channel first.",
+        show_alert=True,
+    )
+    _join_gate(c.message.chat.id, c.message)
 
 # ================================================================
 # MENUS
