@@ -24,6 +24,8 @@
 import os
 import json
 import sqlite3
+import base64
+import tempfile
 import secrets
 import logging
 import html
@@ -77,6 +79,15 @@ logger = logging.getLogger("mobile")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 BOT_LINK = os.environ.get("BOT_LINK", "").strip()
 DB_PATH = os.environ.get("mobile_DB_PATH", "mobile.db").strip()
+
+# Optional GitHub SQLite snapshot/restore.
+# Railway keeps using the normal local mobile.db. GitHub only stores a
+# portable snapshot named data.db at the repository root.
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "").strip()
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip() or "main"
+GITHUB_DB_BACKUP_PATH = "data.db"
+GITHUB_DB_BACKUP_INTERVAL = 24 * 60 * 60
 
 _admin_ids_raw = os.environ.get("ADMIN_IDS", "").strip()
 ADMIN_IDS = {a.strip() for a in _admin_ids_raw.split(",") if a.strip()}
@@ -143,6 +154,270 @@ CURRENCY_LABELS = {"usdt": "USDT"}
 
 MIN_WITHDRAWAL = {"usdt": 2.00}
 
+
+
+# ---------------------------------------------------------------
+# GITHUB DATABASE BACKUP / RESTORE
+# ---------------------------------------------------------------
+# This is deliberately separate from the bot's live database logic:
+#   Railway/local: mobile.db  <-- normal live database
+#   GitHub root:   data.db    <-- portable snapshot only
+#
+# On a fresh host, data.db is restored ONLY when the local DB file does
+# not exist. An existing mobile.db is never overwritten.
+#
+# The snapshot is made with SQLite's backup API so an active WAL database
+# is copied consistently without stopping Telegram handlers.
+# ---------------------------------------------------------------
+
+def _github_backup_enabled() -> bool:
+    return bool(GITHUB_TOKEN and GITHUB_REPOSITORY and "/" in GITHUB_REPOSITORY)
+
+
+def _github_api_url(include_ref=True) -> str:
+    repo = urllib.parse.quote(GITHUB_REPOSITORY.strip(), safe="/")
+    path = urllib.parse.quote(GITHUB_DB_BACKUP_PATH, safe="")
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    if include_ref:
+        branch = urllib.parse.quote(GITHUB_BRANCH, safe="")
+        url += f"?ref={branch}"
+    return url
+
+
+def _github_request(url, method="GET", payload=None):
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "MBH-Railway-DB-Backup",
+    }
+    data = None
+    if payload is not None:
+        data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=45) as response:
+        raw = response.read()
+        return json.loads(raw.decode("utf-8")) if raw else {}
+
+
+def _github_get_db_sha():
+    """Return SHA, None when data.db does not exist, False on lookup error."""
+    if not _github_backup_enabled():
+        return None
+    try:
+        info = _github_request(_github_api_url(), "GET")
+        return info.get("sha")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        logger.warning("GitHub data.db lookup failed: HTTP %s", exc.code)
+    except Exception:
+        logger.exception("GitHub data.db lookup failed")
+    return False
+
+
+def _github_admin_time() -> str:
+    return datetime.now(LAGOS_TZ).strftime("%d %b %Y, %I:%M:%S %p")
+
+
+def _notify_admins_github_db(message: str):
+    """Send important DB backup/restore status to all configured admins."""
+    for admin_id in ADMIN_IDS:
+        try:
+            bot.send_message(int(admin_id), message, parse_mode="HTML")
+        except Exception:
+            logger.exception("Could not send GitHub DB notification to admin %s", admin_id)
+
+
+def _restore_db_from_github_if_missing():
+    """Restore GitHub data.db only when the live local DB is absent."""
+    if os.path.exists(DB_PATH):
+        return False
+    if not _github_backup_enabled():
+        logger.info("GitHub DB restore skipped: GITHUB_TOKEN/GITHUB_REPOSITORY not configured")
+        return False
+
+    try:
+        info = _github_request(_github_api_url(), "GET")
+        encoded = info.get("content", "")
+        if not encoded:
+            logger.info("No GitHub data.db snapshot found; starting with a fresh local database")
+            return False
+
+        raw = base64.b64decode(encoded)
+        parent = os.path.dirname(os.path.abspath(DB_PATH))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        # Write to a temporary file, validate it, then atomically install it.
+        # The live mobile.db is never replaced until the downloaded SQLite file
+        # passes an integrity check.
+        fd, tmp_path = tempfile.mkstemp(prefix=".mobile_restore_", suffix=".db", dir=parent or None)
+        try:
+            with os.fdopen(fd, "wb") as tmp:
+                tmp.write(raw)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+
+            check = sqlite3.connect(tmp_path, timeout=30)
+            try:
+                integrity = check.execute("PRAGMA integrity_check").fetchone()
+                if not integrity or integrity[0] != "ok":
+                    raise RuntimeError(f"GitHub database integrity check failed: {integrity}")
+            finally:
+                check.close()
+
+            os.replace(tmp_path, DB_PATH)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+        restored_at = _github_admin_time()
+        size_mb = len(raw) / (1024 * 1024)
+        logger.info(
+            "Restored local database from GitHub: %s (%.2f MB)",
+            GITHUB_DB_BACKUP_PATH,
+            size_mb,
+        )
+        _notify_admins_github_db(
+            "🛡️ <b>MBH DATABASE RESTORED</b>\n\n"
+            f"📥 <b>Source:</b> GitHub <code>{html.escape(GITHUB_DB_BACKUP_PATH)}</code>\n"
+            f"📤 <b>Restored to:</b> Railway <code>{html.escape(DB_PATH)}</code>\n"
+            f"💾 <b>Database size:</b> {size_mb:.2f} MB\n"
+            f"🕒 <b>Date & time:</b> {html.escape(restored_at)} (Lagos)\n\n"
+            "✅ <b>Old data has been restored.</b> The bot will continue using this database, "
+            "and the automatic GitHub backup will continue every 24 hours.\n\n"
+            "🔐 <i>Your database memory is now back with the bot.</i>"
+        )
+        return True
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            logger.info("No GitHub data.db snapshot found; starting with a fresh local database")
+        else:
+            logger.warning("GitHub DB restore failed: HTTP %s", exc.code)
+    except Exception:
+        logger.exception("GitHub DB restore failed")
+    return False
+
+
+def _create_consistent_db_snapshot():
+    """Create a standalone SQLite snapshot of the live DB."""
+    if not os.path.exists(DB_PATH):
+        return None
+
+    fd, tmp_path = tempfile.mkstemp(prefix=".mobile_backup_", suffix=".db")
+    os.close(fd)
+    try:
+        source = sqlite3.connect(DB_PATH, timeout=60)
+        try:
+            dest = sqlite3.connect(tmp_path, timeout=60)
+            try:
+                source.backup(dest, pages=1000, sleep=0.1)
+                dest.commit()
+            finally:
+                dest.close()
+        finally:
+            source.close()
+        return tmp_path
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _upload_db_snapshot_to_github():
+    """Replace/create root data.db in the configured GitHub repository."""
+    if not _github_backup_enabled():
+        logger.info("GitHub DB backup skipped: GITHUB_TOKEN/GITHUB_REPOSITORY not configured")
+        return False
+
+    snapshot = None
+    try:
+        snapshot = _create_consistent_db_snapshot()
+        if not snapshot:
+            return False
+
+        size = os.path.getsize(snapshot)
+        if size >= 100 * 1024 * 1024:
+            logger.error(
+                "GitHub DB backup skipped: data.db is %.2f MB; GitHub Contents API "
+                "does not support this size reliably.",
+                size / (1024 * 1024),
+            )
+            return False
+
+        with open(snapshot, "rb") as fh:
+            encoded = base64.b64encode(fh.read()).decode("ascii")
+
+        payload = {
+            "message": "chore: update MBH SQLite database backup",
+            "content": encoded,
+            "branch": GITHUB_BRANCH,
+        }
+        sha = _github_get_db_sha()
+        if sha is False:
+            logger.warning("GitHub DB backup aborted because the remote data.db state could not be verified")
+            return False
+        if sha:
+            payload["sha"] = sha
+
+        result = _github_request(_github_api_url(include_ref=False), "PUT", payload)
+        backup_at = _github_admin_time()
+        size_mb = size / (1024 * 1024)
+        logger.info(
+            "GitHub DB backup completed: %s (%.2f MB, commit=%s)",
+            GITHUB_DB_BACKUP_PATH,
+            size_mb,
+            result.get("commit", {}).get("sha", "unknown"),
+        )
+        _notify_admins_github_db(
+            "💾 <b>MBH DATABASE BACKUP SAVED</b>\n\n"
+            f"📥 <b>Source:</b> Railway <code>{html.escape(DB_PATH)}</code>\n"
+            f"📤 <b>Saved to:</b> GitHub root <code>{html.escape(GITHUB_DB_BACKUP_PATH)}</code>\n"
+            f"💾 <b>Snapshot size:</b> {size_mb:.2f} MB\n"
+            f"🕒 <b>Date & time:</b> {html.escape(backup_at)} (Lagos)\n\n"
+            "✅ <b>All current database data has been backed up.</b>\n"
+            "⏰ <b>Next automatic backup:</b> within 24 hours.\n\n"
+            "🧠 <i>This backup keeps your MBH data portable if Railway ever changes host.</i>"
+        )
+        return True
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            detail = ""
+        logger.warning("GitHub DB backup failed: HTTP %s %s", exc.code, detail)
+    except Exception:
+        logger.exception("GitHub DB backup failed")
+    finally:
+        if snapshot and os.path.exists(snapshot):
+            try:
+                os.unlink(snapshot)
+            except OSError:
+                pass
+    return False
+
+
+def _github_db_backup_worker():
+    """Create a portable GitHub snapshot roughly every 24 hours."""
+    # If no remote snapshot exists yet, make one once at startup. This gives
+    # a newly deployed host something to restore even before 24 hours pass.
+    if _github_backup_enabled():
+        remote_sha = _github_get_db_sha()
+        if remote_sha is None:
+            _upload_db_snapshot_to_github()
+        elif remote_sha is False:
+            logger.warning("Skipping startup GitHub DB backup because remote state could not be verified")
+
+    while True:
+        time.sleep(GITHUB_DB_BACKUP_INTERVAL)
+        try:
+            _upload_db_snapshot_to_github()
+        except Exception:
+            logger.exception("GitHub DB backup worker iteration failed")
 
 def is_admin(chat_id) -> bool:
     sid = str(chat_id)
@@ -2323,6 +2598,13 @@ def _capture_new_chat_updates(new_messages):
 # Update listeners observe updates without replacing the bot's existing
 # message/callback handlers.
 bot.set_update_listener(_capture_new_chat_updates)
+
+# Channel posts are exposed separately by Telegram/pyTelegramBotAPI.
+# Keep an explicit observer so channels are detected even when a library
+# version does not include channel posts in the update-listener batch.
+@bot.channel_post_handler(func=lambda m: True)
+def _capture_channel_post(m):
+    _capture_new_group_or_channel(m)
 
 
 # ================================================================
@@ -9820,7 +10102,11 @@ def generic_state_router(m):
 # ================================================================
 
 def main():
+    # On a fresh Railway host, restore the portable GitHub snapshot before
+    # the normal schema initialization can create a new empty mobile.db.
+    _restore_db_from_github_if_missing()
     _ensure_runtime_schema()
+    threading.Thread(target=_github_db_backup_worker, daemon=True, name="github-db-backup-worker").start()
     threading.Thread(target=_otp_worker, daemon=True, name="quick-otp-worker").start()
     threading.Thread(target=_otp_price_watcher, daemon=True, name="quick-otp-price-watcher").start()
     logger.info("%s starting…", BRAND)
