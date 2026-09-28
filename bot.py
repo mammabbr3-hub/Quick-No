@@ -2954,8 +2954,17 @@ def safe_handler(func):
         # Community onboarding gate: normal users must remain members of both
         # required destinations. /start and the verification callback are
         # allowed through so onboarding can be displayed/re-checked.
+        # The join gate is a PRIVATE-CHAT onboarding feature.
+        # Never post the user's join requirement screen inside a group/supergroup/channel.
+        # Users must open the bot in a private chat to complete onboarding.
+        update_chat = getattr(update, "chat", None)
+        if update_chat is None and getattr(update, "message", None) is not None:
+            update_chat = getattr(update.message, "chat", None)
+        chat_type = str(getattr(update_chat, "type", "") or "")
+        is_private_chat = chat_type == "private"
         if (
-            not is_admin(chat_id)
+            is_private_chat
+            and not is_admin(chat_id)
             and func.__name__ not in {"start", "community_join_check_cb"}
             and not _join_gate(chat_id)
         ):
@@ -3048,6 +3057,7 @@ def safe_handler(func):
 @safe_handler
 def _screen_back_cb(c):
     clear_state(c.message.chat.id)
+    _community_pending_clear(c.message.chat.id)
     _screen_clear(c.message.chat.id)
     bot.answer_callback_query(c.id)
     # Returning to the main menu is a deliberate step change, so a fresh
@@ -3125,6 +3135,30 @@ COMMUNITY_LABELS = {
 # These two are the public onboarding requirements. Internal destinations
 # are deliberately excluded from the join gate.
 COMMUNITY_JOIN_KEYS = ("user_group", "user_channel")
+
+# Durable fallback for the two-step Community Settings wizard.  This is kept
+# outside the normal FSM so an ID message is not lost if another handler,
+# Telegram update ordering, or a bot restart clears the transient state.
+def _community_pending_key(admin_id):
+    return f"community_pending:{admin_id}"
+
+def _community_pending_get(admin_id):
+    raw = get_setting(_community_pending_key(admin_id), "") or ""
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _community_pending_set(admin_id, kind, step="id", cid=None):
+    set_setting(
+        _community_pending_key(admin_id),
+        json.dumps({"kind": kind, "step": step, "cid": str(cid) if cid is not None else ""}),
+        admin_id,
+    )
+
+def _community_pending_clear(admin_id):
+    set_setting(_community_pending_key(admin_id), "", admin_id)
 
 def _community_get(kind):
     raw = get_setting(COMMUNITY_KEYS[kind], "") or ""
@@ -3242,6 +3276,7 @@ def admin_community_settings(m):
     if not is_super_admin(m.chat.id):
         return
     clear_state(m.chat.id)
+    _community_pending_clear(m.chat.id)
     kb = types.InlineKeyboardMarkup()
     for k in COMMUNITY_KEYS:
         kb.add(types.InlineKeyboardButton(f"✏️ {COMMUNITY_LABELS[k]}", callback_data=f"comm_set:{k}"))
@@ -3299,6 +3334,7 @@ def community_set_cb(c):
     if kind not in COMMUNITY_KEYS:
         return
     clear_state(c.message.chat.id)
+    _community_pending_set(c.message.chat.id, kind, "id")
     update_state(c.message.chat.id, flow="community_set", step="id", kind=kind)
     bot.answer_callback_query(c.id)
     current = _community_get(kind)
@@ -3362,6 +3398,7 @@ def _community_save_after_link(m, state, cid, link):
 
     _community_set(kind, cid, normalized_link, m.chat.id)
     clear_state(m.chat.id)
+    _community_pending_clear(m.chat.id)
     _screen_send_for_chat(
         m.chat.id,
         f"✅ {COMMUNITY_LABELS[kind]} saved.\n\n"
@@ -3425,6 +3462,7 @@ def _handle_community_set(m, state):
 
         # Keep the ID in the FSM only until the second step is completed.
         update_state(m.chat.id, step="link", kind=kind, cid=str(cid))
+        _community_pending_set(m.chat.id, kind, "link", cid)
         current_link = _community_link(kind)
         _screen_send_for_chat(
             m.chat.id,
@@ -8692,7 +8730,8 @@ _FLOW_ROUTES = {
     ("admin_withdrawal_search", None): _handle_admin_withdrawal_search,
     ("admin_withdraw_method", None): _handle_admin_withdraw_method,
     ("admin_setting", None): _handle_admin_setting,
-    ("community_set", "value"): _handle_community_set,
+    ("community_set", "id"): _handle_community_set,
+    ("community_set", "link"): _handle_community_set,
     ("text_edit", None): _handle_text_edit,
     ("btn_label_edit", None): _handle_btn_label_edit,
     ("menu_opt_add", None): _handle_menu_opt_add,
@@ -10372,6 +10411,28 @@ def generic_state_router(m):
     state = get_state(m.chat.id)
     flow = state.get("flow")
     step = state.get("step")
+
+    # Community Settings is a privileged two-step wizard.  Restore its
+    # durable session if the transient FSM was cleared/replaced between the
+    # button press and the administrator's numeric ID message.
+    if is_super_admin(m.chat.id):
+        pending = _community_pending_get(m.chat.id)
+        if pending.get("kind") in COMMUNITY_KEYS:
+            if flow != "community_set":
+                flow = "community_set"
+                step = pending.get("step") or ("link" if pending.get("cid") else "id")
+                state = {"flow": flow, "step": step, "kind": pending.get("kind")}
+                if pending.get("cid"):
+                    state["cid"] = pending.get("cid")
+                set_state(m.chat.id, state)
+            elif step not in ("id", "link"):
+                step = pending.get("step") or ("link" if pending.get("cid") else "id")
+                state["step"] = step
+                state["kind"] = pending.get("kind")
+                if pending.get("cid"):
+                    state["cid"] = pending.get("cid")
+                set_state(m.chat.id, state)
+
     if not flow:
         return  # No active flow and no menu button matched — nothing to do.
 
@@ -10392,7 +10453,10 @@ def generic_state_router(m):
     if flow_feature == "__admin__" and not is_admin(m.chat.id):
         clear_state(m.chat.id)
         return
-    handler = _FLOW_ROUTES.get((flow, step))
+    # Never let the Community Settings wizard fall through to the generic
+    # "choose one option" message.  Its handler can validate the current
+    # step directly and the durable pending session above can restore it.
+    handler = _handle_community_set if flow == "community_set" and step in ("id", "link") else _FLOW_ROUTES.get((flow, step))
     if handler is None:
         bot.send_message(
             m.chat.id,
