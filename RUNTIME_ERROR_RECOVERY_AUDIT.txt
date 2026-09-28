@@ -1,0 +1,41 @@
+MOBILE DIGITAL HUB — USER HANDLER ERROR / RUNTIME RECOVERY FIX
+
+Problem observed:
+- User-facing handlers such as /start, My Account and Quick OTP were reaching the
+  global safe_handler error path while admin handlers continued to operate.
+- The Telegram message shown to the admin only exposed the handler name, not the
+  underlying exception.
+
+Root-cause class addressed:
+- A persistent SQLite database can survive a code redeploy. If the database is
+  older/partially migrated, user handlers can fail on missing user/wallet/schema
+  state even though admin navigation still opens.
+- The bot previously did not perform a runtime schema/context self-check before
+  every user-facing action.
+- SQLite connection settings were not re-applied per connection, which can make
+  concurrent user writes more sensitive to locking.
+
+Fixes applied:
+1. Runtime schema self-healing runs at startup through the existing init_db and
+   otp_db_init migrations.
+2. Every user-facing action verifies that the user row and wallet row exist;
+   repair is performed only when one is actually missing (normal requests remain
+   read-only).
+3. SQLite connections now apply foreign_keys, busy_timeout, WAL and NORMAL
+   synchronous settings per connection.
+4. The generic handler error alert to the admin is de-duplicated for 30 seconds
+   and now includes the exception type/message while the full traceback remains
+   in mobile_bot.log.
+5. Users still receive only the safe generic error message; internal tracebacks
+   are never exposed to users.
+6. Permanent tracking/result messages remain untouched. The temporary
+   Please-wait message remains the only generic temporary deletion mechanism.
+7. No project subfolders were introduced; bot.py remains the single main
+   application file at the ZIP root.
+
+Verification:
+- Python compile: PASS
+- ZIP root layout: PASS
+- SQLite fresh initialization: PASS
+- User /start simulation with mocked Telegram transport: PASS
+- My Account simulation with mocked Telegram transport: PASS
