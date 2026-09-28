@@ -524,6 +524,15 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_by  TEXT
 );
 
+CREATE TABLE IF NOT EXISTS discovered_chats (
+    chat_id           TEXT PRIMARY KEY,
+    chat_type         TEXT NOT NULL,
+    title             TEXT,
+    username          TEXT,
+    first_message_id  INTEGER,
+    discovered_at     TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS withdrawal_methods (
     method_id   TEXT PRIMARY KEY,
     name        TEXT NOT NULL UNIQUE,
@@ -2208,6 +2217,113 @@ from telebot import types
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 BRAND = "✦ Mobile Business Hub 🤖"
+
+# ================================================================
+# NEW GROUP / CHANNEL ID DETECTOR
+# ================================================================
+# When this bot receives the FIRST message/post from a chat it has never
+# seen before, notify every configured admin exactly once with the numeric
+# Telegram chat ID. The record is persisted in SQLite, so restarts do not
+# cause the same chat ID to be sent again.
+#
+# This does not reply to the group/channel and does not alter any existing
+# user/admin flow.
+# ================================================================
+
+def _chat_capture_title(chat):
+    title = getattr(chat, "title", None)
+    if title:
+        return str(title)
+    first = getattr(chat, "first_name", None) or ""
+    last = getattr(chat, "last_name", None) or ""
+    name = f"{first} {last}".strip()
+    return name or "Untitled chat"
+
+
+def _capture_new_group_or_channel(message):
+    try:
+        chat = getattr(message, "chat", None)
+        if not chat:
+            return
+
+        chat_type = str(getattr(chat, "type", "") or "")
+        if chat_type not in ("group", "supergroup", "channel"):
+            return
+
+        chat_id = str(chat.id)
+        title = _chat_capture_title(chat)
+        username = getattr(chat, "username", None)
+        first_message_id = getattr(message, "message_id", None)
+
+        # INSERT OR IGNORE makes this a one-time notification per chat.
+        with db_tx() as conn:
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO discovered_chats
+                    (chat_id, chat_type, title, username, first_message_id, discovered_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (chat_id, chat_type, title, username, first_message_id, now_iso()),
+            )
+            is_new = cur.rowcount == 1
+
+        if not is_new:
+            return
+
+        type_label = {
+            "group": "GROUP",
+            "supergroup": "SUPERGROUP",
+            "channel": "CHANNEL",
+        }.get(chat_type, chat_type.upper())
+
+        username_line = (
+            f"👤 Username: @{html.escape(str(username))}\n"
+            if username else
+            "👤 Username: —\n"
+        )
+
+        text = (
+            f"🆕 <b>NEW {type_label} DETECTED</b>\n\n"
+            f"📛 <b>Name:</b> {html.escape(title)}\n"
+            f"🆔 <b>Chat ID:</b> <code>{html.escape(chat_id)}</code>\n"
+            f"📂 <b>Type:</b> {html.escape(chat_type)}\n"
+            f"{username_line}"
+            f"💬 <b>First message ID:</b> <code>{first_message_id or '—'}</code>\n\n"
+            f"✅ This ID will not be sent again for this chat."
+        )
+
+        for admin_id in ADMIN_IDS:
+            try:
+                bot.send_message(int(admin_id), text, parse_mode="HTML")
+            except Exception:
+                logger.exception(
+                    "Could not send new chat ID notification to admin %s",
+                    admin_id,
+                )
+
+        logger.info(
+            "New Telegram chat discovered: type=%s id=%s title=%s",
+            chat_type, chat_id, title,
+        )
+
+    except Exception:
+        # This detector must never break any existing bot handler.
+        logger.exception("New group/channel ID detector failed")
+
+
+def _capture_new_chat_updates(new_messages):
+    """Observe incoming message/channel-post updates without consuming them."""
+    try:
+        for message in new_messages:
+            _capture_new_group_or_channel(message)
+    except Exception:
+        logger.exception("New group/channel update listener failed")
+
+
+# Update listeners observe updates without replacing the bot's existing
+# message/callback handlers.
+bot.set_update_listener(_capture_new_chat_updates)
+
 
 # ================================================================
 # AUTO-CLEANUP OF NAVIGATION / OPTION MESSAGES
