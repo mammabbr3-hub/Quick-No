@@ -31,6 +31,7 @@ import logging
 import html
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 import urllib.request
 import urllib.parse
 import re
@@ -92,10 +93,22 @@ GITHUB_DB_BACKUP_INTERVAL = 24 * 60 * 60
 _admin_ids_raw = os.environ.get("ADMIN_IDS", "").strip()
 ADMIN_IDS = {a.strip() for a in _admin_ids_raw.split(",") if a.strip()}
 
-# Quick OTP / Grizzly integration uses the SAME SQLite database and SAME wallet as Mobile Business Hub.
+# Quick OTP / Mobile Business Hub integration uses the SAME SQLite database and SAME wallet as Mobile Business Hub.
 GRIZZLY_API_KEY = os.environ.get("GRIZZLY_API_KEY", "").strip()
 GRIZZLY_BASE_URL = os.environ.get("GRIZZLY_BASE_URL", "https://api.grizzlysms.com/stubs/handler_api.php").strip()
 GRIZZLY_OPERATOR = os.environ.get("GRIZZLY_OPERATOR", "").strip()
+OTP_STATUS_WORKERS = max(4, min(64, int(os.environ.get("OTP_STATUS_WORKERS", "32") or 32)))
+OTP_STATUS_POLL_SECONDS = max(2, int(os.environ.get("OTP_STATUS_POLL_SECONDS", "3") or 3))
+OTP_STATUS_BATCH = max(50, min(1000, int(os.environ.get("OTP_STATUS_BATCH", "500") or 500)))
+TELEGRAM_HANDLER_THREADS = max(4, min(32, int(os.environ.get("TELEGRAM_HANDLER_THREADS", "16") or 16)))
+# Telegram Bot API flood-control guard. Telegram documents a practical limit of
+# about 1 message/sec in a single chat and about 30 messages/sec for bulk sends.
+# Keep a safety margin locally so bursts from OTP workers cannot flood the API.
+TELEGRAM_GLOBAL_RATE = max(5.0, min(30.0, float(os.environ.get("TELEGRAM_GLOBAL_RATE", "25") or 25)))
+TELEGRAM_PER_CHAT_INTERVAL = max(1.0, float(os.environ.get("TELEGRAM_PER_CHAT_INTERVAL", "1.10") or 1.10))
+TELEGRAM_FLOOD_RETRY_MAX = max(0.0, min(5.0, float(os.environ.get("TELEGRAM_FLOOD_RETRY_MAX", "3") or 3)))
+OTP_ACTIVATION_WORKERS = max(4, min(32, int(os.environ.get("OTP_ACTIVATION_WORKERS", "16") or 16)))
+OTP_UI_UPDATE_SECONDS = max(30, int(os.environ.get("OTP_UI_UPDATE_SECONDS", "60") or 60))
 
 # ---------------------------------------------------------------
 # SUPPORT GROUP / APPROVED-WORK CHANNEL
@@ -2490,7 +2503,81 @@ import functools
 import telebot
 from telebot import types
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None, num_threads=TELEGRAM_HANDLER_THREADS)
+
+# ================================================================
+# TELEGRAM OUTBOUND RATE LIMIT / FLOOD PROTECTION
+# ================================================================
+# All Telegram API calls made by this process pass through apihelper._make_request.
+# We leave getUpdates/long polling untouched, but throttle outbound calls globally
+# and per chat. This protects the bot when many OTP orders complete at once.
+# A large Telegram retry_after is never slept inside a handler: doing that would
+# turn one flood-control event into hundreds of blocked handler threads.
+import telebot.apihelper as _telegram_apihelper
+
+_TG_RATE_LOCK = threading.Lock()
+_TG_NEXT_GLOBAL = 0.0
+_TG_CHAT_NEXT = {}
+_TG_CHAT_METHODS = {
+    'sendMessage','sendPhoto','sendVideo','sendDocument','sendAudio','sendVoice',
+    'sendAnimation','sendSticker','sendLocation','sendVenue','sendContact',
+    'editMessageText','editMessageCaption','editMessageMedia','editMessageReplyMarkup',
+    'deleteMessage','sendChatAction'
+}
+_TG_ORIGINAL_MAKE_REQUEST = _telegram_apihelper._make_request
+
+
+def _tg_wait_slot(chat_id=None):
+    global _TG_NEXT_GLOBAL
+    interval = 1.0 / TELEGRAM_GLOBAL_RATE
+    while True:
+        now = time.monotonic()
+        with _TG_RATE_LOCK:
+            wait_global = max(0.0, _TG_NEXT_GLOBAL - now)
+            wait_chat = 0.0
+            if chat_id is not None:
+                wait_chat = max(0.0, _TG_CHAT_NEXT.get(str(chat_id), 0.0) - now)
+            wait_for = max(wait_global, wait_chat)
+            if wait_for <= 0:
+                _TG_NEXT_GLOBAL = now + interval
+                if chat_id is not None:
+                    _TG_CHAT_NEXT[str(chat_id)] = now + TELEGRAM_PER_CHAT_INTERVAL
+                # Prevent unbounded growth if many one-off chats are used.
+                if len(_TG_CHAT_NEXT) > 10000:
+                    cutoff = now - 300.0
+                    for k, v in list(_TG_CHAT_NEXT.items()):
+                        if v < cutoff:
+                            _TG_CHAT_NEXT.pop(k, None)
+                return
+        time.sleep(min(wait_for, 1.0))
+
+
+def _tg_make_request_guard(token, method_name, method='get', params=None, files=None):
+    # getUpdates is long-polling and must not be held behind the outbound queue.
+    if method_name == 'getUpdates':
+        return _TG_ORIGINAL_MAKE_REQUEST(token, method_name, method=method, params=params, files=files)
+    chat_id = params.get('chat_id') if isinstance(params, dict) else None
+    _tg_wait_slot(chat_id)
+    try:
+        return _TG_ORIGINAL_MAKE_REQUEST(token, method_name, method=method, params=params, files=files)
+    except _telegram_apihelper.ApiTelegramException as exc:
+        if getattr(exc, 'error_code', None) == 429:
+            retry_after = 0.0
+            try:
+                retry_after = float((exc.result_json or {}).get('parameters', {}).get('retry_after', 0) or 0)
+            except Exception:
+                pass
+            # Short flood-control responses can safely be retried once. A long
+            # retry_after must bubble up immediately; sleeping for minutes inside
+            # a callback would exhaust the bot's worker pool.
+            if 0 < retry_after <= TELEGRAM_FLOOD_RETRY_MAX:
+                time.sleep(retry_after)
+                _tg_wait_slot(chat_id)
+                return _TG_ORIGINAL_MAKE_REQUEST(token, method_name, method=method, params=params, files=files)
+        raise
+
+_telegram_apihelper._make_request = _tg_make_request_guard
+
 BRAND = "✦ Mobile Business Hub 🤖"
 
 # ================================================================
@@ -2924,6 +3011,38 @@ def _remove_wait_notice(chat_id, message):
         logger.debug("Could not remove temporary wait notice", exc_info=True)
 
 
+
+def _telegram_exception_kind(exc):
+    """Classify Telegram API errors that should never generate another Telegram error message."""
+    code=getattr(exc, 'error_code', None)
+    desc=str(getattr(exc, 'description', '') or exc).lower()
+    if code == 429:
+        return 'rate_limit'
+    if code == 400 and ('message is not modified' in desc or 'query is too old' in desc or 'response timeout expired' in desc or 'query id is invalid' in desc):
+        return 'stale_ui'
+    return None
+
+
+def _admin_error_allowed(signature, interval=120.0):
+    global _LAST_ADMIN_ERROR_SIGNATURE, _LAST_ADMIN_ERROR_AT
+    now_mono=time.monotonic()
+    if signature == _LAST_ADMIN_ERROR_SIGNATURE and (now_mono-_LAST_ADMIN_ERROR_AT) < interval:
+        return False
+    _LAST_ADMIN_ERROR_SIGNATURE=signature
+    _LAST_ADMIN_ERROR_AT=now_mono
+    return True
+
+def _friendly_error_code(func_name):
+    return {"otp_buy_cb":"OTP-GET","otp_new_cb":"OTP-NEW","otp_cancel_cb":"OTP-CANCEL","fund_wallet":"FUNDING","withdraw":"WITHDRAWAL"}.get(func_name,"SYSTEM")
+
+def _friendly_user_error(func_name, ref):
+    action={"otp_buy_cb":"samun sabon number","otp_new_cb":"samun sabon number","otp_cancel_cb":"cancellin request"}.get(func_name,"ci gaba da wannan aiki")
+    return ("⚠️ <b>An samu matsala</b>\n\n" f"Ba a samu damar {action} ba a wannan lokacin.\n" "💡 Ka sake gwadawa bayan ɗan lokaci. Idan matsalar ta ci gaba, tuntuɓi Support.\n\n" f"🧾 <b>Reference:</b> <code>{html.escape(str(ref))}</code>")
+
+def _friendly_admin_error(func_name, chat_id, exc, reference):
+    lag=lagos_parts()
+    return ("🚨 <b>SYSTEM ERROR</b>\n\n" f"🏷️ <b>Type:</b> <code>{_friendly_error_code(func_name)}</code>\n" f"🧩 <b>Handler:</b> <code>{html.escape(func_name)}</code>\n" f"👤 <b>User/Chat:</b> <code>{html.escape(str(chat_id))}</code>\n" f"🧾 <b>Reference:</b> <code>{html.escape(reference)}</code>\n" f"🕒 <b>Time:</b> {html.escape(lag['date']+' '+lag['time'])} (Nigeria)\n\n" f"❗ <b>Error:</b> <code>{html.escape(type(exc).__name__)}</code>\n" f"📝 <b>Details:</b> <code>{html.escape(str(exc)[:500])}</code>\n\n📌 Full traceback yana cikin <code>mobile_bot.log</code>.")
+
 def safe_handler(func):
     @functools.wraps(func)
     def wrapper(update, *args, **kwargs):
@@ -3013,41 +3132,45 @@ def safe_handler(func):
             )
             return result
         except InsufficientFundsError as e:
-            bot.send_message(
-                chat_id,
-                f"❌ Insufficient balance.\n💰 Available: {e.available:.4f} "
-                f"{e.currency.upper()}\n📝 Needed: {e.requested:.4f} {e.currency.upper()}",
-            )
+            bot.send_message(chat_id,
+                "💳 <b>Ba a kammala ba</b>\n\n"
+                f"💰 Balance: <b>{e.available:.4f} {e.currency.upper()}</b>\n"
+                f"📌 Ana buƙatar: <b>{e.requested:.4f} {e.currency.upper()}</b>\n\n"
+                "Ka ƙara balance sannan ka sake gwadawa.", parse_mode="HTML")
         except (WithdrawalStateError, SubmissionStateError, ValueError) as e:
-            bot.send_message(chat_id, f"⚠️ {e}")
-        except Exception as exc:
-            logger.exception("Unhandled error in handler '%s' (chat %s)", func.__name__, chat_id)
+            ref=f"ERR-{secrets.token_hex(4).upper()}"
+            logger.warning("User action error handler=%s chat=%s ref=%s: %s",func.__name__,chat_id,ref,e)
+            bot.send_message(chat_id, _friendly_user_error(func.__name__, ref), parse_mode="HTML")
             try:
-                bot.send_message(chat_id, "⚠️ Something went wrong. Please try again or contact Support.")
-            except Exception:
-                logger.exception("Failed to notify user %s of error", chat_id)
-            # Do not flood the admin chat when one broken dependency causes
-            # several handlers to fail in the same second. The full traceback
-            # remains in mobile_bot.log; the admin alert identifies the actual
-            # exception instead of only saying to inspect the log.
-            global _LAST_ADMIN_ERROR_SIGNATURE, _LAST_ADMIN_ERROR_AT
-            signature = f"{func.__name__}|{type(exc).__name__}|{str(exc)[:300]}"
-            now_mono = time.monotonic()
-            if signature != _LAST_ADMIN_ERROR_SIGNATURE or (now_mono - _LAST_ADMIN_ERROR_AT) >= 30:
-                _LAST_ADMIN_ERROR_SIGNATURE = signature
-                _LAST_ADMIN_ERROR_AT = now_mono
-                try:
-                    bot.send_message(
-                        PRIMARY_ADMIN,
-                        f"🐛 <b>Handler error</b>\n\n"
-                        f"Handler: <code>{html.escape(func.__name__)}</code>\n"
-                        f"Chat: <code>{chat_id}</code>\n"
-                        f"Error: <code>{html.escape(type(exc).__name__)}: {html.escape(str(exc)[:300])}</code>\n\n"
-                        f"Full traceback: <code>mobile_bot.log</code>",
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    logger.exception("Failed to notify admin of error")
+                bot.send_message(PRIMARY_ADMIN,
+                    "⚠️ <b>ACTION ERROR</b>\n\n"
+                    f"🏷️ Type: <code>{_friendly_error_code(func.__name__)}</code>\n"
+                    f"🧩 Handler: <code>{html.escape(func.__name__)}</code>\n"
+                    f"👤 User/Chat: <code>{html.escape(str(chat_id))}</code>\n"
+                    f"🧾 Reference: <code>{ref}</code>\n"
+                    f"📝 Details: <code>{html.escape(str(e)[:500])}</code>", parse_mode="HTML")
+            except Exception: logger.exception("Failed to notify admin of action error")
+        except Exception as exc:
+            tg_kind=_telegram_exception_kind(exc)
+            if tg_kind == 'rate_limit':
+                # Never send another Telegram message in response to Telegram's
+                # own flood-control error. That creates a self-amplifying loop.
+                logger.warning("Telegram flood control in handler=%s chat=%s; suppressing secondary alert: %s", func.__name__, chat_id, exc)
+                return
+            if tg_kind == 'stale_ui':
+                # A user can press an old inline button or two workers can race
+                # an edit. These are expected UI races, not system failures.
+                logger.info("Stale Telegram UI event handler=%s chat=%s: %s", func.__name__, chat_id, exc)
+                return
+            logger.exception("Unhandled error in handler '%s' (chat %s)", func.__name__, chat_id)
+            ref=f"ERR-{secrets.token_hex(4).upper()}"
+            try: bot.send_message(chat_id, _friendly_user_error(func.__name__, ref), parse_mode="HTML")
+            except Exception as notify_exc:
+                logger.warning("Could not send user error notice chat=%s: %s", chat_id, notify_exc)
+            signature=f"{func.__name__}|{type(exc).__name__}|{str(exc)[:300]}"
+            if _admin_error_allowed(signature, 120.0):
+                try: bot.send_message(PRIMARY_ADMIN, _friendly_admin_error(func.__name__,chat_id,exc,ref), parse_mode="HTML")
+                except Exception as notify_exc: logger.warning("Could not send admin error notice: %s", notify_exc)
         finally:
             _remove_wait_notice(chat_id, wait_notice)
     return wrapper
@@ -3222,13 +3345,13 @@ def _community_settings_text():
         "",
         "Configure the two required user join points and the internal destinations.",
         "👥 User Group + 📢 User Channel are mandatory for normal users.",
-        "📝 Each destination is configured in 2 separate steps: Chat ID first, then Join/Invite link.",
+        "📝 User Group + User Channel need Chat ID and Join/Invite link. Internal admin-only destinations need Chat ID only.",
         "",
     ]
     for k in COMMUNITY_KEYS:
         d = _community_get(k)
         cid = d.get("id") or "Not set"
-        link = d.get("link") or "Auto/public link if available"
+        link = d.get("link") or ("Required for user joining" if k in COMMUNITY_JOIN_KEYS else "Not required")
         required = " • <b>REQUIRED</b>" if k in COMMUNITY_JOIN_KEYS else ""
         lines.append(f"{COMMUNITY_LABELS[k]}{required}\n🆔 <code>{html.escape(str(cid))}</code>\n🔗 {html.escape(str(link))}")
         lines.append("")
@@ -3343,12 +3466,11 @@ def community_set_cb(c):
     _screen_from_callback(
         c,
         f"✏️ <b>{COMMUNITY_LABELS[kind]}</b>\n\n"
-        "<b>Step 1 of 2 — Chat ID</b>\n"
-        "Send the Telegram numeric chat ID only. Do not add the link on this step.\n\n"
-        "Example: <code>-1001234567890</code>\n\n"
-        "The bot will check that it can access the chat and that the chat type is correct.\n"
-        f"Current ID: <code>{html.escape(str(current_id or 'not set'))}</code>\n\n"
-        "The bot must already be a member/admin of the target chat.",
+        + ("<b>Step 1 of 2 — Chat ID</b>\nSend the Telegram numeric chat ID only. A Join/Invite link is required after this for user Group/Channel.\n\n" if kind in COMMUNITY_JOIN_KEYS else "<b>Admin-only destination</b>\nSend the Telegram numeric chat ID only. No link is required. It will be saved immediately after validation.\n\n")
+        + "Example: <code>-1001234567890</code>\n\n"
+        + "The bot will check that it can access the chat and that the chat type is correct.\n"
+        + f"Current ID: <code>{html.escape(str(current_id or 'not set'))}</code>\n\n"
+        + "The bot must already be a member/admin of the target chat.",
         parse_mode="HTML",
         reply_markup=back_kb(),
     )
@@ -3461,6 +3583,13 @@ def _handle_community_set(m, state):
             return
 
         # Keep the ID in the FSM only until the second step is completed.
+        if kind not in COMMUNITY_JOIN_KEYS:
+            _community_set(kind, cid, "", m.chat.id)
+            clear_state(m.chat.id)
+            _community_pending_clear(m.chat.id)
+            _screen_send_for_chat(m.chat.id, f"✅ {COMMUNITY_LABELS[kind]} saved.\n\nID: <code>{cid}</code>\nNo public/invite link is required for this admin-only destination.", parse_mode="HTML", reply_markup=main_menu(m.chat.id))
+            return
+
         update_state(m.chat.id, step="link", kind=kind, cid=str(cid))
         _community_pending_set(m.chat.id, kind, "link", cid)
         current_link = _community_link(kind)
@@ -8834,16 +8963,22 @@ CREATE TABLE IF NOT EXISTS otp_orders (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     chat_id TEXT,
-    message_id INTEGER
+    message_id INTEGER,
+    next_poll_at TEXT,
+    poll_failures INTEGER NOT NULL DEFAULT 0,
+    last_provider_status TEXT,
+    ui_updated_at TEXT,
+    poll_lease_until TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_otp_orders_user_status ON otp_orders(user_id,status);
-CREATE INDEX IF NOT EXISTS idx_otp_orders_status ON otp_orders(status);
+CREATE INDEX IF NOT EXISTS idx_otp_orders_status_poll ON otp_orders(status,next_poll_at);
+CREATE INDEX IF NOT EXISTS idx_otp_orders_activation ON otp_orders(activation_id);
 """
 
 
 _GRIZZLY_COUNTRY_META = {'1': ('Ukraine', 'UA'), '2': ('Kazakhstan', 'KZ'), '3': ('China', 'CN'), '4': ('Philippines', 'PH'), '6': ('Indonesia', 'ID'), '7': ('Malaysia', 'MY'), '8': ('Kenya', 'KE'), '9': ('Tanzania', 'TZ'), '10': ('Vietnam', 'VN'), '11': ('Kyrgyzstan', 'KG'), '12': ('USA (virtual)', 'US'), '13': ('Israel', 'IL'), '14': ('Hong Kong', 'HK'), '15': ('Poland', 'PL'), '16': ('United Kingdom', 'GB'), '17': ('Madagascar', 'MG'), '18': ('DR Congo', 'CD'), '19': ('Nigeria', 'NG'), '20': ('Macao', 'MO'), '21': ('Egypt', 'EG'), '22': ('India', 'IN'), '23': ('Ireland', 'IE'), '24': ('Cambodia', 'KH'), '25': ('Laos', 'LA'), '26': ('Haiti', 'HT'), '27': ('Ivory Coast', 'CI'), '28': ('Gambia', 'GM'), '29': ('Serbia', 'RS'), '30': ('Yemen', 'YE'), '31': ('South Africa', 'ZA'), '32': ('Romania', 'RO'), '33': ('Colombia', 'CO'), '34': ('Estonia', 'EE'), '35': ('Azerbaijan', 'AZ'), '36': ('Canada', 'CA'), '37': ('Morocco', 'MA'), '38': ('Ghana', 'GH'), '39': ('Argentina', 'AR'), '40': ('Uzbekistan', 'UZ'), '41': ('Cameroon', 'CM'), '42': ('Chad', 'TD'), '43': ('Germany', 'DE'), '44': ('Lithuania', 'LT'), '45': ('Croatia', 'HR'), '46': ('Sweden', 'SE'), '48': ('Netherlands', 'NL'), '49': ('Latvia', 'LV'), '50': ('Austria', 'AT'), '52': ('Thailand', 'TH'), '53': ('Saudi Arabia', 'SA'), '55': ('Taiwan', 'TW'), '56': ('Spain', 'ES'), '58': ('Algeria', 'DZ'), '59': ('Slovenia', 'SI'), '60': ('Bangladesh', 'BD'), '61': ('Senegal', 'SN'), '62': ('Turkey', 'TR'), '63': ('Czech Republic', 'CZ'), '64': ('Sri Lanka', 'LK'), '65': ('Peru', 'PE'), '66': ('Pakistan', 'PK'), '67': ('New Zealand', 'NZ'), '68': ('Guinea', 'GN'), '69': ('Mali', 'ML'), '71': ('Ethiopia', 'ET'), '73': ('Brazil', 'BR'), '74': ('Afghanistan', 'AF'), '75': ('Uganda', 'UG'), '76': ('Angola', 'AO'), '77': ('Cyprus', 'CY'), '78': ('France', 'FR'), '79': ('Papua New Guinea', 'PG'), '80': ('Mozambique', 'MZ'), '81': ('Nepal', 'NP'), '82': ('Belgium', 'BE'), '83': ('Bulgaria', 'BG'), '84': ('Hungary', 'HU'), '86': ('Italy', 'IT'), '87': ('Paraguay', 'PY'), '88': ('Honduras', 'HN'), '89': ('Tunisia', 'TN'), '90': ('Nicaragua', 'NI'), '91': ('Timor-Leste', 'TL'), '92': ('Bolivia', 'BO'), '93': ('Costa Rica', 'CR'), '94': ('Guatemala', 'GT'), '95': ('United Arab Emirates', 'AE'), '96': ('Zimbabwe', 'ZW'), '97': ('Puerto Rico', 'PR'), '99': ('Togo', 'TG'), '100': ('Kuwait', 'KW'), '101': ('El Salvador', 'SV'), '102': ('Tonga', 'TO'), '103': ('Jamaica', 'JM'), '104': ('Trinidad and Tobago', 'TT'), '105': ('Ecuador', 'EC'), '106': ('Eswatini', 'SZ'), '107': ('Oman', 'OM'), '108': ('Bosnia and Herzegovina', 'BA'), '109': ('Dominican Republic', 'DO'), '111': ('Qatar', 'QA'), '112': ('Panama', 'PA'), '114': ('Mauritania', 'MR'), '115': ('Sierra Leone', 'SL'), '116': ('Jordan', 'JO'), '117': ('Portugal', 'PT'), '118': ('Barbados', 'BB'), '119': ('Burundi', 'BI'), '120': ('Benin', 'BJ'), '121': ('Brunei Darussalam', 'BN'), '122': ('Bahamas', 'BS'), '123': ('Botswana', 'BW'), '124': ('Belize', 'BZ'), '125': ('Central African Republic', 'CF'), '128': ('Georgia', 'GE'), '129': ('Greece', 'GR'), '130': ('Guinea-Bissau', 'GW'), '131': ('Guyana', 'GY'), '132': ('Iceland', 'IS'), '133': ('Comoros', 'KM'), '134': ('Saint Kitts and Nevis', 'KN'), '135': ('Liberia', 'LR'), '136': ('Lesotho', 'LS'), '137': ('Malawi', 'MW'), '138': ('Namibia', 'NA'), '139': ('Niger', 'NE'), '140': ('Rwanda', 'RW'), '141': ('Slovakia', 'SK'), '142': ('Suriname', 'SR'), '143': ('Tajikistan', 'TJ'), '145': ('Bahrain', 'BH'), '146': ('Reunion', 'RE'), '147': ('Zambia', 'ZM'), '148': ('Armenia', 'AM'), '149': ('Somalia', 'SO'), '150': ('Republic of the Congo', 'CG'), '151': ('Chile', 'CL'), '152': ('Burkina Faso', 'BF'), '154': ('Gabon', 'GA'), '155': ('Albania', 'AL'), '156': ('Uruguay', 'UY'), '157': ('Mauritius', 'MU'), '158': ('Bhutan', 'BT'), '159': ('Maldives', 'MV'), '161': ('Turkmenistan', 'TM'), '162': ('French Guiana', 'GF'), '163': ('Finland', 'FI'), '164': ('Saint Lucia', 'LC'), '165': ('Luxembourg', 'LU'), '166': ('Saint Vincent', 'VC'), '167': ('Equatorial Guinea', 'GQ'), '168': ('Djibouti', 'DJ'), '169': ('Antigua and Barbuda', 'AG'), '170': ('Cayman Islands', 'KY'), '171': ('Montenegro', 'ME'), '172': ('Denmark', 'DK'), '173': ('Switzerland', 'CH'), '174': ('Norway', 'NO'), '175': ('Australia', 'AU'), '176': ('Eritrea', 'ER'), '177': ('South Sudan', 'SS'), '178': ('Sao Tome and Principe', 'ST'), '179': ('Aruba', 'AW'), '180': ('Montserrat', 'MS'), '181': ('Anguilla', 'AI'), '182': ('Japan', 'JP'), '183': ('North Macedonia', 'MK'), '184': ('Seychelles', 'SC'), '185': ('New Caledonia', 'NC'), '186': ('Cape Verde', 'CV'), '187': ('USA', 'US'), '188': ('Palestine', 'PS'), '189': ('Fiji', 'FJ'), '199': ('Malta', 'MT'), '201': ('Gibraltar', 'GI'), '203': ('Kosovo', 'XK'), '204': ('Niue', 'NU'), '1003': ('Bermuda', 'BM'), '1007': ('Vanuatu', 'VU'), '1008': ('Greenland', 'GL'), '1011': ('Martinique', 'MQ'), '1012': ('French Polynesia', 'PF'), '10161': ('American Samoa', 'AS'), '10348': ('Liechtenstein', 'LI'), '10349': ('Sint Maarten', 'SX'), '10350': ('South Korea', 'KR'), '10351': ('Singapore', 'SG')}
 
-# Human-readable Grizzly/SMS-Activate-compatible service labels.
+# Human-readable Mobile Business Hub/SMS-Activate-compatible service labels.
 _OTP_SERVICE_LABELS = {
     'tg':'Telegram','wa':'WhatsApp','ig':'Instagram','fb':'Facebook','go':'Google / YouTube / Gmail',
     'tw':'Twitter / X','mm':'Microsoft','hw':'Alipay / Alibaba / 1688','am':'Amazon','oi':'Tinder',
@@ -8898,7 +9033,7 @@ def _otp_service_display_name(code, candidate=None):
     candidate=str(candidate or '').strip()
     if candidate and candidate.lower() != code.lower() and candidate.lower() not in {'unknown','none','null'}:
         return candidate
-    return _OTP_SERVICE_LABELS.get(code.lower()) or (f'Grizzly Service ({code})' if code else 'Grizzly Service')
+    return _OTP_SERVICE_LABELS.get(code.lower()) or (f'Service ({code})' if code else 'Service')
 
 _OTP_SERVICE_EMOJIS = {
     'whatsapp':'🟢','facebook':'🔵','telegram':'✈️','instagram':'📸','google':'🔎','gmail':'✉️','youtube':'▶️',
@@ -8980,6 +9115,11 @@ def otp_db_init():
             ("refunded", "INTEGER NOT NULL DEFAULT 0"),
             ("chat_id", "TEXT"),
             ("message_id", "INTEGER"),
+            ("next_poll_at", "TEXT"),
+            ("poll_failures", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_provider_status", "TEXT"),
+            ("ui_updated_at", "TEXT"),
+            ("poll_lease_until", "TEXT"),
         ]
         for col, definition in otp_order_migrations:
             if col not in otp_order_columns:
@@ -8991,6 +9131,10 @@ def otp_db_init():
             conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_otp_orders_activation_id ON otp_orders(activation_id) WHERE activation_id IS NOT NULL')
         except Exception:
             logger.exception('Could not create OTP activation index')
+        try:
+            conn.execute('UPDATE otp_orders SET next_poll_at=COALESCE(next_poll_at,updated_at,created_at) WHERE status="waiting"')
+        except Exception:
+            logger.exception('Could not initialize OTP polling schedule')
 
         # Refresh human-readable service labels for existing installations.
         existing_services=conn.execute('SELECT service_code,service_name FROM otp_services').fetchall()
@@ -9026,7 +9170,7 @@ def _otp_http(action, **params):
     try: data=json.loads(body)
     except Exception: data=None
     if isinstance(data,dict):
-        # Grizzly V2 responses are JSON. Keep both the provider status and
+        # Mobile Business Hub V2 responses are JSON. Keep both the provider status and
         # activation payload so every activation can be tracked independently.
         activation_id=(data.get('activationId') or data.get('activation_id')
                        or data.get('id') or (data.get('activation') or {}).get('activationId')
@@ -9063,7 +9207,7 @@ def _otp_http(action, **params):
     return {'status':'error','raw':body}
 
 def _otp_http_catalog(action, **params):
-    # Grizzly's current docs list getServices/getCountries and the current
+    # Mobile Business Hub's current docs list getServices/getCountries and the current
     # price endpoints. Some accounts/endpoints do not require operator while
     # others expose it. Try the configured operator first, then a documented
     # numeric operator fallback, then the legacy no-operator form.
@@ -9084,7 +9228,7 @@ def _otp_http_catalog(action, **params):
             last=r
         except Exception as exc:
             last=exc
-    raise RuntimeError(f'Grizzly {action} failed: {last}')
+    raise RuntimeError(f'Mobile Business Hub {action} failed: {last}')
 
 def _otp_flag_from_iso(iso):
     iso=(iso or '').upper()
@@ -9181,7 +9325,7 @@ def _otp_parse_country_list(payload):
 def otp_sync_countries():
     r=_otp_http_catalog('getCountries')
     rows=_otp_parse_country_list(r.get('data',r))
-    if not rows: raise RuntimeError(f'Grizzly returned no countries: {r}')
+    if not rows: raise RuntimeError(f'Mobile Business Hub returned no countries: {r}')
     with db_tx() as conn:
         for code,name,flag in rows:
             conn.execute('INSERT INTO otp_grizzly_countries(code,name,flag,updated_at) VALUES(?,?,?,?) ON CONFLICT(code) DO UPDATE SET name=excluded.name,flag=excluded.flag,updated_at=excluded.updated_at',(code,name,flag,_otp_now()))
@@ -9223,7 +9367,7 @@ def otp_sync_services():
     except Exception as exc: last=exc
     # If the catalogue action is unavailable on an account, fall back to the
     # documented full-price endpoint for a small set of live countries. This
-    # still discovers real Grizzly service codes rather than hard-coding apps.
+    # still discovers real service codes rather than hard-coding apps.
     try:
         otp_sync_countries()
         countries=fetchall('SELECT code FROM otp_grizzly_countries ORDER BY CAST(code AS INTEGER) LIMIT 8')
@@ -9239,7 +9383,7 @@ def otp_sync_services():
                     conn.execute("INSERT INTO otp_services(service_code,service_name,emoji,enabled,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(service_code) DO UPDATE SET service_name=excluded.service_name,emoji=excluded.emoji,updated_at=excluded.updated_at",(code,name,_otp_service_emoji(name),1,_otp_now()))
             return len(found)
     except Exception as exc: last=exc
-    raise RuntimeError(f'Grizzly service sync failed: {last}')
+    raise RuntimeError(f'service sync failed: {last}')
 
 def _otp_public_channel_id():
     return _community_id("user_channel")
@@ -9342,11 +9486,11 @@ def otp_sync_service_stock(service_code, country_codes=None):
     # IMPORTANT PERFORMANCE RULE:
     # Never force a full country catalogue refresh from a user click.
     # A service can have many countries and each price/stock lookup is an
-    # external Grizzly request. User-facing handlers should either use the
+    # external Mobile Business Hub request. User-facing handlers should either use the
     # cached DB values or refresh only the requested country.
     if country_codes is None:
         try: otp_sync_countries()
-        except Exception as exc: logger.warning('Grizzly country sync failed: %s',exc)
+        except Exception as exc: logger.warning('Mobile Business Hub country sync failed: %s',exc)
     _otp_ensure_service_countries(service_code)
     if country_codes is None:
         rows=fetchall('SELECT country_code FROM otp_service_countries WHERE service_code=? AND (enabled=1 OR profit_active=1 OR explicit_price IS NOT NULL) ORDER BY name',(service_code,))
@@ -9391,10 +9535,10 @@ def otp_sync_service_stock(service_code, country_codes=None):
                 _otp_post_country_price_update(service_code,code,'NUMBERS AVAILABLE')
         except Exception as exc:
             last=exc
-            logger.warning('Grizzly price refresh failed for service=%s country=%s: %s',service_code,code,exc)
+            logger.warning('Provider price refresh failed for service=%s country=%s: %s',service_code,code,exc)
     if alerts: _otp_notify_price_alerts(service_code,alerts)
     if updated==0 and last and not alerts:
-        raise RuntimeError(f'Grizzly price refresh failed for {service_code}: {last}')
+        raise RuntimeError(f'Provider price refresh failed for {service_code}: {last}')
     return updated
 
 def otp_sync_stock():
@@ -9427,10 +9571,10 @@ def _otp_norm_country_name(value):
 def _otp_load_calling_codes():
     """Build a country-name -> E.164 calling-code index from countryinfo.
 
-    IMPORTANT: Grizzly's country `code` is an internal API/catalogue ID and is
+    IMPORTANT: Mobile Business Hub's country `code` is an internal API/catalogue ID and is
     deliberately NOT used as a telephone calling code. This index is based on
-    the real country's callingCodes metadata, so newly-added Grizzly countries
-    follow the same rule without adding another Grizzly-ID mapping.
+    the real country's callingCodes metadata, so newly-added Mobile Business Hub countries
+    follow the same rule without adding another Mobile Business Hub-ID mapping.
     """
     global _OTP_CALLING_DATA_READY, _OTP_CALLING_BY_NAME
     if _OTP_CALLING_DATA_READY:
@@ -9463,7 +9607,7 @@ def _otp_load_calling_codes():
         logger.warning('Could not load country calling-code metadata: %s', exc)
 
 def _otp_country_calling_code(country_name, phone=None):
-    """Return the REAL telephone calling code, never Grizzly's country ID."""
+    """Return the REAL telephone calling code, never Mobile Business Hub's country ID."""
     _otp_load_calling_codes()
     name = _otp_norm_country_name(country_name)
     codes = _OTP_CALLING_BY_NAME.get(name, [])
@@ -9477,8 +9621,8 @@ def _otp_country_calling_code(country_name, phone=None):
                 return code
         return sorted(codes, key=len, reverse=True)[0]
 
-    # Secondary lookup through pycountry when Grizzly's display name differs
-    # slightly from the countryinfo spelling. Still no Grizzly-ID assumption.
+    # Secondary lookup through pycountry when Mobile Business Hub's display name differs
+    # slightly from the countryinfo spelling. Still no Mobile Business Hub-ID assumption.
     if pycountry is not None and name:
         try:
             c = pycountry.countries.lookup(str(country_name))
@@ -9515,7 +9659,7 @@ def _otp_local_phone(phone, country_name=None, country_code=None):
     """Return local number using the country's REAL E.164 calling code.
 
     `country_code` is retained only for backward-compatible callers. It is
-    NEVER interpreted as a telephone calling code because Grizzly uses its own
+    NEVER interpreted as a telephone calling code because Mobile Business Hub uses its own
     internal country IDs (for example Colombia=33 while +57 is Colombia's
     actual calling code).
     """
@@ -9562,39 +9706,25 @@ def _otp_received_update_text(o):
             f'📩 Your request for <code>{phone}</code> has been received.\n'
             f'🔑 <b>Verification code: {code}</b>')
 
-def _otp_kb(order_id,service_code,country_code,manual_remaining, phone_number=None):
+def _otp_kb(order_id,service_code,country_code,manual_remaining, phone_number=None, otp_code=None):
     label=f'✋ Cancel available {manual_remaining//60:02d}:{manual_remaining%60:02d}' if manual_remaining>0 else '❌ Cancel'
     kb=types.InlineKeyboardMarkup()
-    # Telegram's official copy_text button copies ONLY the local/subscriber number.
-    # Never treat Grizzly's internal country ID as a telephone calling code.
-    row = fetchone('SELECT name FROM otp_service_countries WHERE service_code=? AND country_code=?',(service_code,str(country_code)))
-    local = _otp_phone_parts(phone_number, row['name'] if row else None)[1]
-    try:
-        kb.row(types.InlineKeyboardButton('📋 Copy Number', copy_text=types.CopyTextButton(text=local)))
-    except Exception:
-        # Compatibility fallback for older pyTelegramBotAPI versions.
-        try:
-            btn=types.InlineKeyboardButton('📋 Copy Number', callback_data=f'otp_copy:{order_id}')
-            setattr(btn,'copy_text', {'text': local})
-            btn.callback_data=None
-            kb.row(btn)
-        except Exception:
-            pass
+    row=fetchone('SELECT name FROM otp_service_countries WHERE service_code=? AND country_code=?',(service_code,str(country_code)))
+    local=_otp_phone_parts(phone_number,row['name'] if row else None)[1] if phone_number else ''
+    if local:
+        try: kb.row(types.InlineKeyboardButton('📋 Copy Number',copy_text=types.CopyTextButton(text=local)))
+        except Exception: pass
+    if otp_code:
+        try: kb.row(types.InlineKeyboardButton('📋 Copy OTP',copy_text=types.CopyTextButton(text=str(otp_code))))
+        except Exception: pass
     kb.row(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{order_id}'))
-    # Manual cancel must not be offered before the 5-minute threshold.
-    # The countdown remains visible in the waiting text; once it reaches zero
-    # the real Cancel button is added.
-    if manual_remaining <= 0:
-        kb.row(types.InlineKeyboardButton(label,callback_data=f'otp_cancel:{order_id}'))
+    if manual_remaining<=0: kb.row(types.InlineKeyboardButton(label,callback_data=f'otp_cancel:{order_id}'))
     return kb
-
 def _otp_create_activation(user_id,service_code,country_code,source_chat_id):
     # Refresh ONLY the selected country before purchase. The previous code
     # refreshed every country in the service here, which could make Telegram
     # appear frozen for several seconds (or longer) on services such as
     # Telegram.
-    try: otp_sync_service_stock(service_code, [str(country_code)])
-    except Exception as exc: logger.warning('OTP selected-country refresh failed: %s',exc)
     row=fetchone('SELECT * FROM otp_service_countries WHERE service_code=? AND country_code=? AND enabled=1 AND profit_active=1',(service_code,str(country_code)))
     if not row: return None,'This service/country is no longer available.'
     if int(row['available_count'] or 0)<=0: return None,'❌ No number is currently available for this service and country.'
@@ -9613,7 +9743,10 @@ def _otp_create_activation(user_id,service_code,country_code,source_chat_id):
     try: result=_otp_http('getNumberV2',service=service_code,country=str(row['country_code']),maxPrice=str(price))
     except Exception:
         with db_tx() as conn: conn.execute('UPDATE otp_orders SET status="manual_reconciliation",updated_at=? WHERE order_id=? AND status="processing"',(_otp_now(),order_id))
-        return None,f'⚠️ Grizzly did not confirm the request. Order <code>{order_id}</code> is under safe reconciliation; balance was not auto-refunded.'
+        try:
+            notify_admins(f'🚨 <b>OTP PROVIDER ISSUE</b>\n\n🧾 Order: <code>{order_id}</code>\n👤 User: <code>{user_id}</code>\n⚠️ Provider did not confirm the number request. The order is under safe reconciliation; no automatic refund was issued yet.', parse_mode='HTML')
+        except Exception: pass
+        return None,f'⚠️ <b>An samu matsala wajen tabbatar da number</b>\n\n🧾 Request: <code>{order_id}</code>\n\nBa za a cire maka kuɗi sau biyu ba. An ajiye request ɗin domin reconciliation, kuma Support zai iya duba shi.'
     if result.get('status')!='ok' or not result.get('activation_id'):
         with db_tx() as conn:
             conn.execute('UPDATE otp_orders SET status="refunded",refunded=1,updated_at=? WHERE order_id=?',(_otp_now(),order_id))
@@ -9621,7 +9754,7 @@ def _otp_create_activation(user_id,service_code,country_code,source_chat_id):
         return None,'❌ No number is currently available. Your funds were refunded.'
     activation_id=result['activation_id']; phone=result['phone']; raw_cost=float(result.get('cost') or row['grizzly_cost'] or 0)
     with db_tx() as conn:
-        conn.execute('UPDATE otp_orders SET status="waiting",phone_number=?,activation_id=?,raw_cost=?,updated_at=? WHERE order_id=?',(phone,activation_id,raw_cost,_otp_now(),order_id))
+        conn.execute('UPDATE otp_orders SET status="waiting",phone_number=?,activation_id=?,raw_cost=?,next_poll_at=?,poll_failures=0,last_provider_status=?,updated_at=? WHERE order_id=?',(phone,activation_id,raw_cost,_otp_now(),0,'STATUS_WAIT_CODE',_otp_now(),order_id))
         logger.info('Quick OTP activation created order=%s activation_id=%s phone=%s service=%s country=%s',order_id,activation_id,phone,service_code,row['country_code'])
         conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",(str(user_id),"OTP_PURCHASE",str(user_id),price,order_id,f'service={service_name}; country={row["name"]}; provider_cost={raw_cost:.6f}',_otp_now()))
     return fetchone('SELECT o.*,s.service_name FROM otp_orders o LEFT JOIN otp_services s ON s.service_code=o.service_code WHERE o.order_id=?',(order_id,)),None
@@ -9659,6 +9792,78 @@ def otp_services_page_cb(c):
         return bot.answer_callback_query(c.id, "Quick OTP is currently unavailable.", show_alert=True)
     bot.answer_callback_query(c.id); _otp_show_services(c.message.chat.id,int(c.data.split(':',1)[1]),edit=c.message.message_id)
 
+# Provider activation calls are network-bound. Never hold a Telegram callback
+# worker while waiting up to the HTTP timeout; a bounded executor keeps bursts
+# from exhausting Telegram handler threads.
+_OTP_ACTIVATION_EXECUTOR = ThreadPoolExecutor(
+    max_workers=OTP_ACTIVATION_WORKERS, thread_name_prefix='otp-activation'
+)
+
+def _otp_activation_ui_result(chat_id, message_id, service, code, result, msg, new_message=False):
+    try:
+        if not result:
+            text = f'⚠️ <b>Number request could not be completed.</b>\n\n{msg}'
+            kb = types.InlineKeyboardMarkup().add(
+                types.InlineKeyboardButton('🔄 Try Again', callback_data=f'otp_country:{service}:{code}')
+            ).add(types.InlineKeyboardButton('⬅️ Countries', callback_data=f'otp_service:{service}'))
+        else:
+            text = _otp_waiting_text(dict(result), 1200, 300)
+            kb = _otp_kb(result['order_id'], service, code, 300, result.get('phone_number'))
+            with db_tx() as conn:
+                conn.execute(
+                    'UPDATE otp_orders SET chat_id=?,message_id=?,updated_at=?,ui_updated_at=? WHERE order_id=?',
+                    (str(chat_id), message_id, _otp_now(), _otp_now(), result['order_id'])
+                )
+        bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
+    except Exception:
+        logger.exception('Quick OTP async UI update failed chat=%s message=%s service=%s country=%s', chat_id, message_id, service, code)
+
+_OTP_ADMIN_FAILURE_LAST={}
+_OTP_ADMIN_FAILURE_LOCK=threading.Lock()
+
+def _otp_admin_number_failure(chat_id, service, country_code, msg):
+    """Notify admins about number acquisition failures without flooding them."""
+    text=str(msg or '')
+    low=text.lower()
+    if 'insufficient balance' in low or 'balance' in low and 'required' in low:
+        return
+    country=fetchone('SELECT name FROM otp_service_countries WHERE service_code=? AND country_code=?',(service,str(country_code)))
+    country_name=str(country['name']) if country else str(country_code)
+    if 'no number' in low or 'available' in low:
+        category='NO STOCK'
+    elif 'provider' in low or 'reconciliation' in low or 'confirm' in low:
+        category='PROVIDER / RECONCILIATION'
+    else:
+        category='NUMBER REQUEST'
+    key=f'{category}|{service}|{country_code}'
+    now_mono=time.monotonic()
+    with _OTP_ADMIN_FAILURE_LOCK:
+        last=_OTP_ADMIN_FAILURE_LAST.get(key,0.0)
+        if now_mono-last < (300.0 if category=='NO STOCK' else 60.0):
+            return
+        _OTP_ADMIN_FAILURE_LAST[key]=now_mono
+    message=(
+        '🚨 <b>OTP NUMBER REQUEST</b>\n\n'
+        f'📌 <b>Result:</b> {html.escape(category)}\n'
+        f'👤 <b>User:</b> <code>{html.escape(str(chat_id))}</code>\n'
+        f'🧩 <b>Service:</b> <code>{html.escape(str(service))}</code>\n'
+        f'🌍 <b>Country:</b> {html.escape(country_name)} (<code>{html.escape(str(country_code))}</code>)\n'
+        f'📝 <b>Details:</b> {html.escape(text[:700])}\n\n'
+        'ℹ️ This alert is rate-limited to prevent Telegram flood-control.'
+    )
+    notify_admins(message, parse_mode='HTML')
+
+def _otp_activation_done(future, chat_id, message_id, service, code):
+    try:
+        result, msg = future.result()
+    except Exception as exc:
+        logger.exception('Quick OTP activation task failed')
+        result, msg = None, 'Please try again. If your balance changed, the request is under safe reconciliation.'
+        _otp_admin_number_failure(chat_id, service, code, f'Activation worker error: {type(exc).__name__}: {exc}')
+    if not result:
+        _otp_admin_number_failure(chat_id, service, code, msg)
+    _otp_activation_ui_result(chat_id, message_id, service, code, result, msg)
+
 _OTP_CATALOG_REFRESH_LOCK = threading.Lock()
 _OTP_CATALOG_REFRESH_AT = 0.0
 _OTP_CATALOG_REFRESH_TTL = 60.0
@@ -9682,7 +9887,7 @@ def _otp_refresh_catalog_async():
 @safe_handler
 def otp_entry(m):
     if feature_blocked_message(m,'quick_otp'): return
-    # Show the cached catalogue immediately. Only refresh Grizzly in the
+    # Show the cached catalogue immediately. Only refresh Mobile Business Hub in the
     # background so the user does not wait on an external API call.
     service_count=fetchone('SELECT COUNT(*) AS n FROM otp_services WHERE enabled=1')
     if not service_count or int(service_count['n'] or 0)==0:
@@ -9712,7 +9917,7 @@ def otp_service_cb(c):
     service=c.data.split(':',1)[1]; svc=fetchone('SELECT * FROM otp_services WHERE service_code=? AND enabled=1',(service,))
     if not svc: return bot.answer_callback_query(c.id,'Service unavailable.',show_alert=True)
     # Acknowledge the Telegram click FIRST, then render cached countries.
-    # Live Grizzly stock refresh runs in the background instead of blocking
+    # Live Mobile Business Hub stock refresh runs in the background instead of blocking
     # the callback for every country in the service.
     bot.answer_callback_query(c.id,'Please wait…')
     _otp_show_countries(c.message.chat.id, service, 0, svc, edit=c.message.message_id)
@@ -9825,46 +10030,20 @@ def otp_buy_cb(c):
     if not is_feature_enabled("quick_otp", c.from_user.id):
         return bot.answer_callback_query(c.id, "Quick OTP is currently unavailable.", show_alert=True)
     _,service,code=c.data.split(':',2)
-    bot.answer_callback_query(c.id,'Processing…')
+    bot.answer_callback_query(c.id,'Getting a number…')
     try:
-        result,msg=_otp_create_activation(c.from_user.id,service,code,c.message.chat.id)
-        if not result:
-            # Keep the Quick OTP flow in-place. Do not create a stack of
-            # repeated generic error messages underneath the country screen.
-            bot.edit_message_text(
-                f'⚠️ <b>Number request could not be completed.</b>\n\n{msg}',
-                c.message.chat.id,c.message.message_id,parse_mode='HTML',
-                reply_markup=types.InlineKeyboardMarkup().add(
-                    types.InlineKeyboardButton('🔄 Try Again',callback_data=f'otp_country:{service}:{code}')
-                ).add(
-                    types.InlineKeyboardButton('⬅️ Countries',callback_data=f'otp_service:{service}')
-                )
-            )
-            return
-        text=_otp_waiting_text(dict(result),1200,300)
-        # The country/service message becomes the waiting card. This prevents
-        # duplicate "Something went wrong" / duplicate option messages.
         bot.edit_message_text(
-            text,c.message.chat.id,c.message.message_id,parse_mode='HTML',
-            reply_markup=_otp_kb(result['order_id'],service,code,300,result['phone_number'])
+            '⏳ <b>Getting your number…</b>\n\nPlease wait. This request is being processed independently.',
+            c.message.chat.id, c.message.message_id, parse_mode='HTML'
         )
-        with db_tx() as conn:
-            conn.execute('UPDATE otp_orders SET chat_id=?,message_id=?,updated_at=? WHERE order_id=?',
-                         (str(c.message.chat.id),c.message.message_id,_otp_now(),result['order_id']))
     except Exception:
-        logger.exception('Quick OTP buy failed order creation chat=%s service=%s country=%s',c.message.chat.id,service,code)
-        try:
-            bot.edit_message_text(
-                '⚠️ <b>Number request failed.</b>\n\nPlease try again. Your balance was not charged if the number was not confirmed.',
-                c.message.chat.id,c.message.message_id,parse_mode='HTML',
-                reply_markup=types.InlineKeyboardMarkup().add(
-                    types.InlineKeyboardButton('🔄 Try Again',callback_data=f'otp_country:{service}:{code}')
-                ).add(
-                    types.InlineKeyboardButton('⬅️ Countries',callback_data=f'otp_service:{service}')
-                )
-            )
-        except Exception:
-            raise
+        logger.exception('Could not show OTP processing state')
+    future=_OTP_ACTIVATION_EXECUTOR.submit(
+        _otp_create_activation, c.from_user.id, service, code, c.message.chat.id
+    )
+    future.add_done_callback(
+        lambda f: _otp_activation_done(f, c.message.chat.id, c.message.message_id, service, code)
+    )
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_new:'))
 @safe_handler
@@ -9876,32 +10055,22 @@ def otp_new_cb(c):
     if not old:
         return bot.answer_callback_query(c.id,'This OTP request is no longer available.',show_alert=True)
     service,code=old['service_code'],old['country_code']
-
-    # IMPORTANT: this is a NEW Grizzly activation. The old activation is never
-    # cancelled, released, refunded, edited, or reused by this action.
     bot.answer_callback_query(c.id,'Getting a new number…')
     try:
-        result,msg=_otp_create_activation(c.from_user.id,service,code,c.message.chat.id)
-        if not result:
-            return bot.answer_callback_query(c.id, str(msg)[:180], show_alert=True)
-        # Give the new activation its own permanent tracking message. The worker
-        # polls by activation_id, so old and new numbers can receive OTPs independently.
-        result=dict(result)
-        text=_otp_waiting_text(result,1200,300)
         sent=bot.send_message(
             c.message.chat.id,
-            text,
-            parse_mode='HTML',
-            reply_markup=_otp_kb(result['order_id'],service,code,300,result.get('phone_number'))
+            '⏳ <b>Getting a new number…</b>\n\nThis is a separate OTP request; your previous request remains independent.',
+            parse_mode='HTML'
         )
-        with db_tx() as conn:
-            conn.execute(
-                'UPDATE otp_orders SET chat_id=?,message_id=?,updated_at=? WHERE order_id=?',
-                (str(sent.chat.id),sent.message_id,_otp_now(),result['order_id'])
-            )
-    except Exception as exc:
-        logger.exception('Quick OTP new-number creation failed: %s',exc)
-        return bot.answer_callback_query(c.id,'Unable to get a new number right now. Please try again.',show_alert=True)
+    except Exception:
+        logger.exception('Could not create async OTP message')
+        return
+    future=_OTP_ACTIVATION_EXECUTOR.submit(
+        _otp_create_activation, c.from_user.id, service, code, c.message.chat.id
+    )
+    future.add_done_callback(
+        lambda f: _otp_activation_done(f, sent.chat.id, sent.message_id, service, code)
+    )
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_cancel:'))
 @safe_handler
@@ -9914,12 +10083,12 @@ def otp_cancel_cb(c):
     if remaining>0: return bot.answer_callback_query(c.id,f'⏱ Cancel will be available in {int(remaining)//60:02d}:{int(remaining)%60:02d}',show_alert=True)
     try: r=_otp_http('setStatus',id=o['activation_id'],status='8')
     except Exception: return bot.answer_callback_query(c.id,'Network error. Please try again.',show_alert=True)
-    if r.get('raw') not in {'ACCESS_CANCEL','STATUS_CANCEL','NO_ACTIVATION'}: return bot.answer_callback_query(c.id,'Cancel was not accepted by Grizzly yet.',show_alert=True)
+    if not _otp_provider_missing(r): return bot.answer_callback_query(c.id,'Cancel is still pending. Please try again shortly.',show_alert=True)
     with db_tx() as conn:
         cur=conn.execute('SELECT * FROM otp_orders WHERE order_id=? AND status="waiting" AND refunded=0',(order_id,)).fetchone()
         if not cur: return bot.answer_callback_query(c.id,'Order already closed.',show_alert=True)
         adjust_balance(conn,cur['user_id'],'usdt',float(cur['selling_price']),'OTP_REFUND',reason=f'Quick OTP manual cancel {order_id}',related_txn=order_id,processed_by=cur['user_id'])
-        conn.execute('UPDATE otp_orders SET status="cancelled",refunded=1,updated_at=? WHERE order_id=?',(_otp_now(),order_id))
+        conn.execute('UPDATE otp_orders SET status="cancelled",refunded=1,activation_id=NULL,next_poll_at=NULL,poll_lease_until=NULL,last_provider_status=?,updated_at=? WHERE order_id=?',(str(r.get('raw') or r.get('provider_status') or 'CANCELLED')[:120],_otp_now(),order_id))
         conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",(str(cur['user_id']),"OTP_REFUND",str(cur['user_id']),cur['selling_price'],order_id,"manual cancel",_otp_now()))
     bot.answer_callback_query(c.id,'Cancelled and refunded.')
     try: _otp_update_message(o['chat_id'],o['message_id'],f'❌ <b>OTP REQUEST CANCELLED</b>\n\n🆔 Request ID: <code>{html.escape(str(o["order_id"]))}</code>\n\n💰 Your refund has been processed.',types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{o["order_id"]}')))
@@ -9940,8 +10109,12 @@ def otp_admin_menu(m):
 @safe_handler
 def otp_admin_sync_services(c):
     if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
-    try: n=otp_sync_services(); bot.answer_callback_query(c.id,f'✅ Synced {n:,} Grizzly services.')
-    except Exception as exc: bot.answer_callback_query(c.id,f'❌ Sync failed: {str(exc)[:180]}',show_alert=True)
+    try: n=otp_sync_services(); bot.answer_callback_query(c.id,f'✅ Synced {n:,} services.')
+    except Exception as exc:
+        if _telegram_exception_kind(exc) in ('rate_limit','stale_ui'):
+            return
+        bot.answer_callback_query(c.id,'❌ Sync could not be completed. Please try again shortly.',show_alert=True)
+        logger.warning('OTP admin service sync failed: %s',exc)
 
 @bot.callback_query_handler(func=lambda c: c.data=='otp_admin_active')
 @safe_handler
@@ -9972,13 +10145,13 @@ def otp_admin_back(c):
 def otp_admin_find_service(c):
     if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
     clear_state(c.from_user.id); update_state(c.from_user.id,flow='otp_find_service',step=None)
-    bot.answer_callback_query(c.id); _screen_from_callback(c,'🔎 <b>FIND GRIZZLY SERVICE</b>\n\nSend the service name or code.\nExamples: <code>WhatsApp</code>, <code>Telegram</code>, <code>wa</code>, <code>tg</code>',parse_mode='HTML',reply_markup=_screen_back_kb())
+    bot.answer_callback_query(c.id); _screen_from_callback(c,'🔎 <b>FIND SERVICE</b>\n\nSend the service name or code.\nExamples: <code>WhatsApp</code>, <code>Telegram</code>, <code>wa</code>, <code>tg</code>',parse_mode='HTML',reply_markup=_screen_back_kb())
 
 def _handle_otp_find_service(m,state):
     if not is_super_admin(m.chat.id): clear_state(m.chat.id); return
     q=m.text.strip().lower()
     rows=fetchall('SELECT * FROM otp_services WHERE lower(service_name) LIKE ? OR lower(service_code) LIKE ? ORDER BY service_name LIMIT 30',(f'%{q}%',f'%{q}%'))
-    if not rows: return _screen_send_for_chat(m.chat.id,'❌ No matching service found. Try the exact Grizzly service code or a shorter name.')
+    if not rows: return _screen_send_for_chat(m.chat.id,'❌ No matching service found. Try the exact service code or a shorter name.')
     kb=types.InlineKeyboardMarkup()
     for r in rows: kb.add(types.InlineKeyboardButton(f"{r['emoji']} {r['service_name']}",callback_data=f"otp_admin_svc:{r['service_code']}"))
     clear_state(m.chat.id); _screen_send_for_chat(m.chat.id,f'🔎 <b>Matches for:</b> {html.escape(m.text.strip())}\n\nSelect a service:',parse_mode='HTML',reply_markup=kb)
@@ -9999,7 +10172,7 @@ def otp_admin_services(c):
     if (page+1)*per<total: nav.append(types.InlineKeyboardButton('Next ➡️',callback_data=f'otp_admin_services:{page+1}'))
     if nav: kb.row(*nav)
     kb.row(types.InlineKeyboardButton('🔄 Sync',callback_data='otp_admin_sync_services'))
-    bot.answer_callback_query(c.id); _screen_from_callback(c,f'🧩 <b>GRIZZLY SERVICES</b>\n\nShowing {page*per+1 if total else 0}-{min((page+1)*per,total)} of {total:,}.\n\nSelect a service to configure its countries and profit.',parse_mode='HTML',reply_markup=kb)
+    bot.answer_callback_query(c.id); _screen_from_callback(c,f'🧩 <b>SERVICES</b>\n\nShowing {page*per+1 if total else 0}-{min((page+1)*per,total)} of {total:,}.\n\nSelect a service to configure its countries and profit.',parse_mode='HTML',reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_admin_svc:'))
 @safe_handler
@@ -10020,7 +10193,7 @@ def _otp_admin_show_countries(chat_id, service, page, svc, edit=None):
     if not rows and page>0:
         page-=1
         rows=fetchall('SELECT * FROM otp_service_countries WHERE service_code=? ORDER BY name LIMIT ? OFFSET ?',(service,per,page*per))
-    # Refresh the visible page so the admin sees current Grizzly cost/stock
+    # Refresh the visible page so the admin sees current Provider cost/stock
     # instead of a misleading 0.00 from an unsynced catalogue row.
     visible_codes=[str(r['country_code']) for r in rows if str(r['country_code']).isdigit()]
     if visible_codes:
@@ -10043,7 +10216,7 @@ def _otp_admin_show_countries(chat_id, service, page, svc, edit=None):
     if (page+1)*per<total: nav.append(types.InlineKeyboardButton('Next ➡️',callback_data=f'otp_admin_countries:{service}:{page+1}'))
     if nav: kb.row(*nav)
     kb.row(types.InlineKeyboardButton('⬅️ Services',callback_data='otp_admin_services:0'))
-    text=f'{svc["emoji"]} <b>{html.escape(svc["service_name"])}</b>\n\n🌍 Configure a country below.\n🟢 = visible to users\n⚪ = hidden until profit is activated.\n💹 Prices/stock refreshed from Grizzly for this page.\n📄 Page {page+1}/{max(1,(total+per-1)//per)}'
+    text=f'{svc["emoji"]} <b>{html.escape(svc["service_name"])}</b>\n\n🌍 Configure a country below.\n🟢 = visible to users\n⚪ = hidden until profit is activated.\n💹 Prices/stock refreshed from provider for this page.\n📄 Page {page+1}/{max(1,(total+per-1)//per)}'
     if edit:
         bot.edit_message_text(text,chat_id,edit,parse_mode='HTML',reply_markup=kb)
     else:
@@ -10133,7 +10306,7 @@ def otp_admin_sc(c):
     global_profit='OFF' if not svc or svc['global_profit_percent'] is None else f"{float(svc['global_profit_percent']):g}%"
     manual_price='OFF' if r['explicit_price'] is None else f"{float(r['explicit_price']):.2f} USDT"
     cost_text='N/A' if r['grizzly_cost'] is None else f"{float(r['grizzly_cost']):.4f}"
-    bot.answer_callback_query(c.id); bot.edit_message_text(f'{service_emoji} <b>{html.escape(str(service_label))}</b>\n🌍 {_otp_country_flag(r["name"], r["flag"])} <b>{html.escape(r["name"])}</b>\n\n🏷 Grizzly cost: {cost_text}\n💰 User price: <b>{_otp_price(r,svc):.2f} USDT</b>\n📈 Global profit: <b>{global_profit}</b>\n✍️ Manual country price: <b>{manual_price}</b>\n📦 Available: <b>{int(r["available_count"]):,}</b>\n🔘 Status: {status}',c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=kb)
+    bot.answer_callback_query(c.id); bot.edit_message_text(f'{service_emoji} <b>{html.escape(str(service_label))}</b>\n🌍 {_otp_country_flag(r["name"], r["flag"])} <b>{html.escape(r["name"])}</b>\n\n🏷 Provider cost: {cost_text}\n💰 User price: <b>{_otp_price(r,svc):.2f} USDT</b>\n📈 Global profit: <b>{global_profit}</b>\n✍️ Manual country price: <b>{manual_price}</b>\n📦 Available: <b>{int(r["available_count"]):,}</b>\n🔘 Status: {status}',c.message.chat.id,c.message.message_id,parse_mode='HTML',reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_service_toggle:'))
 @safe_handler
@@ -10165,7 +10338,7 @@ def otp_profit_cb(c):
     kb=types.InlineKeyboardMarkup()
     for pct in (5,10,15,30,50): kb.add(types.InlineKeyboardButton(f'➕ {pct}%',callback_data=f'otp_profit_set:{service}:{code}:{pct}'))
     kb.add(types.InlineKeyboardButton('✍️ Manual percentage',callback_data=f'otp_profit_manual:{service}:{code}'))
-    bot.answer_callback_query(c.id); _screen_from_callback(c,f'📈 <b>{r["name"]}</b>\n\nChoose profit above the live Grizzly cost:',parse_mode='HTML',reply_markup=kb)
+    bot.answer_callback_query(c.id); _screen_from_callback(c,f'📈 <b>{r["name"]}</b>\n\nChoose profit above the live Provider cost:',parse_mode='HTML',reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_profit_set:'))
 @safe_handler
@@ -10238,7 +10411,7 @@ def otp_global_manual_cb(c):
     service=c.data.split(':',1)[1]; svc=fetchone('SELECT service_name FROM otp_services WHERE service_code=?',(service,))
     if not svc: return bot.answer_callback_query(c.id,'Service not found.',show_alert=True)
     clear_state(c.from_user.id); update_state(c.from_user.id,flow='otp_global_manual',step=None,otp_service=service)
-    bot.answer_callback_query(c.id); _screen_from_callback(c,f'✍️ Send exact global profit percentage for <b>{html.escape(svc["service_name"])}</b>.\nExample: <code>25</code>\nUse <code>0</code> to keep prices at Grizzly cost (countries still need to be above cost to show users).',parse_mode='HTML',reply_markup=_screen_back_kb())
+    bot.answer_callback_query(c.id); _screen_from_callback(c,f'✍️ Send exact global profit percentage for <b>{html.escape(svc["service_name"])}</b>.\nExample: <code>25</code>\nUse <code>0</code> to keep prices at Provider cost (countries still need to be above cost to show users).',parse_mode='HTML',reply_markup=_screen_back_kb())
 
 def _handle_otp_global_manual(m,state):
     if not is_super_admin(m.chat.id): clear_state(m.chat.id); return
@@ -10279,7 +10452,7 @@ def _handle_otp_set_price(m,state):
     if price<=0: return _screen_send_for_chat(m.chat.id,'❌ Price must be greater than 0.')
     r=fetchone('SELECT grizzly_cost FROM otp_service_countries WHERE service_code=? AND country_code=?',(service,code))
     if not r: return _screen_send_for_chat(m.chat.id,'❌ Country not found.')
-    if price<=float(r['grizzly_cost'] or 0): return _screen_send_for_chat(m.chat.id,f'❌ User price must be above Grizzly cost ({float(r["grizzly_cost"] or 0):.4f} USDT).')
+    if price<=float(r['grizzly_cost'] or 0): return _screen_send_for_chat(m.chat.id,f'❌ User price must be above Provider cost ({float(r["grizzly_cost"] or 0):.4f} USDT).')
     with db_tx() as conn: conn.execute('UPDATE otp_service_countries SET explicit_price=?,markup_percent=0,markup_fixed=0,profit_active=1,enabled=1,updated_at=? WHERE service_code=? AND country_code=?',(price,_otp_now(),service,code))
     _otp_post_country_price_update(service,code,'PRICE UPDATED')
     clear_state(m.chat.id); _screen_send_for_chat(m.chat.id,f'✅ Final user price updated to {price:.2f} USDT. 🟢 Active.',reply_markup=main_menu(m.chat.id))
@@ -10291,8 +10464,8 @@ _FLOW_ROUTES[('otp_set_price',None)] = _handle_otp_set_price
 def otp_admin_alerts(c):
     if not is_super_admin(c.from_user.id): return bot.answer_callback_query(c.id,'Super admin only',show_alert=True)
     rows=fetchall('SELECT a.*,s.service_name FROM otp_price_alerts a LEFT JOIN otp_services s ON s.service_code=a.service_code ORDER BY a.id DESC LIMIT 30')
-    if not rows: return bot.answer_callback_query(c.id,'No Grizzly price changes recorded yet.',show_alert=True)
-    lines=['🔔 <b>RECENT GRIZZLY PRICE CHANGES</b>','']
+    if not rows: return bot.answer_callback_query(c.id,'No Provider price changes recorded yet.',show_alert=True)
+    lines=['🔔 <b>RECENT MOBILE BUSINESS HUB PRICE CHANGES</b>','']
     for r in rows:
         arrow='📈' if r['direction']=='increased' else '📉'
         lines.append(f'{arrow} {r["service_name"] or r["service_code"]} • {r["country_name"]}: {float(r["old_cost"]):.4f} → {float(r["new_cost"]):.4f} USDT')
@@ -10310,98 +10483,100 @@ def _otp_price_watcher():
         except Exception: logger.exception('OTP price watcher error')
         time.sleep(600)
 
+_OTP_TERMINAL_PROVIDER_STATUSES = {'STATUS_CANCEL','STATUS_CANCELLED','NO_ACTIVATION','ACCESS_CANCEL','ACCESS_CANCEL_ALREADY','STATUS_EXPIRED','EXPIRED'}
+
+def _otp_provider_missing(r):
+    raw=str(r.get('raw') or '').upper().strip()
+    status=str(r.get('provider_status') or r.get('status') or '').upper().strip()
+    return raw in _OTP_TERMINAL_PROVIDER_STATUSES or status in _OTP_TERMINAL_PROVIDER_STATUSES
+
+def _otp_close_provider_order(o, terminal_status='cancelled', reason='provider closed activation'):
+    with db_tx() as conn:
+        cur=conn.execute('SELECT * FROM otp_orders WHERE order_id=? AND status="waiting" AND refunded=0',(o['order_id'],)).fetchone()
+        if not cur: return False
+        adjust_balance(conn,cur['user_id'],'usdt',float(cur['selling_price']),'OTP_REFUND',reason=f'Quick OTP {reason} {o["order_id"]}',related_txn=o['order_id'],processed_by=cur['user_id'])
+        conn.execute('UPDATE otp_orders SET status=?,refunded=1,activation_id=NULL,next_poll_at=NULL,poll_lease_until=NULL,last_provider_status=?,updated_at=? WHERE order_id=?',(terminal_status,str(reason)[:120],_otp_now(),o['order_id']))
+    return True
+
+def _otp_poll_one(o):
+    try: return o,_otp_http('getStatusV2',id=o['activation_id']),None
+    except Exception as exc: return o,None,exc
+
 def _otp_worker():
-    last_status={}
+    executor=ThreadPoolExecutor(max_workers=OTP_STATUS_WORKERS,thread_name_prefix='otp-status')
     while True:
         try:
-            active=fetchall('SELECT o.*,s.service_name FROM otp_orders o LEFT JOIN otp_services s ON s.service_code=o.service_code WHERE o.status="waiting" ORDER BY o.created_at LIMIT 300')
             now=datetime.now(timezone.utc)
-            for o_row in active:
-                # sqlite3.Row does not implement .get(). Convert once so the
-                # waiting UI/clock code can safely use dictionary access.
-                o=dict(o_row)
+            rows=fetchall('SELECT o.*,s.service_name FROM otp_orders o LEFT JOIN otp_services s ON s.service_code=o.service_code WHERE o.status="waiting" AND (o.poll_lease_until IS NULL OR o.poll_lease_until<=?) ORDER BY COALESCE(o.next_poll_at,o.created_at) LIMIT ?',(now.isoformat(),OTP_STATUS_BATCH,))
+            due=[]
+            for row in rows:
+                o=dict(row)
                 try: elapsed=(now-datetime.fromisoformat(o['created_at'])).total_seconds()
                 except Exception: continue
-                auto=max(0,1200-int(elapsed)); manual=max(0,300-int(elapsed))
                 if elapsed>=1200:
                     try: r=_otp_http('setStatus',id=o['activation_id'],status='8')
-                    except Exception: continue
-                    if r.get('raw') not in {'ACCESS_CANCEL','STATUS_CANCEL','NO_ACTIVATION'}: continue
-                    with db_tx() as conn:
-                        cur=conn.execute('SELECT * FROM otp_orders WHERE order_id=? AND status="waiting" AND refunded=0',(o['order_id'],)).fetchone()
-                        if cur:
-                            adjust_balance(conn,cur['user_id'],'usdt',float(cur['selling_price']),'OTP_REFUND',reason=f'Quick OTP auto cancel {o["order_id"]}',related_txn=o['order_id'],processed_by=cur['user_id'])
-                            conn.execute('UPDATE otp_orders SET status="expired",refunded=1,updated_at=? WHERE order_id=?',(_otp_now(),o['order_id']))
-                    try:
-                        _otp_update_message(
-                            o['chat_id'], o['message_id'],
-                            f'⌛ <b>OTP REQUEST EXPIRED</b>\n\n🆔 Request ID: <code>{html.escape(str(o["order_id"]))}</code>\n\n💰 Your refund has been processed because no OTP was received within 20 minutes.',
-                            types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{o["order_id"]}'))
-                        )
-                    except Exception: logger.exception('Could not update expired OTP message')
+                    except Exception as exc:
+                        logger.warning('OTP auto-expire cancel failed order=%s: %s',o['order_id'],exc); continue
+                    if _otp_provider_missing(r) and _otp_close_provider_order(o,'expired','automatic expiry'):
+                        try: _otp_update_message(o['chat_id'],o['message_id'],f'⌛ <b>OTP REQUEST EXPIRED</b>\n\n🆔 Request ID: <code>{html.escape(str(o["order_id"]))}</code>\n\n💰 Your refund has been processed because no code was received in time.',types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{o["order_id"]}')))
+                        except Exception: logger.exception('Could not update expired OTP message')
                     continue
-                if o['chat_id'] and o['message_id']:
-                    _otp_update_message(o['chat_id'],o['message_id'],_otp_waiting_text(o,auto,manual),_otp_kb(o['order_id'],o['service_code'],o['country_code'],manual,o.get('phone_number')))
-                if elapsed-last_status.get(o['order_id'],-999)>=3:
-                    last_status[o['order_id']]=elapsed
-                    try: r=_otp_http('getStatusV2',id=o['activation_id'])
-                    except Exception: continue
-                    # The API poll is also a synchronization point for the
-                    # waiting card. Recalculate the timers immediately after
-                    # every status check, whether an OTP was found or not.
-                    if not r.get('otp') and o['chat_id'] and o['message_id']:
+                due_at=o.get('next_poll_at')
+                if due_at:
+                    try:
+                        if datetime.fromisoformat(due_at)>now: continue
+                    except Exception: pass
+                if len(due) < OTP_STATUS_WORKERS:
+                    lease_until=(now+timedelta(seconds=60)).isoformat()
+                    with db_tx() as conn:
+                        claimed=conn.execute(
+                            'UPDATE otp_orders SET poll_lease_until=?,updated_at=? WHERE order_id=? AND status="waiting" AND (poll_lease_until IS NULL OR poll_lease_until<=?)',
+                            (lease_until,_otp_now(),o['order_id'],now.isoformat())
+                        ).rowcount
+                    if claimed:
+                        o['poll_lease_until']=lease_until
+                        due.append(o)
+            futures=[executor.submit(_otp_poll_one,o) for o in due[:OTP_STATUS_WORKERS]]
+            for fut in futures:
+                o,r,exc=fut.result()
+                if exc:
+                    failures=int(o.get('poll_failures') or 0)+1
+                    delay=min(30,max(OTP_STATUS_POLL_SECONDS,2**min(failures,4)))
+                    with db_tx() as conn: conn.execute('UPDATE otp_orders SET poll_failures=?,next_poll_at=?,poll_lease_until=NULL,updated_at=? WHERE order_id=? AND status="waiting"',(failures,(datetime.now(timezone.utc)+timedelta(seconds=delay)).isoformat(),_otp_now(),o['order_id']))
+                    continue
+                status=str(r.get('provider_status') or r.get('status') or '').upper()
+                otp=r.get('otp')
+                if otp:
+                    with db_tx() as conn:
+                        cur=conn.execute('SELECT * FROM otp_orders WHERE order_id=? AND status="waiting"',(o['order_id'],)).fetchone()
+                        if not cur: continue
+                        conn.execute('UPDATE otp_orders SET status="completed",otp_code=?,last_provider_status=?,next_poll_at=NULL,poll_lease_until=NULL,updated_at=? WHERE order_id=?',(str(otp),status or 'STATUS_OK',_otp_now(),o['order_id']))
+                        conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",(str(cur['user_id']),'OTP_COMPLETED',str(cur['user_id']),cur['selling_price'],o['order_id'],f'service={cur["service_code"]}; country={cur["country_name"]}',_otp_now()))
+                    updated=dict(o); updated['otp_code']=str(otp)
+                    try: _otp_update_message(o['chat_id'],o['message_id'],_otp_received_update_text(updated),_otp_kb(o['order_id'],o['service_code'],o['country_code'],0,o.get('phone_number'),str(otp)))
+                    except Exception: logger.exception('OTP received UI update failed order=%s',o['order_id'])
+                elif _otp_provider_missing(r):
+                    if _otp_close_provider_order(o,'cancelled','provider activation no longer exists or expired'):
+                        try: _otp_update_message(o['chat_id'],o['message_id'],f'❌ <b>OTP REQUEST CLOSED</b>\n\n🆔 Request ID: <code>{html.escape(str(o["order_id"]))}</code>\n\n💰 Your refund has been processed. This request is no longer active.',types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{o["order_id"]}')))
+                        except Exception: logger.exception('Could not update closed OTP message')
+                else:
+                    now_iso=_otp_now()
+                    try:
+                        last_ui=datetime.fromisoformat(o['ui_updated_at']) if o.get('ui_updated_at') else None
+                    except Exception:
+                        last_ui=None
+                    should_update_ui = last_ui is None or (datetime.now(timezone.utc)-last_ui).total_seconds() >= OTP_UI_UPDATE_SECONDS
+                    with db_tx() as conn:
+                        conn.execute(
+                            'UPDATE otp_orders SET poll_failures=0,last_provider_status=?,next_poll_at=?,updated_at=?,ui_updated_at=CASE WHEN ? THEN ? ELSE ui_updated_at END WHERE order_id=? AND status="waiting"',
+                            (status,(datetime.now(timezone.utc)+timedelta(seconds=OTP_STATUS_POLL_SECONDS)).isoformat(),now_iso,1 if should_update_ui else 0,now_iso,o['order_id'])
+                        )
+                    if should_update_ui:
                         try:
-                            fresh_now=datetime.now(timezone.utc)
-                            fresh_elapsed=(fresh_now-datetime.fromisoformat(o['created_at'])).total_seconds()
-                            fresh_auto=max(0,1200-int(fresh_elapsed)); fresh_manual=max(0,300-int(fresh_elapsed))
-                            fresh=dict(o)
-                            _otp_update_message(o['chat_id'],o['message_id'],_otp_waiting_text(fresh,fresh_auto,fresh_manual),_otp_kb(o['order_id'],o['service_code'],o['country_code'],fresh_manual,o.get('phone_number')))
+                            elapsed=(datetime.now(timezone.utc)-datetime.fromisoformat(o['created_at'])).total_seconds(); auto=max(0,1200-int(elapsed)); manual=max(0,300-int(elapsed))
+                            _otp_update_message(o['chat_id'],o['message_id'],_otp_waiting_text(o,auto,manual),_otp_kb(o['order_id'],o['service_code'],o['country_code'],manual,o.get('phone_number')))
                         except Exception:
-                            logger.warning('OTP waiting-clock sync after status check failed for order=%s',o['order_id'])
-                    if r.get('otp'):
-                        logger.info('Quick OTP code received order=%s activation_id=%s',o['order_id'],o['activation_id'])
-                        otp=r['otp']
-                        try: _otp_http('setStatus',id=o['activation_id'],status='6')
-                        except Exception: pass
-                        with db_tx() as conn:
-                            cur=conn.execute('SELECT * FROM otp_orders WHERE order_id=? AND status="waiting"',(o['order_id'],)).fetchone()
-                            if cur:
-                                conn.execute('UPDATE otp_orders SET status="completed",otp_code=?,updated_at=? WHERE order_id=?',(otp,_otp_now(),o['order_id']))
-                                conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",(str(cur['user_id']),"OTP_COMPLETED",str(cur['user_id']),cur['selling_price'],o['order_id'],f'service={cur["service_code"]}; country={cur["country_name"]}',_otp_now()))
-                        # Update the existing waiting message in place. Do NOT send
-                        # a second OTP message: the phone number and OTP stay together.
-                        try:
-                            updated_order=dict(o)
-                            updated_order['phone_number']=cur['phone_number'] or o['phone_number']
-                            updated_order['otp_code']=otp
-                            kb=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{o["order_id"]}'))
-                            _otp_update_message(o['chat_id'],o['message_id'],_otp_received_update_text(updated_order),kb)
-                            # The waiting card is updated in place, then send a
-                            # separate, clear notification so the requester gets
-                            # an unmistakable OTP-arrived message as well.
-                            bot.send_message(
-                                o['chat_id'],
-                                f'📩 <b>OTP RECEIVED</b>\n\n'
-                                f'📞 Your request for <code>{html.escape(_otp_phone_parts(o["phone_number"], o.get("country_name"))[1])}</code> has been received.\n\n'
-                                f'🔐 <b>OTP: {html.escape(str(otp))}</b>',
-                                parse_mode='HTML'
-                            )
-                        except Exception as exc:
-                            logger.warning('OTP received UI update/notification failed: %s',exc)
-                    elif r.get('provider_status') in {'STATUS_CANCEL','STATUS_CANCELLED','NO_ACTIVATION','ACCESS_CANCEL','ACCESS_CANCEL_ALREADY'} or r.get('raw') in {'STATUS_CANCEL','NO_ACTIVATION','ACCESS_CANCEL','ACCESS_CANCEL_ALREADY'}:
-                        with db_tx() as conn:
-                            cur=conn.execute('SELECT * FROM otp_orders WHERE order_id=? AND status="waiting" AND refunded=0',(o['order_id'],)).fetchone()
-                            if cur:
-                                adjust_balance(conn,cur['user_id'],'usdt',float(cur['selling_price']),'OTP_REFUND',reason=f'Quick OTP provider cancel {o["order_id"]}',related_txn=o['order_id'],processed_by=cur['user_id'])
-                                conn.execute('UPDATE otp_orders SET status="cancelled",refunded=1,updated_at=? WHERE order_id=?',(_otp_now(),o['order_id']))
-                        try:
-                            _otp_update_message(
-                                o['chat_id'], o['message_id'],
-                                f'❌ <b>OTP REQUEST CANCELLED</b>\n\n🆔 Request ID: <code>{html.escape(str(o["order_id"]))}</code>\n\n💰 Your refund has been processed.',
-                                types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{o["order_id"]}'))
-                            )
-                        except Exception: logger.exception('Could not update provider-cancelled OTP message')
-            live={x['order_id'] for x in active}; last_status={k:v for k,v in last_status.items() if k in live}
+                            logger.exception('OTP waiting UI update failed order=%s',o['order_id'])
         except Exception: logger.exception('Quick OTP worker error')
         time.sleep(1)
 

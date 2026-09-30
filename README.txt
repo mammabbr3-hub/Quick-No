@@ -138,3 +138,33 @@ CALLING CODE FIX (2026-09-27)
 - Example: Grizzly Colombia ID 33 -> Colombia telephone code +57; the returned E.164 number is split as +57 + local number.
 - The same logic applies to countries added later, without adding a new Grizzly-ID-to-calling-code mapping.
 - Copy Number copies only the local/subscriber number.
+
+
+PERFORMANCE / OTP CONCURRENCY
+-----------------------------
+- Buy/New Number no longer performs a live stock/catalogue refresh in the Telegram callback path. Provider activation is requested directly; background sync handles catalogue stock.
+- OTP status polling is independent per activation and uses a bounded worker pool. Configure OTP_STATUS_WORKERS (default 32), OTP_STATUS_POLL_SECONDS (default 3), and OTP_STATUS_BATCH (default 500).
+- Telegram handler concurrency is configurable with TELEGRAM_HANDLER_THREADS (default 32). Do not set these above the limits your provider/account and Railway instance can sustain.
+- Each OTP order stores its next poll time and provider state, so a slow/failed provider request backs off instead of blocking every other order.
+- When the provider reports an activation is cancelled/missing/expired, the order is detached from provider polling, refunded once, and the user-facing card contains only the bot's own wording.
+- Completed OTP cards include Telegram's native Copy OTP button when supported by the installed pyTelegramBotAPI version. Telegram added the official CopyTextButton in Bot API 7.11.
+
+COMMUNITY SETTINGS
+------------------
+- User Group and User Channel require a Chat ID plus a public/private join link because users must be able to join them.
+- Submission Channel, Approved Work Channel, Bank Store Channel, Support Channel, and Audit Channel are admin-only destinations and now require only the numeric Chat ID; no link is required or saved.
+
+
+FINAL TELEGRAM FLOOD-CONTROL / OTP ERROR SAFETY
+-----------------------------------------------
+- TELEGRAM_HANDLER_THREADS default: 16 (bounded 4..32).
+- TELEGRAM_GLOBAL_RATE default: 25 outbound API requests/sec.
+- TELEGRAM_PER_CHAT_INTERVAL default: 1.10 sec between outbound calls to the same chat.
+- TELEGRAM_FLOOD_RETRY_MAX default: 3 sec; long Telegram retry_after values are not slept inside handlers.
+- Telegram 429 errors never trigger a second Telegram error message.
+- Stale callback/UI errors such as "query is too old" and "message is not modified" are treated as expected UI races, not admin incidents.
+- OTP waiting-card edits default to once per 60 seconds; OTP receipt/cancel/expiry still update immediately.
+- When a user cannot obtain a number, admins receive a readable, rate-limited OTP NUMBER REQUEST alert with user, service, country, category and details.
+- Expected insufficient-balance failures do not spam admins. No-stock alerts are grouped per service/country.
+
+These settings are designed to prevent a burst of concurrent OTP activity from creating a Telegram flood-control feedback loop. Telegram's official Bot API guidance says bots should avoid more than about one message per second in a single chat and about 30 messages per second for bulk sends.
