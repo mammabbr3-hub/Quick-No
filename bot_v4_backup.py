@@ -9261,28 +9261,21 @@ def _otp_http(action, **params):
     try: data=json.loads(body)
     except Exception: data=None
     if isinstance(data,dict):
-        # Grizzly's documented getNumberV2 response is a flat JSON object
-        # containing activationId + phoneNumber. Some gateways/proxies may wrap
-        # the same payload under `data` or `activation`, so normalize all of those
-        # forms before the activation worker touches the database.
-        nested = data.get('data') if isinstance(data.get('data'),dict) else {}
-        activation = data.get('activation') if isinstance(data.get('activation'),dict) else {}
-        activation_id=(data.get('activationId') or data.get('activation_id') or data.get('id')
-                       or activation.get('activationId') or activation.get('activation_id') or activation.get('id')
-                       or nested.get('activationId') or nested.get('activation_id') or nested.get('id'))
+        # Mobile Business Hub V2 responses are JSON. Keep both the provider status and
+        # activation payload so every activation can be tracked independently.
+        activation_id=(data.get('activationId') or data.get('activation_id')
+                       or data.get('id') or (data.get('activation') or {}).get('activationId')
+                       if isinstance(data.get('activation'),dict) else
+                       data.get('activationId') or data.get('activation_id') or data.get('id'))
         phone=(data.get('phoneNumber') or data.get('phone_number')
-               or activation.get('phoneNumber') or activation.get('phone_number')
-               or nested.get('phoneNumber') or nested.get('phone_number'))
-        cost=(data.get('activationCost') or data.get('activation_cost') or data.get('cost')
-              or activation.get('activationCost') or activation.get('activation_cost') or activation.get('cost')
-              or nested.get('activationCost') or nested.get('activation_cost') or nested.get('cost'))
-        status_value=(data.get('status') or data.get('state') or data.get('activationStatus')
-                      or activation.get('status') or nested.get('status'))
+               or (data.get('activation') or {}).get('phoneNumber')
+               if isinstance(data.get('activation'),dict) else
+               data.get('phoneNumber') or data.get('phone_number'))
+        cost=data.get('activationCost') or data.get('activation_cost') or data.get('cost')
+        status_value=data.get('status') or data.get('state') or data.get('activationStatus')
         sms=data.get('sms') if isinstance(data.get('sms'),dict) else {}
-        if not sms and isinstance(activation.get('sms'),dict):
-            sms=activation.get('sms')
-        if not sms and isinstance(nested.get('sms'),dict):
-            sms=nested.get('sms')
+        if not sms and isinstance(data.get('data'),dict) and isinstance(data['data'].get('sms'),dict):
+            sms=data['data']['sms']
         otp=(sms.get('code') or sms.get('otp') or data.get('code') or
              data.get('otp') or data.get('smsCode'))
         provider_status=str(status_value or '').upper().strip()
@@ -9860,85 +9853,11 @@ def _otp_create_activation(user_id,service_code,country_code,source_chat_id):
             adjust_balance(conn,user_id,'usdt',price,'OTP_REFUND',reason=f'Quick OTP failed {order_id}',related_txn=order_id,processed_by=user_id)
         return None,'❌ No number is currently available. Your funds were refunded.'
     activation_id=result['activation_id']; phone=result['phone']; raw_cost=float(result.get('cost') or row['grizzly_cost'] or 0)
-
-    # Provider allocation is successful at this point. The most dangerous failure
-    # is losing the DB write after the user's wallet has already been charged: the
-    # provider then has a live number while the bot has no activation to poll.
-    # Persist the provider result with retries before returning control to Telegram.
-    persist_error = None
-    for attempt in range(5):
-        try:
-            with db_tx() as conn:
-                conn.execute(
-                    'UPDATE otp_orders SET status="waiting",phone_number=?,activation_id=?,raw_cost=?,next_poll_at=?,poll_failures=0,last_provider_status=?,updated_at=? WHERE order_id=? AND status="processing"',
-                    (phone,activation_id,raw_cost,_otp_now(),'STATUS_WAIT_CODE',_otp_now(),order_id)
-                )
-                changed = conn.execute('SELECT changes()').fetchone()[0]
-                if int(changed or 0) != 1:
-                    raise RuntimeError(f'OTP order {order_id} was not in PROCESSING state while saving provider allocation')
-                conn.execute(
-                    "INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",
-                    (str(user_id),"OTP_PURCHASE",str(user_id),price,order_id,
-                     f'service={service_name}; country={row["name"]}; provider_cost={raw_cost:.6f}; activation_id={activation_id}',_otp_now())
-                )
-            logger.info('Quick OTP activation persisted order=%s activation_id=%s phone=%s service=%s country=%s',order_id,activation_id,phone,service_code,row['country_code'])
-            persisted = fetchone('SELECT o.*,s.service_name FROM otp_orders o LEFT JOIN otp_services s ON s.service_code=o.service_code WHERE o.order_id=?',(order_id,))
-            if persisted and persisted['activation_id'] == str(activation_id):
-                return persisted,None
-            raise RuntimeError(f'OTP activation persistence verification failed for order {order_id}')
-        except Exception as exc:
-            persist_error = exc
-            logger.warning('OTP activation DB persist attempt %s/5 failed order=%s activation=%s: %s', attempt+1, order_id, activation_id, exc)
-            if attempt < 4:
-                time.sleep(0.25 * (2 ** attempt))
-
-    # Never leave the customer charged while the provider allocation is detached
-    # from the bot. Try to cancel the provider activation, then refund locally.
-    provider_cancel = None
-    try:
-        provider_cancel = _otp_http('setStatus', id=activation_id, status='8')
-    except Exception as exc:
-        logger.exception('OTP orphan activation cancel failed order=%s activation=%s',order_id,activation_id)
-    cancelled = _otp_provider_missing(provider_cancel) if provider_cancel else False
-    if cancelled:
-        refund_ok=False
-        for attempt in range(4):
-            try:
-                with db_tx() as conn:
-                    cur=conn.execute('SELECT status,refunded FROM otp_orders WHERE order_id=?',(order_id,)).fetchone()
-                    if cur and int(cur['refunded'] or 0)==0:
-                        adjust_balance(conn,user_id,'usdt',price,'OTP_REFUND',reason=f'Quick OTP provider allocation could not be saved {order_id}',related_txn=order_id,processed_by=user_id)
-                        conn.execute('UPDATE otp_orders SET status="refunded",refunded=1,activation_id=NULL,next_poll_at=NULL,poll_lease_until=NULL,last_provider_status=?,updated_at=? WHERE order_id=?',('DB_PERSIST_FAILED',_otp_now(),order_id))
-                    refund_ok=True
-                break
-            except Exception as exc:
-                logger.warning('OTP orphan refund attempt %s/4 failed order=%s: %s',attempt+1,order_id,exc)
-                if attempt < 3: time.sleep(0.25 * (2 ** attempt))
-        if refund_ok:
-            return None,'❌ Ba a iya kammala ajiye number ɗin ba. An mayar da kuɗin request ɗin zuwa balance ɗinka.'
-
-    # If provider cancellation or refund cannot be confirmed, keep the order in a
-    # visible reconciliation state. Do not silently tell the user that the request
-    # simply failed after charging them.
-    try:
-        with db_tx() as conn:
-            conn.execute('UPDATE otp_orders SET status="manual_reconciliation",phone_number=?,activation_id=?,raw_cost=?,last_provider_status=?,updated_at=? WHERE order_id=?',
-                         (phone,activation_id,raw_cost,'DB_PERSIST_FAILED',_otp_now(),order_id))
-    except Exception:
-        logger.exception('Could not mark orphan OTP order for reconciliation order=%s activation=%s',order_id,activation_id)
-    try:
-        notify_admins(
-            '🚨 <b>OTP ORPHAN ACTIVATION</b>\n\n'
-            f'🧾 Order: <code>{html.escape(order_id)}</code>\n'
-            f'👤 User: <code>{html.escape(str(user_id))}</code>\n'
-            f'📞 Number: <code>{html.escape(str(phone))}</code>\n'
-            f'🔑 Activation: <code>{html.escape(str(activation_id))}</code>\n'
-            f'⚠️ Database persistence failed after provider allocation.\n'
-            f'📝 Error: <code>{html.escape(str(persist_error)[:500])}</code>',
-            parse_mode='HTML'
-        )
-    except Exception: pass
-    return None,'⚠️ <b>An samu matsala wajen ajiye request ɗin number.</b>\n\nAn riga an tabbatar da number daga provider, amma tsarinmu ya kasa kammala ajiyar request ɗin. An tura shi zuwa reconciliation domin kada kuɗinka ya ɓace.\n\n🧾 Request: <code>'+html.escape(order_id)+'</code>'
+    with db_tx() as conn:
+        conn.execute('UPDATE otp_orders SET status="waiting",phone_number=?,activation_id=?,raw_cost=?,next_poll_at=?,poll_failures=0,last_provider_status=?,updated_at=? WHERE order_id=?',(phone,activation_id,raw_cost,_otp_now(),'STATUS_WAIT_CODE',_otp_now(),order_id))
+        logger.info('Quick OTP activation created order=%s activation_id=%s phone=%s service=%s country=%s',order_id,activation_id,phone,service_code,row['country_code'])
+        conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",(str(user_id),"OTP_PURCHASE",str(user_id),price,order_id,f'service={service_name}; country={row["name"]}; provider_cost={raw_cost:.6f}',_otp_now()))
+    return fetchone('SELECT o.*,s.service_name FROM otp_orders o LEFT JOIN otp_services s ON s.service_code=o.service_code WHERE o.order_id=?',(order_id,)),None
 
 def _otp_show_services(chat_id, page=0, edit=None):
     per=20; page=max(0,int(page))
