@@ -900,6 +900,7 @@ _MIGRATIONS = [
     "ALTER TABLE users ADD COLUMN banned_by TEXT",
     "ALTER TABLE users ADD COLUMN banned_by_username TEXT",
     "ALTER TABLE users ADD COLUMN banned_at TEXT",
+    "ALTER TABLE users ADD COLUMN community_verified_at TEXT",
 
     "ALTER TABLE bank_details ADD COLUMN category TEXT",
     "ALTER TABLE auto_messages ADD COLUMN interval_minutes INTEGER",
@@ -3085,9 +3086,21 @@ def safe_handler(func):
             is_private_chat
             and not is_admin(chat_id)
             and func.__name__ not in {"start", "community_join_check_cb"}
-            and not _join_gate(chat_id)
         ):
-            return
+            # Community membership is a one-time onboarding check. Once the
+            # user has been verified, only a definite Telegram answer that
+            # they LEFT/BECAME KICKED should trigger the gate again.
+            # Temporary Telegram/API failures are treated as unknown and do
+            # not lock an otherwise valid user out.
+            if not _community_verified(chat_id):
+                if not _join_gate(chat_id):
+                    return
+            else:
+                membership_state, missing = _community_membership_state(chat_id)
+                if membership_state == "not_joined":
+                    _community_clear_verified(chat_id)
+                    _join_gate(chat_id)
+                    return
 
         # System-wide maintenance gate. Admins remain fully operational;
         # users can still open and complete Support requests.
@@ -3619,6 +3632,75 @@ def _handle_community_set(m, state):
     clear_state(m.chat.id)
     bot.send_message(m.chat.id, "⚠️ The community setup session expired. Please start again.", reply_markup=main_menu(m.chat.id))
 
+_COMMUNITY_MEMBER_CACHE = {}
+_COMMUNITY_MEMBER_CACHE_LOCK = threading.Lock()
+_COMMUNITY_MEMBER_CACHE_TTL = 45.0
+
+
+def _community_membership_state(chat_id):
+    """Return (state, missing) where state is joined/not_joined/unknown.
+
+    `unknown` means Telegram could not reliably answer the membership query.
+    It must never be treated as "not joined", otherwise a temporary Telegram
+   /API problem can lock a perfectly valid user out of the bot.
+    """
+    now = time.monotonic()
+    key = str(chat_id)
+    with _COMMUNITY_MEMBER_CACHE_LOCK:
+        cached = _COMMUNITY_MEMBER_CACHE.get(key)
+        if cached and (now - cached[0]) < _COMMUNITY_MEMBER_CACHE_TTL:
+            return cached[1], cached[2]
+
+    missing = []
+    unknown = False
+    for kind, label in _user_join_requirements():
+        cid = _community_id(kind)
+        if not cid:
+            # If the administrator has not configured a required community,
+            # do not lock every user out. The configuration check will show it.
+            unknown = True
+            continue
+        try:
+            member = bot.get_chat_member(cid, chat_id)
+            status = str(getattr(member, "status", "") or "")
+            is_member = bool(getattr(member, "is_member", False))
+            joined = status in ("member", "administrator", "creator") or (status == "restricted" and is_member)
+            if not joined:
+                missing.append((kind, label, _community_effective_link(kind)))
+        except Exception as exc:
+            unknown = True
+            logger.warning("Membership check unavailable: user=%s community=%s: %s", chat_id, kind, exc)
+
+    if unknown:
+        state = "unknown"
+    elif missing:
+        state = "not_joined"
+    else:
+        state = "joined"
+    with _COMMUNITY_MEMBER_CACHE_LOCK:
+        _COMMUNITY_MEMBER_CACHE[key] = (now, state, missing)
+    return state, missing
+
+
+def _community_verified(chat_id):
+    row = fetchone("SELECT community_verified_at FROM users WHERE user_id=?", (str(chat_id),))
+    return bool(row and row["community_verified_at"])
+
+
+def _community_mark_verified(chat_id):
+    with db_tx() as conn:
+        conn.execute("UPDATE users SET community_verified_at=? WHERE user_id=?", (now_iso(), str(chat_id)))
+    with _COMMUNITY_MEMBER_CACHE_LOCK:
+        _COMMUNITY_MEMBER_CACHE[str(chat_id)] = (time.monotonic(), "joined", [])
+
+
+def _community_clear_verified(chat_id):
+    with db_tx() as conn:
+        conn.execute("UPDATE users SET community_verified_at=NULL WHERE user_id=?", (str(chat_id),))
+    with _COMMUNITY_MEMBER_CACHE_LOCK:
+        _COMMUNITY_MEMBER_CACHE.pop(str(chat_id), None)
+
+
 def _user_join_requirements():
     # These are the only two destinations that normal users must join before
     # they can use the bot. Internal work/support/audit destinations are not
@@ -3630,25 +3712,11 @@ def _user_join_requirements():
 
 
 def _user_is_joined(chat_id):
-    missing = []
-    for kind, label in _user_join_requirements():
-        cid = _community_id(kind)
-        link = _community_link(kind)
-        if not cid:
-            missing.append((kind, label, link))
-            continue
-        try:
-            member = bot.get_chat_member(cid, chat_id)
-            status = str(getattr(member, "status", "") or "")
-            is_member = bool(getattr(member, "is_member", False))
-            joined = status in ("member", "administrator", "creator") or (status == "restricted" and is_member)
-            if not joined:
-                missing.append((kind, label, _community_effective_link(kind)))
-        except Exception:
-            logger.exception("Membership check failed: user=%s community=%s", chat_id, kind)
-            # Fail closed: a membership check failure must not grant access.
-            missing.append((kind, label, _community_effective_link(kind)))
-    return missing
+    """Compatibility wrapper: only return a missing list on a definite miss."""
+    state, missing = _community_membership_state(chat_id)
+    if state == "not_joined":
+        return missing
+    return []
 
 
 def _join_gate(chat_id, message=None):
@@ -3656,9 +3724,27 @@ def _join_gate(chat_id, message=None):
     if is_admin(chat_id):
         return True
 
-    missing = _user_is_joined(chat_id)
-    if not missing:
+    state, missing = _community_membership_state(chat_id)
+    if state == "joined":
+        _community_mark_verified(chat_id)
         return True
+    if state == "unknown":
+        # For a user who has never completed onboarding, do not silently
+        # bypass the requirement. Also do not show the Join screen as if they
+        # had left: tell them the verification service is temporarily unable
+        # to answer and let them retry. Verified users are handled separately
+        # in safe_handler and are allowed through on an unknown result.
+        try:
+            bot.send_message(
+                chat_id,
+                "⚠️ <b>Community verification is temporarily unavailable.</b>\n\n"
+                "Your account has not been blocked. Please tap the button again in a moment.",
+                parse_mode="HTML",
+                reply_markup=main_menu(chat_id),
+            )
+        except Exception:
+            logger.warning("Could not send community verification unavailable notice to %s", chat_id)
+        return False
 
     # Always present both onboarding buttons when their links are configured.
     # This fixes the old UI where users could see only "I Joined" after one
@@ -3712,15 +3798,20 @@ def community_join_check_cb(c):
         _screen_from_callback(c, "🏠 Main Menu", reply_markup=main_menu(c.message.chat.id))
         return
 
-    missing = _user_is_joined(c.message.chat.id)
-    if not missing:
+    membership_state, missing = _community_membership_state(c.message.chat.id)
+    if membership_state == "joined":
+        _community_mark_verified(c.message.chat.id)
         bot.answer_callback_query(c.id, "✅ Membership confirmed.")
         _screen_from_callback(
             c,
-            "✅ <b>Membership confirmed.</b>\n\nYou have joined the required Group and Channel.",
+            "✅ <b>Membership confirmed.</b>\n\nYou can now use the bot normally. We will only ask you to join again if Telegram later confirms that you left a required community.",
             parse_mode="HTML",
             reply_markup=main_menu(c.message.chat.id),
         )
+        return
+
+    if membership_state == "unknown":
+        bot.answer_callback_query(c.id, "⚠️ Telegram could not verify membership right now. Please try again shortly.", show_alert=True)
         return
 
     bot.answer_callback_query(
@@ -9655,6 +9746,14 @@ def _otp_phone_parts(phone, country_name):
         return cc, p[len(cc):]
     return cc, p
 
+def _otp_full_phone(phone, country_name):
+    """Return the activation number in E.164-like form for display/copy."""
+    p = re.sub(r"[^0-9]", "", str(phone or ""))
+    cc = _otp_country_calling_code(country_name, p)
+    if cc and p.startswith(cc):
+        return "+" + p
+    return ("+" + cc + p) if cc else ("+" + p if p else "")
+
 def _otp_local_phone(phone, country_name=None, country_code=None):
     """Return local number using the country's REAL E.164 calling code.
 
@@ -9678,8 +9777,8 @@ def _otp_waiting_text(o,remaining,manual_remaining):
     return (f'╭━━━━━━━━━━━━━━━━━━━━╮\n'
             f'   📱 <b>QUICK OTP</b>\n'
             f'╰━━━━━━━━━━━━━━━━━━━━╯\n\n'
-            f'{_otp_service_emoji(o.get("service_name") or o.get("service_code"))} <b>{service_name}</b>  •  {country_name} {_otp_country_flag(country_name, o.get("country_flag"))}\n'
-            f'🌍 <b>Country Code:</b> +{country_code.lstrip("+")}\n'
+            f'{_otp_service_emoji(o.get("service_name") or o.get("service_code"))} <b>{service_name}</b>\n'
+            f'🌍 <b>{country_name} +{country_code.lstrip("+")} {_otp_country_flag(country_name, o.get("country_flag"))}</b>\n'
             f'💰 <b>Price:</b> ${float(o.get("selling_price") or 0):.2f}\n\n'
             f'📞 <b>Your Number</b>\n'
             f'<code>{phone}</code>\n\n'
@@ -9697,8 +9796,8 @@ def _otp_received_update_text(o):
     return (f'╭━━━━━━━━━━━━━━━━━━━━╮\n'
             f'   📱 <b>QUICK OTP</b>\n'
             f'╰━━━━━━━━━━━━━━━━━━━━╯\n\n'
-            f'{_otp_service_emoji(o.get("service_name") or o.get("service_code"))} <b>{html.escape(str(o.get("service_name") or o.get("service_code")))}</b> • {_otp_country_flag(o.get("country_name"), o.get("country_flag"))} {html.escape(str(o.get("country_name")))}\n'
-            f'🌍 <b>Country Code:</b> +{country_code.lstrip("+")}\n\n'
+            f'{_otp_service_emoji(o.get("service_name") or o.get("service_code"))} <b>{html.escape(str(o.get("service_name") or o.get("service_code")))}</b>\n'
+            f'🌍 <b>{html.escape(str(o.get("country_name") or "Country"))} +{country_code.lstrip("+")} {_otp_country_flag(o.get("country_name"), o.get("country_flag"))}</b>\n\n'
             f'📞 <b>Phone Number</b>\n'
             f'<code>{phone}</code>\n\n'
             f'✅ <b>OTP RECEIVED</b>\n\n'
@@ -9710,9 +9809,9 @@ def _otp_kb(order_id,service_code,country_code,manual_remaining, phone_number=No
     label=f'✋ Cancel available {manual_remaining//60:02d}:{manual_remaining%60:02d}' if manual_remaining>0 else '❌ Cancel'
     kb=types.InlineKeyboardMarkup()
     row=fetchone('SELECT name FROM otp_service_countries WHERE service_code=? AND country_code=?',(service_code,str(country_code)))
-    local=_otp_phone_parts(phone_number,row['name'] if row else None)[1] if phone_number else ''
-    if local:
-        try: kb.row(types.InlineKeyboardButton('📋 Copy Number',copy_text=types.CopyTextButton(text=local)))
+    local_number=_otp_local_phone(phone_number,row['name'] if row else None) if phone_number else ''
+    if local_number:
+        try: kb.row(types.InlineKeyboardButton('📋 Copy Number',copy_text=types.CopyTextButton(text=local_number)))
         except Exception: pass
     if otp_code:
         try: kb.row(types.InlineKeyboardButton('📋 Copy OTP',copy_text=types.CopyTextButton(text=str(otp_code))))
@@ -9727,7 +9826,8 @@ def _otp_create_activation(user_id,service_code,country_code,source_chat_id):
     # Telegram.
     row=fetchone('SELECT * FROM otp_service_countries WHERE service_code=? AND country_code=? AND enabled=1 AND profit_active=1',(service_code,str(country_code)))
     if not row: return None,'This service/country is no longer available.'
-    if int(row['available_count'] or 0)<=0: return None,'❌ No number is currently available for this service and country.'
+    # The cached catalogue count can be stale. Grizzly is authoritative at purchase time,
+    # so do not reject a visible Buy button solely because the local cache says zero.
     svc_cfg=fetchone('SELECT * FROM otp_services WHERE service_code=?',(service_code,))
     price=_otp_price(row,svc_cfg)
     if price<=0: return None,'❌ Invalid price configured for this service/country.'

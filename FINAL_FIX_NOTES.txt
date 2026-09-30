@@ -1,0 +1,25 @@
+FINAL FIX NOTES — 2026-09-30
+
+1) COMMUNITY ONBOARDING
+- A user is required to join the configured Group + Channel only until the first successful membership verification.
+- Once verified, the verification timestamp is persisted in users.community_verified_at.
+- Future actions re-check membership with a short cache. If Telegram definitively reports LEFT/KICKED, the verification is cleared and the join screen is shown again.
+- Temporary Telegram/API membership-check failures are NOT treated as leaving. Verified users are allowed to continue so a transient API problem cannot trap them in a join loop.
+- First-time users who are already members are automatically marked verified.
+- The join screen is no longer repeatedly shown after a successful confirmation.
+
+2) NUMBER DELIVERY
+- Cached local stock is advisory only and no longer blocks a visible Buy Number action when the cached count is zero/stale.
+- Grizzly getNumberV2 remains authoritative for the purchase result.
+- Successful activation stores activationId + phoneNumber and immediately updates the user message with the full phone number.
+- Copy Number copies the full +E.164-like number.
+- Provider failure/refund/reconciliation paths remain isolated per order.
+
+3) OTP
+- Each activation has its own order/activation ID, polling lease and state.
+- OTP polling remains bounded and independent across orders.
+- OTP code and copy button remain supported.
+
+4) TELEGRAM UI
+- Stale callback errors and 'message is not modified' are treated as expected UI races.
+- Telegram 429 errors never trigger another Telegram error message.
