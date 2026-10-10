@@ -10377,8 +10377,9 @@ def _otp_waiting_text(o,remaining,manual_remaining):
                    else '🟢 <b>Cancel is now available</b>')
     service_name=html.escape(str(o.get("service_name") or o.get("service_code") or "Service"))
     country_name=html.escape(str(o.get("country_name") or "Country"))
-    calling_code, local_phone = _otp_phone_parts(o.get("phone_number"), o.get("country_name"))
-    phone=html.escape(local_phone)
+    full_phone = _otp_full_phone(o.get("phone_number"), o.get("country_name"))
+    calling_code, _ = _otp_phone_parts(o.get("phone_number"), o.get("country_name"))
+    phone=html.escape(full_phone)
     country_code=html.escape(calling_code)
     order_id=html.escape(str(o.get("order_id") or ""))
     return (f'╭━━━━━━━━━━━━━━━━━━━━╮\n'
@@ -10396,8 +10397,9 @@ def _otp_waiting_text(o,remaining,manual_remaining):
             f'🆔 <b>Request ID:</b> <code>{order_id}</code>')
 
 def _otp_received_update_text(o):
-    calling_code, local_phone = _otp_phone_parts(o.get("phone_number"), o.get("country_name"))
-    phone=html.escape(local_phone)
+    full_phone = _otp_full_phone(o.get("phone_number"), o.get("country_name"))
+    calling_code, _ = _otp_phone_parts(o.get("phone_number"), o.get("country_name"))
+    phone=html.escape(full_phone)
     country_code=html.escape(calling_code)
     code=html.escape(str(o.get("otp_code") or o.get("otp") or ""))
     return (f'╭━━━━━━━━━━━━━━━━━━━━╮\n'
@@ -10416,9 +10418,9 @@ def _otp_kb(order_id,service_code,country_code,manual_remaining, phone_number=No
     label=f'✋ Cancel available {manual_remaining//60:02d}:{manual_remaining%60:02d}' if manual_remaining>0 else '❌ Cancel'
     kb=types.InlineKeyboardMarkup()
     row=fetchone('SELECT name FROM otp_service_countries WHERE service_code=? AND country_code=?',(service_code,str(country_code)))
-    local_number=_otp_local_phone(phone_number,row['name'] if row else None) if phone_number else ''
-    if local_number:
-        try: kb.row(types.InlineKeyboardButton('📋 Copy Number',copy_text=types.CopyTextButton(text=local_number)))
+    full_number=_otp_full_phone(phone_number,row['name'] if row else None) if phone_number else ''
+    if full_number:
+        try: kb.row(types.InlineKeyboardButton('📋 Copy Number',copy_text=types.CopyTextButton(text=full_number)))
         except Exception: pass
     if otp_code:
         try: kb.row(types.InlineKeyboardButton('📋 Copy OTP',copy_text=types.CopyTextButton(text=str(otp_code))))
@@ -10636,23 +10638,43 @@ def _otp_buy_overloaded():
 
 
 def _otp_activation_ui_result(chat_id, message_id, service, code, result, msg, new_message=False):
+    """Deliver the purchase result reliably; fall back to a fresh Telegram message if edit fails."""
+    if not result:
+        text = f'⚠️ <b>Number request could not be completed.</b>\n\n{msg}'
+        kb = types.InlineKeyboardMarkup().add(
+            types.InlineKeyboardButton('🔄 Try Again', callback_data=f'otp_country:{service}:{code}')
+        ).add(types.InlineKeyboardButton('⬅️ Countries', callback_data=f'otp_service:{service}'))
+    else:
+        text = _otp_waiting_text(dict(result), 1200, 300)
+        kb = _otp_kb(result['order_id'], service, code, 300, result.get('phone_number'))
+
+    delivered_message_id = message_id
     try:
-        if not result:
-            text = f'⚠️ <b>Number request could not be completed.</b>\n\n{msg}'
-            kb = types.InlineKeyboardMarkup().add(
-                types.InlineKeyboardButton('🔄 Try Again', callback_data=f'otp_country:{service}:{code}')
-            ).add(types.InlineKeyboardButton('⬅️ Countries', callback_data=f'otp_service:{service}'))
-        else:
-            text = _otp_waiting_text(dict(result), 1200, 300)
-            kb = _otp_kb(result['order_id'], service, code, 300, result.get('phone_number'))
+        bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
+    except Exception as edit_exc:
+        # A valid Grizzly allocation must never disappear merely because the
+        # original placeholder was deleted, became inaccessible, or could not be edited.
+        logger.warning('OTP result edit failed; trying a new message chat=%s message=%s: %s',
+                       chat_id, message_id, edit_exc)
+        try:
+            sent = bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=kb)
+            delivered_message_id = sent.message_id
+        except Exception:
+            logger.exception('Quick OTP result could not be sent after edit failure chat=%s order=%s',
+                             chat_id, result.get('order_id') if result else 'n/a')
+            # Keep the order persisted for the polling worker/admin reconciliation;
+            # do not cancel/refund a potentially live provider activation blindly.
+            return
+
+    if result:
+        try:
             with db_tx() as conn:
                 conn.execute(
                     'UPDATE otp_orders SET chat_id=?,message_id=?,updated_at=?,ui_updated_at=? WHERE order_id=?',
-                    (str(chat_id), message_id, _otp_now(), _otp_now(), result['order_id'])
+                    (str(chat_id), delivered_message_id, _otp_now(), _otp_now(), result['order_id'])
                 )
-        bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
-    except Exception:
-        logger.exception('Quick OTP async UI update failed chat=%s message=%s service=%s country=%s', chat_id, message_id, service, code)
+        except Exception:
+            logger.exception('Could not persist delivered OTP message reference order=%s', result.get('order_id'))
 
 _OTP_ADMIN_FAILURE_LAST={}
 _OTP_ADMIN_FAILURE_LOCK=threading.Lock()

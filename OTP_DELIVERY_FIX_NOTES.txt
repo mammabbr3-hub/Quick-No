@@ -1,0 +1,16 @@
+QUICK OTP DELIVERY PATCH — 2026-10-10
+
+Changes made without removing existing bot features:
+1. OTP number display now uses the normalized full international number, rather than only the subscriber/local part.
+2. Copy Number now copies the full international number.
+3. If editing the Telegram placeholder fails after Grizzly has allocated a number, the bot attempts to send the complete result as a new message.
+4. When fallback delivery succeeds, the new Telegram message ID is saved to the OTP order so later OTP updates target the delivered message.
+5. If both edit and send fail, the provider activation/order is left persisted for polling/reconciliation rather than being silently discarded.
+
+Validation performed:
+- Python syntax compilation: PASS
+- Static review of activation persistence, Telegram result delivery fallback, OTP polling and full-number formatting.
+
+Not performed / not guaranteed:
+- No live Grizzly API purchase or live Telegram delivery was performed because credentials and a deployed environment were not supplied.
+- 500,000+ concurrent/registered users cannot be guaranteed from source review alone. That scale needs production-grade shared database/queue infrastructure, horizontal workers, rate-limit planning, and staged load tests. Telegram and Grizzly quotas remain external limits.
