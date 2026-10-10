@@ -97,18 +97,70 @@ ADMIN_IDS = {a.strip() for a in _admin_ids_raw.split(",") if a.strip()}
 GRIZZLY_API_KEY = os.environ.get("GRIZZLY_API_KEY", "").strip()
 GRIZZLY_BASE_URL = os.environ.get("GRIZZLY_BASE_URL", "https://api.grizzlysms.com/stubs/handler_api.php").strip()
 GRIZZLY_OPERATOR = os.environ.get("GRIZZLY_OPERATOR", "").strip()
-OTP_STATUS_WORKERS = max(4, min(64, int(os.environ.get("OTP_STATUS_WORKERS", "32") or 32)))
+OTP_STATUS_WORKERS = max(4, min(128, int(os.environ.get("OTP_STATUS_WORKERS", "48") or 48)))
 OTP_STATUS_POLL_SECONDS = max(2, int(os.environ.get("OTP_STATUS_POLL_SECONDS", "3") or 3))
 OTP_STATUS_BATCH = max(50, min(1000, int(os.environ.get("OTP_STATUS_BATCH", "500") or 500)))
-TELEGRAM_HANDLER_THREADS = max(4, min(32, int(os.environ.get("TELEGRAM_HANDLER_THREADS", "16") or 16)))
+TELEGRAM_HANDLER_THREADS = max(4, min(64, int(os.environ.get("TELEGRAM_HANDLER_THREADS", "32") or 32)))
 # Telegram Bot API flood-control guard. Telegram documents a practical limit of
 # about 1 message/sec in a single chat and about 30 messages/sec for bulk sends.
 # Keep a safety margin locally so bursts from OTP workers cannot flood the API.
 TELEGRAM_GLOBAL_RATE = max(5.0, min(30.0, float(os.environ.get("TELEGRAM_GLOBAL_RATE", "25") or 25)))
-TELEGRAM_PER_CHAT_INTERVAL = max(1.0, float(os.environ.get("TELEGRAM_PER_CHAT_INTERVAL", "1.10") or 1.10))
+TELEGRAM_PER_CHAT_INTERVAL = max(0.5, float(os.environ.get("TELEGRAM_PER_CHAT_INTERVAL", "0.80") or 0.80))
 TELEGRAM_FLOOD_RETRY_MAX = max(0.0, min(5.0, float(os.environ.get("TELEGRAM_FLOOD_RETRY_MAX", "3") or 3)))
-OTP_ACTIVATION_WORKERS = max(4, min(32, int(os.environ.get("OTP_ACTIVATION_WORKERS", "16") or 16)))
+OTP_ACTIVATION_WORKERS = max(4, min(128, int(os.environ.get("OTP_ACTIVATION_WORKERS", "32") or 32)))
 OTP_UI_UPDATE_SECONDS = max(30, int(os.environ.get("OTP_UI_UPDATE_SECONDS", "60") or 60))
+
+
+# ---------------------------------------------------------------
+# SCALE / LOAD-PROTECTION SETTINGS (all optional environment overrides)
+# ---------------------------------------------------------------
+def _env_float(name, default, lo=None, hi=None):
+    try:
+        v = float(os.environ.get(name, "") or default)
+    except Exception:
+        v = float(default)
+    if lo is not None:
+        v = max(lo, v)
+    if hi is not None:
+        v = min(hi, v)
+    return v
+
+
+def _env_int(name, default, lo=None, hi=None):
+    return int(_env_float(name, default, lo, hi))
+
+
+# answerCallbackQuery / getChatMember / getChat / getMe are NOT "messages".
+# They get their own, much larger budget so membership checks and button
+# acknowledgements can never be starved by (or starve) message sending.
+TELEGRAM_LIGHT_RATE = _env_float("TELEGRAM_LIGHT_RATE", 80.0, 10.0, 300.0)
+# Telegram allows only ~20 messages/minute into one group/channel.
+TELEGRAM_GROUP_INTERVAL = _env_float("TELEGRAM_GROUP_INTERVAL", 3.2, 1.0, 60.0)
+# The old "Please wait..." send+delete cost 2 extra Telegram calls per tap.
+# Set SHOW_WAIT_NOTICE=1 to bring it back.
+SHOW_WAIT_NOTICE = os.environ.get("SHOW_WAIT_NOTICE", "0").strip() == "1"
+# How long a verified user's "still a member" answer is trusted.
+COMMUNITY_RECHECK_SECONDS = _env_float("COMMUNITY_RECHECK_SECONDS", 600.0, 30.0, 86400.0)
+# Auto-approve join requests for the two required communities so users of
+# "request to join" invite links can pass the join gate.
+AUTO_APPROVE_JOIN_REQUESTS = os.environ.get("AUTO_APPROVE_JOIN_REQUESTS", "1").strip() != "0"
+# Provider (Grizzly) request pacing, per second.
+GRIZZLY_BUY_RPS = _env_float("GRIZZLY_BUY_RPS", 20.0, 1.0, 500.0)
+GRIZZLY_POLL_RPS = _env_float("GRIZZLY_POLL_RPS", 30.0, 1.0, 1000.0)
+GRIZZLY_CATALOG_RPS = _env_float("GRIZZLY_CATALOG_RPS", 5.0, 0.5, 100.0)
+# If the number-purchase backlog is longer than this, new requests are politely
+# declined BEFORE any money is charged ("server busy, try again").
+OTP_BUY_MAX_WAIT_SECONDS = _env_float("OTP_BUY_MAX_WAIT_SECONDS", 45.0, 5.0, 600.0)
+# A service's stock is refreshed from the provider at most once per this many seconds
+# (no matter how many users click it).
+OTP_STOCK_REFRESH_TTL = _env_float("OTP_STOCK_REFRESH_TTL", 120.0, 10.0, 3600.0)
+# Budget for countdown-timer edits of waiting OTP messages.
+OTP_UI_EDITS_PER_SECOND = _env_float("OTP_UI_EDITS_PER_SECOND", 8.0, 1.0, 30.0)
+# Broadcasts run in the background and never use more than this many msgs/sec.
+BROADCAST_RATE = _env_float("BROADCAST_RATE", 10.0, 1.0, 28.0)
+# Audit channel pacing (Telegram: ~20 msgs/min per channel) and load shedding.
+AUDIT_CHANNEL_MIN_INTERVAL = _env_float("AUDIT_CHANNEL_MIN_INTERVAL", 3.3, 1.0, 60.0)
+AUDIT_SHED_BACKLOG = _env_int("AUDIT_SHED_BACKLOG", 300, 50, 100000)
 
 # ---------------------------------------------------------------
 # SUPPORT GROUP / APPROVED-WORK CHANNEL
@@ -432,15 +484,33 @@ def _github_db_backup_worker():
         except Exception:
             logger.exception("GitHub DB backup worker iteration failed")
 
+_ADMIN_CACHE = {}
+_ADMIN_CACHE_TTL = 30.0
+
+
+def _admin_cache_clear():
+    _ADMIN_CACHE.clear()
+
+
 def is_admin(chat_id) -> bool:
     sid = str(chat_id)
     if sid in ADMIN_IDS:
         return True
+    # Called many times per update for every user: remember the answer briefly
+    # instead of hitting SQLite each time. Cleared whenever admins change.
+    now = time.monotonic()
+    hit = _ADMIN_CACHE.get(sid)
+    if hit is not None and (now - hit[0]) < _ADMIN_CACHE_TTL:
+        return hit[1]
     try:
         row = fetchone("SELECT user_id FROM extra_admins WHERE user_id=?", (sid,))
-        return bool(row)
+        value = bool(row)
     except Exception:
         return False
+    if len(_ADMIN_CACHE) > 200000:
+        _ADMIN_CACHE.clear()
+    _ADMIN_CACHE[sid] = (now, value)
+    return value
 
 
 def is_super_admin(chat_id) -> bool:
@@ -463,6 +533,7 @@ def add_extra_admin(user_id, added_by):
         return False
     with db_tx() as conn:
         conn.execute("INSERT OR IGNORE INTO extra_admins(user_id,added_by,added_at) VALUES(?,?,?)", (sid,str(added_by),now_iso()))
+    _admin_cache_clear()
     return True
 
 
@@ -533,7 +604,11 @@ class ActionStateError(Exception):
 # operations (like approving a withdrawal) safe against two admins
 # clicking buttons at the same time.
 
+_DB_WAL_READY = False
+
+
 def _connect():
+    global _DB_WAL_READY
     db_parent = os.path.dirname(os.path.abspath(DB_PATH))
     if db_parent:
         os.makedirs(db_parent, exist_ok=True)
@@ -545,8 +620,15 @@ def _connect():
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 30000")
     try:
-        conn.execute("PRAGMA journal_mode = WAL")
+        # journal_mode=WAL is stored inside the database file, so it only needs
+        # to be switched once per process. Re-issuing it on every connection
+        # (hundreds per second) just adds lock contention.
+        if not _DB_WAL_READY:
+            conn.execute("PRAGMA journal_mode = WAL")
+            _DB_WAL_READY = True
         conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA temp_store = MEMORY")
+        conn.execute("PRAGMA cache_size = -4000")
     except sqlite3.OperationalError:
         # Some read-only/locked environments may reject PRAGMA changes; the
         # connection remains usable with the configured timeout.
@@ -901,6 +983,8 @@ _MIGRATIONS = [
     "ALTER TABLE users ADD COLUMN banned_by_username TEXT",
     "ALTER TABLE users ADD COLUMN banned_at TEXT",
     "ALTER TABLE users ADD COLUMN community_verified_at TEXT",
+    "ALTER TABLE users ADD COLUMN pending_ref TEXT",
+    "ALTER TABLE users ADD COLUMN onboarded_at TEXT",
 
     "ALTER TABLE bank_details ADD COLUMN category TEXT",
     "ALTER TABLE auto_messages ADD COLUMN interval_minutes INTEGER",
@@ -945,10 +1029,25 @@ def init_db():
             try:
                 conn.execute(stmt)
                 conn.commit()
+                if "ADD COLUMN onboarded_at" in stmt:
+                    # Everybody who already exists was onboarded before this
+                    # column existed: never treat them as brand-new users.
+                    conn.execute("UPDATE users SET onboarded_at=COALESCE(created_at, ?) WHERE onboarded_at IS NULL", (now_iso(),))
+                    conn.commit()
             except sqlite3.OperationalError as e:
                 if "duplicate column" not in str(e).lower():
                     logger.exception("Migration failed: %s", stmt)
         _migrate_legacy_finance_schema(conn)
+        for _idx_stmt in (
+            # The audit dispatcher scans for unsent rows every few seconds.
+            "CREATE INDEX IF NOT EXISTS idx_audit_channel_sent ON audit_log(channel_sent, id)",
+            "CREATE INDEX IF NOT EXISTS idx_users_created ON users(created_at)",
+        ):
+            try:
+                conn.execute(_idx_stmt)
+                conn.commit()
+            except Exception:
+                logger.exception("Index creation failed: %s", _idx_stmt)
         # Seed the requested default minimum withdrawal only when the admin
         # has never configured it. Existing admin choices are preserved.
         try:
@@ -1020,24 +1119,39 @@ def _seed_default_menu_options(conn):
 # mid-admin-task, etc). This replaces the old plain Python dicts.
 # ---------------------------------------------------------------
 
+_STATE_CACHE = {}
+_STATE_UNSET = object()
+
+
 def get_state(chat_id) -> dict:
-    row = fetchone("SELECT data FROM fsm_state WHERE chat_id=?", (str(chat_id),))
-    if not row:
+    sid = str(chat_id)
+    raw = _STATE_CACHE.get(sid, _STATE_UNSET)
+    if raw is _STATE_UNSET:
+        row = fetchone("SELECT data FROM fsm_state WHERE chat_id=?", (sid,))
+        raw = row["data"] if row else None
+        if len(_STATE_CACHE) > 300000:
+            _STATE_CACHE.clear()
+        # setdefault: if another thread wrote a newer state meanwhile, keep it.
+        raw = _STATE_CACHE.setdefault(sid, raw)
+    if not raw:
         return {}
     try:
-        return json.loads(row["data"])
+        return json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         logger.warning("Corrupt fsm_state for chat %s, resetting", chat_id)
         return {}
 
 
 def set_state(chat_id, data: dict):
+    sid = str(chat_id)
+    raw = json.dumps(data)
     with db_tx() as conn:
         conn.execute(
             "INSERT INTO fsm_state (chat_id, data, updated_at) VALUES (?,?,?) "
             "ON CONFLICT(chat_id) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at",
-            (str(chat_id), json.dumps(data), now_iso()),
+            (sid, raw, now_iso()),
         )
+    _STATE_CACHE[sid] = raw
 
 
 def update_state(chat_id, **kwargs) -> dict:
@@ -1048,8 +1162,10 @@ def update_state(chat_id, **kwargs) -> dict:
 
 
 def clear_state(chat_id):
+    sid = str(chat_id)
     with db_tx() as conn:
-        conn.execute("DELETE FROM fsm_state WHERE chat_id=?", (str(chat_id),))
+        conn.execute("DELETE FROM fsm_state WHERE chat_id=?", (sid,))
+    _STATE_CACHE[sid] = None
 
 
 # ---------------------------------------------------------------
@@ -1620,9 +1736,26 @@ def get_support_ticket(ticket_id):
 # ADMIN-ADJUSTABLE SETTINGS (minimum withdrawal, USDT-only wallet settings…)
 # ---------------------------------------------------------------
 
+_SETTINGS_CACHE = {}
+_SETTINGS_CACHE_TTL = _env_float("SETTINGS_CACHE_SECONDS", 5.0, 0.0, 300.0)
+_SETTINGS_MISSING = object()
+
+
 def get_setting(key, default=None):
-    row = fetchone("SELECT value FROM settings WHERE key=?", (key,))
-    return row["value"] if row else default
+    # Settings are read several times per update (maintenance mode, feature
+    # switches, per-user feature switches...). A tiny TTL cache removes most of
+    # those SQLite round-trips. set_setting/delete_setting invalidate instantly.
+    now = time.monotonic()
+    hit = _SETTINGS_CACHE.get(key)
+    if hit is not None and (now - hit[0]) < _SETTINGS_CACHE_TTL:
+        value = hit[1]
+    else:
+        row = fetchone("SELECT value FROM settings WHERE key=?", (key,))
+        value = row["value"] if row else _SETTINGS_MISSING
+        if len(_SETTINGS_CACHE) > 300000:
+            _SETTINGS_CACHE.clear()
+        _SETTINGS_CACHE[key] = (now, value)
+    return default if value is _SETTINGS_MISSING else value
 
 
 def set_setting(key, value, admin_id=None):
@@ -1639,11 +1772,13 @@ def set_setting(key, value, admin_id=None):
                 "INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",
                 (str(admin_id), "SETTING_CHANGED", None, None, key, f"{old['value'] if old else '<unset>'} -> {value}", now_iso()),
             )
+    _SETTINGS_CACHE.pop(key, None)
 
 
 def delete_setting(key):
     with db_tx() as conn:
         conn.execute("DELETE FROM settings WHERE key=?", (key,))
+    _SETTINGS_CACHE.pop(key, None)
 
 
 def list_withdrawal_methods(active_only=False):
@@ -2528,39 +2663,106 @@ _TG_CHAT_METHODS = {
 _TG_ORIGINAL_MAKE_REQUEST = _telegram_apihelper._make_request
 
 
-def _tg_wait_slot(chat_id=None):
-    global _TG_NEXT_GLOBAL
-    interval = 1.0 / TELEGRAM_GLOBAL_RATE
-    while True:
-        now = time.monotonic()
-        with _TG_RATE_LOCK:
-            wait_global = max(0.0, _TG_NEXT_GLOBAL - now)
-            wait_chat = 0.0
-            if chat_id is not None:
-                wait_chat = max(0.0, _TG_CHAT_NEXT.get(str(chat_id), 0.0) - now)
-            wait_for = max(wait_global, wait_chat)
-            if wait_for <= 0:
-                _TG_NEXT_GLOBAL = now + interval
-                if chat_id is not None:
-                    _TG_CHAT_NEXT[str(chat_id)] = now + TELEGRAM_PER_CHAT_INTERVAL
-                # Prevent unbounded growth if many one-off chats are used.
-                if len(_TG_CHAT_NEXT) > 10000:
-                    cutoff = now - 300.0
-                    for k, v in list(_TG_CHAT_NEXT.items()):
-                        if v < cutoff:
-                            _TG_CHAT_NEXT.pop(k, None)
-                return
-        time.sleep(min(wait_for, 1.0))
+# ---- Two independent budgets -------------------------------------------------
+#  * "message" calls (send*/edit*/delete...) : TELEGRAM_GLOBAL_RATE per second
+#    overall + a per-chat gap (private chat / group-or-channel gap).
+#  * "light" calls (answerCallbackQuery, getChatMember, getChat, getMe ...):
+#    TELEGRAM_LIGHT_RATE per second and NO per-chat gap.
+#
+# IMPORTANT BUG THAT WAS FIXED HERE: getChatMember(chat_id=<our group>, user)
+# used to be treated as "a message to the group", so EVERY membership check of
+# EVERY user was serialised to one check per ~1.1 s. With many users that froze
+# all handler threads and made the join check look broken.
+#
+# Scheduling is FIFO and reservation based (no busy loops, no thundering herd):
+# each caller atomically reserves its send time and sleeps exactly that long.
+_TG_NEXT_LIGHT = 0.0
+_TG_LIGHT_METHODS = {
+    'answerCallbackQuery', 'getChatMember', 'getChat', 'getMe', 'getChatMemberCount',
+    'getChatAdministrators', 'getFile', 'sendChatAction', 'approveChatJoinRequest',
+    'declineChatJoinRequest', 'answerInlineQuery', 'getMyCommands', 'setMyCommands',
+}
+# Cosmetic calls that are silently skipped when the outbound queue is long.
+_TG_SKIPPABLE_METHODS = {'deleteMessage', 'sendChatAction'}
 
 
-def _tg_make_request_guard(token, method_name, method='get', params=None, files=None):
+def _tg_backlog_seconds():
+    """Estimated seconds a NEW message-class call would wait right now."""
+    return max(0.0, _TG_NEXT_GLOBAL - time.monotonic())
+
+
+def _tg_is_group_chat(chat_id):
+    try:
+        return int(chat_id) < 0
+    except Exception:
+        return str(chat_id).startswith('@')
+
+
+def _tg_reserve(chat_id=None, light=False):
+    """Reserve the next send slot. Returns how many seconds the caller must wait."""
+    global _TG_NEXT_GLOBAL, _TG_NEXT_LIGHT
+    now = time.monotonic()
+    with _TG_RATE_LOCK:
+        if light:
+            slot = max(now, _TG_NEXT_LIGHT)
+            _TG_NEXT_LIGHT = slot + 1.0 / TELEGRAM_LIGHT_RATE
+            return slot - now
+        slot = max(now, _TG_NEXT_GLOBAL)
+        _TG_NEXT_GLOBAL = slot + 1.0 / TELEGRAM_GLOBAL_RATE
+        if chat_id is not None:
+            key = str(chat_id)
+            chat_slot = _TG_CHAT_NEXT.get(key, 0.0)
+            if chat_slot > slot:
+                slot = chat_slot
+            gap = TELEGRAM_GROUP_INTERVAL if _tg_is_group_chat(chat_id) else TELEGRAM_PER_CHAT_INTERVAL
+            _TG_CHAT_NEXT[key] = slot + gap
+            # Prevent unbounded growth if many one-off chats are used.
+            if len(_TG_CHAT_NEXT) > 20000:
+                cutoff = now - 300.0
+                for k, v in list(_TG_CHAT_NEXT.items()):
+                    if v < cutoff:
+                        _TG_CHAT_NEXT.pop(k, None)
+        return slot - now
+
+
+def _tg_penalize(chat_id, retry_after, light=False):
+    """After a 429, make everybody who shares the limited resource back off."""
+    global _TG_NEXT_GLOBAL, _TG_NEXT_LIGHT
+    until = time.monotonic() + max(0.0, float(retry_after)) + 0.05
+    with _TG_RATE_LOCK:
+        if light:
+            _TG_NEXT_LIGHT = max(_TG_NEXT_LIGHT, until)
+            return
+        if chat_id is not None:
+            key = str(chat_id)
+            _TG_CHAT_NEXT[key] = max(_TG_CHAT_NEXT.get(key, 0.0), until)
+        # A flood-wait on a private chat (or on no chat) means the bot as a whole
+        # is too fast; a flood-wait on one group/channel must not stall everyone.
+        if (chat_id is None or not _tg_is_group_chat(chat_id)) and retry_after <= 15:
+            _TG_NEXT_GLOBAL = max(_TG_NEXT_GLOBAL, until)
+
+
+def _tg_wait_slot(chat_id=None, light=False):
+    wait = _tg_reserve(chat_id, light)
+    if wait > 0:
+        time.sleep(wait)
+
+
+def _tg_make_request_guard(token, method_name, method='get', params=None, files=None, **kwargs):
     # getUpdates is long-polling and must not be held behind the outbound queue.
     if method_name == 'getUpdates':
-        return _TG_ORIGINAL_MAKE_REQUEST(token, method_name, method=method, params=params, files=files)
-    chat_id = params.get('chat_id') if isinstance(params, dict) else None
-    _tg_wait_slot(chat_id)
+        return _TG_ORIGINAL_MAKE_REQUEST(token, method_name, method=method, params=params, files=files, **kwargs)
+    light = method_name in _TG_LIGHT_METHODS
+    chat_id = None
+    if not light and isinstance(params, dict):
+        chat_id = params.get('chat_id')
+    if method_name in _TG_SKIPPABLE_METHODS and _tg_backlog_seconds() > 3.0:
+        # Cosmetic call while the queue is long: skip it instead of making the
+        # important messages wait even longer.
+        return True
+    _tg_wait_slot(chat_id, light)
     try:
-        return _TG_ORIGINAL_MAKE_REQUEST(token, method_name, method=method, params=params, files=files)
+        return _TG_ORIGINAL_MAKE_REQUEST(token, method_name, method=method, params=params, files=files, **kwargs)
     except _telegram_apihelper.ApiTelegramException as exc:
         if getattr(exc, 'error_code', None) == 429:
             retry_after = 0.0
@@ -2568,13 +2770,13 @@ def _tg_make_request_guard(token, method_name, method='get', params=None, files=
                 retry_after = float((exc.result_json or {}).get('parameters', {}).get('retry_after', 0) or 0)
             except Exception:
                 pass
+            _tg_penalize(chat_id, retry_after or 1.0, light)
             # Short flood-control responses can safely be retried once. A long
             # retry_after must bubble up immediately; sleeping for minutes inside
             # a callback would exhaust the bot's worker pool.
             if 0 < retry_after <= TELEGRAM_FLOOD_RETRY_MAX:
-                time.sleep(retry_after)
-                _tg_wait_slot(chat_id)
-                return _TG_ORIGINAL_MAKE_REQUEST(token, method_name, method=method, params=params, files=files)
+                _tg_wait_slot(chat_id, light)
+                return _TG_ORIGINAL_MAKE_REQUEST(token, method_name, method=method, params=params, files=files, **kwargs)
         raise
 
 _telegram_apihelper._make_request = _tg_make_request_guard
@@ -2831,6 +3033,32 @@ def _double_action_message(chat_id):
         "Please wait for the first selection to finish, then choose the option you want."
     )
 
+_RAPID_NOTICE_AT = {}
+
+
+def _rapid_notice_allowed(chat_id, interval=6.0):
+    """Never answer a spamming user with one warning per tap (that doubles the load)."""
+    now = time.monotonic()
+    key = str(chat_id)
+    with _ACTION_GUARD_LOCK:
+        last = _RAPID_NOTICE_AT.get(key, 0.0)
+        if (now - last) < interval:
+            return False
+        if len(_RAPID_NOTICE_AT) > 100000:
+            _RAPID_NOTICE_AT.clear()
+        _RAPID_NOTICE_AT[key] = now
+        return True
+
+
+def _ack_callback(update):
+    """Stop the Telegram loading spinner for a tap we are not going to process."""
+    try:
+        if hasattr(update, "id") and hasattr(update, "data"):
+            bot.answer_callback_query(update.id)
+    except Exception:
+        logger.debug("Could not acknowledge callback", exc_info=True)
+
+
 def _guard_rapid_action(update, chat_id):
     """Return False when this update is a rapid second tap for this user."""
     now = time.monotonic()
@@ -2838,6 +3066,11 @@ def _guard_rapid_action(update, chat_id):
     with _ACTION_GUARD_LOCK:
         previous = _ACTION_GUARD_STATE.get(str(chat_id))
         _ACTION_GUARD_STATE[str(chat_id)] = (now, signature)
+        if len(_ACTION_GUARD_STATE) > 200000:
+            cutoff = now - 60.0
+            for k, v in list(_ACTION_GUARD_STATE.items()):
+                if v[0] < cutoff:
+                    _ACTION_GUARD_STATE.pop(k, None)
         if previous and (now - previous[0]) < _ACTION_GUARD_WINDOW:
             return False
     return True
@@ -2864,16 +3097,27 @@ def _ensure_runtime_schema():
         otp_db_init()
         _RUNTIME_SCHEMA_READY = True
 
+_KNOWN_USERS = set()
+
+
 def _ensure_user_context(update):
     chat_id = _chat_id_of(update)
     if is_admin(chat_id):
         return
+    sid = str(chat_id)
+    # Users are never deleted, so once a user+wallet pair was seen, skip the
+    # two SELECTs for the rest of the process lifetime.
+    if sid in _KNOWN_USERS:
+        return
     # Normal requests are read-only here. Only repair the database when the
     # user row or wallet is actually missing, so this does not add a write
     # transaction to every message at scale.
-    existing = fetchone("SELECT user_id FROM users WHERE user_id=?", (str(chat_id),))
-    wallet = fetchone("SELECT user_id FROM wallets WHERE user_id=?", (str(chat_id),))
+    existing = fetchone("SELECT user_id FROM users WHERE user_id=?", (sid,))
+    wallet = fetchone("SELECT user_id FROM wallets WHERE user_id=?", (sid,))
     if existing is not None and wallet is not None:
+        if len(_KNOWN_USERS) > 2000000:
+            _KNOWN_USERS.clear()
+        _KNOWN_USERS.add(sid)
         return
     user = getattr(update, "from_user", None)
     if user is None and getattr(update, "message", None) is not None:
@@ -2884,7 +3128,8 @@ def _ensure_user_context(update):
         name = f"{name} {last}"
     username = getattr(user, "username", None)
     with db_tx() as conn:
-        ensure_user(conn, str(chat_id), name, username)
+        ensure_user(conn, sid, name, username)
+    _KNOWN_USERS.add(sid)
 
 # ================================================================
 # ERROR-SAFE HANDLER WRAPPER
@@ -3065,6 +3310,7 @@ def safe_handler(func):
                 logger.exception("Failed to send database recovery notice to %s", chat_id)
             return
         if not _actor_may_proceed(chat_id, func.__name__):
+            _ack_callback(update)
             try:
                 _send_ban_notice(chat_id)
             except Exception:
@@ -3094,11 +3340,13 @@ def safe_handler(func):
             # not lock an otherwise valid user out.
             if not _community_verified(chat_id):
                 if not _join_gate(chat_id):
+                    _ack_callback(update)
                     return
             else:
                 membership_state, missing = _community_membership_state(chat_id)
                 if membership_state == "not_joined":
                     _community_clear_verified(chat_id)
+                    _ack_callback(update)
                     _join_gate(chat_id)
                     return
 
@@ -3108,6 +3356,7 @@ def safe_handler(func):
             if func.__name__ not in {"support", "_handle_support_text_complaint"}:
                 data = getattr(update, "data", "")
                 if data not in {"maintenance_try", "maintenance_support"} and get_state(chat_id).get("flow") != "support":
+                    _ack_callback(update)
                     maintenance_message(chat_id)
                     return
         if not _guard_rapid_action(update, chat_id):
@@ -3119,7 +3368,8 @@ def safe_handler(func):
                 except Exception:
                     logger.exception("Could not acknowledge rapid callback for %s", chat_id)
             else:
-                bot.send_message(chat_id, _double_action_message(chat_id), parse_mode="HTML")
+                if _rapid_notice_allowed(chat_id):
+                    bot.send_message(chat_id, _double_action_message(chat_id), parse_mode="HTML")
             return
 
         # IMPORTANT: do NOT delete the current navigation keyboard yet.
@@ -3130,7 +3380,7 @@ def safe_handler(func):
         if hasattr(update, "message") and getattr(update, "message", None):
             keep_message_id = getattr(update.message, "message_id", None)
 
-        wait_notice = _show_wait_notice(chat_id)
+        wait_notice = _show_wait_notice(chat_id) if SHOW_WAIT_NOTICE else None
         # The wait notice is intentionally temporary: show it first so the
         # user knows the tap was received, then remove it at the exact
         # boundary where the real action starts. Tracking/result messages
@@ -3200,12 +3450,69 @@ def _screen_back_cb(c):
     # message is appropriate here. The previous screen remains in chat.
     bot.send_message(c.message.chat.id, "🏠 Main Menu", reply_markup=main_menu(c.message.chat.id))
 
-def notify_admins(text, **kwargs):
+import queue
+
+_ADMIN_NOTIFY_QUEUE = queue.Queue(maxsize=5000)
+_ADMIN_NOTIFY_STARTED = False
+_ADMIN_NOTIFY_LOCK = threading.Lock()
+_ADMIN_NOTIFY_SUPPRESSED = [0]
+
+
+def _admin_notify_flush_summary():
+    n = _ADMIN_NOTIFY_SUPPRESSED[0]
+    if n <= 0:
+        return
+    _ADMIN_NOTIFY_SUPPRESSED[0] = 0
     for admin_id in ADMIN_IDS:
         try:
-            bot.send_message(admin_id, text, **kwargs)
+            bot.send_message(admin_id, f"🆕 {n} more new users joined (individual alerts were grouped during heavy traffic).")
         except Exception:
-            logger.exception("Failed to notify admin %s", admin_id)
+            logger.warning("Failed to send grouped new-user summary to admin %s", admin_id, exc_info=True)
+
+
+def _admin_notify_worker():
+    """Admin alerts are sent from ONE background thread.
+
+    They used to be sent inside user handlers; when thousands of users arrived
+    at once every handler thread queued behind the admin's chat and the bot
+    froze. Alerts are now queued, paced by the Telegram limiter, and the very
+    chatty 'NEW USER' alert is grouped when the queue is long.
+    """
+    while True:
+        try:
+            text, kwargs = _ADMIN_NOTIFY_QUEUE.get(timeout=20)
+        except queue.Empty:
+            try:
+                _admin_notify_flush_summary()
+            except Exception:
+                logger.exception("Admin notify summary failed")
+            continue
+        try:
+            if _ADMIN_NOTIFY_QUEUE.qsize() > 60 and str(text).startswith("🆕 NEW USER"):
+                _ADMIN_NOTIFY_SUPPRESSED[0] += 1
+                continue
+            for admin_id in ADMIN_IDS:
+                try:
+                    bot.send_message(admin_id, text, **kwargs)
+                except Exception:
+                    logger.warning("Failed to notify admin %s", admin_id, exc_info=True)
+            if _ADMIN_NOTIFY_SUPPRESSED[0] and _ADMIN_NOTIFY_QUEUE.empty():
+                _admin_notify_flush_summary()
+        except Exception:
+            logger.exception("Admin notify worker error")
+
+
+def notify_admins(text, **kwargs):
+    global _ADMIN_NOTIFY_STARTED
+    if not _ADMIN_NOTIFY_STARTED:
+        with _ADMIN_NOTIFY_LOCK:
+            if not _ADMIN_NOTIFY_STARTED:
+                threading.Thread(target=_admin_notify_worker, daemon=True, name="admin-notify").start()
+                _ADMIN_NOTIFY_STARTED = True
+    try:
+        _ADMIN_NOTIFY_QUEUE.put_nowait((text, kwargs))
+    except queue.Full:
+        logger.warning("Admin notification queue is full; one alert was dropped")
 
 
 def _audit_channel_id():
@@ -3224,26 +3531,49 @@ def _audit_text(row):
             f"👮 Actor: <code>{html.escape(str(row['admin_id']))}</code>\n"
             f"🕒 {html.escape(str(row['created_at']))}")
 
+_NOISY_AUDIT_ACTIONS = ("OTP_PURCHASE", "OTP_COMPLETED", "NEW_USER")
+
+
 def audit_channel_dispatcher():
     """Deliver durable SQLite audit history to the configured channel.
     The database remains the source of truth; failed Telegram delivery is retried.
+
+    Telegram allows only ~20 messages/minute into one channel, so delivery is
+    paced (AUDIT_CHANNEL_MIN_INTERVAL). If the backlog grows beyond
+    AUDIT_SHED_BACKLOG, the very frequent OTP_PURCHASE / OTP_COMPLETED / NEW_USER
+    rows are no longer mirrored to the channel (they stay in the database).
     """
     while True:
+        pause = 5.0
         try:
             cid=_audit_channel_id()
             if cid:
                 rows=fetchall("SELECT * FROM audit_log WHERE channel_sent=0 ORDER BY id LIMIT 25")
+                shed = False
+                if len(rows) >= 25:
+                    cnt = fetchone("SELECT COUNT(*) AS n FROM (SELECT 1 FROM audit_log WHERE channel_sent=0 LIMIT ?)", (AUDIT_SHED_BACKLOG + 1,))
+                    shed = bool(cnt and int(cnt["n"]) > AUDIT_SHED_BACKLOG)
                 for row in rows:
+                    if shed and str(row["action"]) in _NOISY_AUDIT_ACTIONS:
+                        with db_tx() as conn:
+                            conn.execute("UPDATE audit_log SET channel_sent=1 WHERE id=?",(row["id"],))
+                        continue
                     try:
                         sent=bot.send_message(cid,_audit_text(row),parse_mode="HTML")
                         with db_tx() as conn:
                             conn.execute("UPDATE audit_log SET channel_sent=1,channel_message_id=? WHERE id=?",(sent.message_id,row["id"]))
-                    except Exception:
-                        logger.exception("Audit channel delivery failed for audit id %s",row["id"])
+                    except Exception as exc:
+                        if getattr(exc, "error_code", None) == 429:
+                            try:
+                                pause = float(((getattr(exc, "result_json", None) or {}).get("parameters") or {}).get("retry_after", 10) or 10) + 1.0
+                            except Exception:
+                                pause = 10.0
+                        logger.warning("Audit channel delivery failed for audit id %s: %s",row["id"],exc)
                         break
+                    time.sleep(AUDIT_CHANNEL_MIN_INTERVAL)
         except Exception:
             logger.exception("Audit channel dispatcher error")
-        time.sleep(5)
+        time.sleep(pause)
 
 
 
@@ -3334,22 +3664,32 @@ def _community_id(kind):
 def _community_link(kind):
     return str(_community_get(kind).get("link") or "").strip()
 
+_COMMUNITY_LINK_CACHE = {}
+
+
 def _community_effective_link(kind, chat=None):
     """Return configured invite/public link, or derive a public t.me link."""
     saved = _community_link(kind)
     if saved:
         return saved
+    cache_key = None
     try:
         if chat is None:
             cid = _community_id(kind)
             if not cid:
                 return ""
+            cache_key = (kind, cid)
+            hit = _COMMUNITY_LINK_CACHE.get(cache_key)
+            if hit and (time.monotonic() - hit[0]) < (600.0 if hit[1] else 60.0):
+                return hit[1]
             chat = bot.get_chat(cid)
         username = getattr(chat, "username", None)
-        if username:
-            return f"https://t.me/{username}"
+        link = f"https://t.me/{username}" if username else ""
+        if cache_key is not None:
+            _COMMUNITY_LINK_CACHE[cache_key] = (time.monotonic(), link)
+        return link
     except Exception:
-        logger.exception("Could not resolve public link for community %s", kind)
+        logger.warning("Could not resolve public link for community %s", kind, exc_info=True)
     return ""
 
 def _community_settings_text():
@@ -3634,31 +3974,79 @@ def _handle_community_set(m, state):
 
 _COMMUNITY_MEMBER_CACHE = {}
 _COMMUNITY_MEMBER_CACHE_LOCK = threading.Lock()
-_COMMUNITY_MEMBER_CACHE_TTL = 60.0
+# A "joined" answer is trusted for COMMUNITY_RECHECK_SECONDS (default 10 min).
+# A definite "not joined" answer is trusted for only 2 seconds, and "unknown"
+# is never cached.
+#
+# BUG THAT WAS FIXED: "not joined" used to be cached for a whole minute. A user
+# who tapped "I've Joined" a few seconds after seeing the join screen got the
+# stale cached "not joined" answer back, so the bot kept asking him to join
+# even though he already had. The "I've Joined" button now ALWAYS asks Telegram
+# again (force=True).
+_COMMUNITY_MEMBER_CACHE_TTL = COMMUNITY_RECHECK_SECONDS
+_COMMUNITY_NEGATIVE_TTL = 2.0
+_COMMUNITY_ERROR_ALERT_AT = {}
+_COMMUNITY_DEFINITE_MISS_MARKERS = (
+    "user not found", "participant_id_invalid", "user_not_participant", "member not found",
+)
 
 
-def _community_membership_state(chat_id):
+def _community_is_definite_miss(exc):
+    """Telegram answered clearly: this user is not in the chat."""
+    code = getattr(exc, "error_code", None)
+    desc = str(getattr(exc, "description", "") or exc).lower()
+    return code == 400 and any(marker in desc for marker in _COMMUNITY_DEFINITE_MISS_MARKERS)
+
+
+def _community_report_check_error(kind, cid, exc):
+    logger.warning("Membership check unavailable: community=%s id=%s: %s", kind, cid, exc)
+    now = time.monotonic()
+    if (now - _COMMUNITY_ERROR_ALERT_AT.get(kind, 0.0)) < 1800.0:
+        return
+    _COMMUNITY_ERROR_ALERT_AT[kind] = now
+    try:
+        label = COMMUNITY_LABELS.get(kind, kind)
+        notify_admins(
+            "⚠️ <b>COMMUNITY CHECK PROBLEM</b>\n\n"
+            f"Telegram cannot verify members of <b>{html.escape(str(label))}</b> "
+            f"(<code>{html.escape(str(cid))}</code>).\n"
+            "✅ Make sure the bot is an <b>ADMIN</b> of that group/channel and that the saved Chat ID is correct.\n\n"
+            f"📝 <code>{html.escape(str(exc)[:300])}</code>\n\n"
+            "ℹ️ This alert is sent at most once every 30 minutes.",
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.exception("Could not queue community check alert")
+
+
+def _community_membership_state(chat_id, force=False):
     """Return (state, missing) where state is joined/not_joined/unknown.
 
     `unknown` means Telegram could not reliably answer the membership query.
     It must never be treated as "not joined", otherwise a temporary Telegram
-   /API problem can lock a perfectly valid user out of the bot.
+    API problem can lock a perfectly valid user out of the bot.
+
+    force=True skips the cache (used by the "I've Joined - Check Again" button).
     """
-    now = time.monotonic()
     key = str(chat_id)
-    with _COMMUNITY_MEMBER_CACHE_LOCK:
-        cached = _COMMUNITY_MEMBER_CACHE.get(key)
-        if cached and (now - cached[0]) < _COMMUNITY_MEMBER_CACHE_TTL:
-            return cached[1], cached[2]
+    if not force:
+        now = time.monotonic()
+        with _COMMUNITY_MEMBER_CACHE_LOCK:
+            cached = _COMMUNITY_MEMBER_CACHE.get(key)
+        if cached:
+            age = now - cached[0]
+            if cached[1] == "joined" and age < _COMMUNITY_MEMBER_CACHE_TTL:
+                return cached[1], cached[2]
+            if cached[1] == "not_joined" and age < _COMMUNITY_NEGATIVE_TTL:
+                return cached[1], cached[2]
 
     missing = []
     unknown = False
     for kind, label in _user_join_requirements():
         cid = _community_id(kind)
         if not cid:
-            # If the administrator has not configured a required community,
-            # do not lock every user out. The configuration check will show it.
-            unknown = True
+            # A community the administrator has not configured cannot be
+            # required. (The admin sees it in Community Settings.)
             continue
         try:
             member = bot.get_chat_member(cid, chat_id)
@@ -3668,17 +4056,25 @@ def _community_membership_state(chat_id):
             if not joined:
                 missing.append((kind, label, _community_effective_link(kind)))
         except Exception as exc:
-            unknown = True
-            logger.warning("Membership check unavailable: user=%s community=%s: %s", chat_id, kind, exc)
+            if _community_is_definite_miss(exc):
+                missing.append((kind, label, _community_effective_link(kind)))
+            else:
+                unknown = True
+                _community_report_check_error(kind, cid, exc)
 
-    if unknown:
-        state = "unknown"
-    elif missing:
+    # A definite miss wins over an unknown answer for the OTHER community.
+    # (Before, one flaky answer hid the fact that the user had not joined.)
+    if missing:
         state = "not_joined"
+    elif unknown:
+        state = "unknown"
     else:
         state = "joined"
-    with _COMMUNITY_MEMBER_CACHE_LOCK:
-        _COMMUNITY_MEMBER_CACHE[key] = (now, state, missing)
+    if state != "unknown":
+        with _COMMUNITY_MEMBER_CACHE_LOCK:
+            if len(_COMMUNITY_MEMBER_CACHE) > 500000:
+                _COMMUNITY_MEMBER_CACHE.clear()
+            _COMMUNITY_MEMBER_CACHE[key] = (time.monotonic(), state, missing)
     return state, missing
 
 
@@ -3719,12 +4115,56 @@ def _user_is_joined(chat_id):
     return []
 
 
-def _join_gate(chat_id, message=None):
+def _join_gate_screen(chat_id, missing, message=None, note=None):
+    """Draw the 'please join' screen (edit in place when we are given a message)."""
+    configured = {kind: (label, link) for kind, label, link in missing}
+    kb = types.InlineKeyboardMarkup()
+    for kind, label in _user_join_requirements():
+        if not _community_id(kind):
+            continue
+        link = configured.get(kind, (label, _community_effective_link(kind)))[1]
+        if link:
+            kb.add(types.InlineKeyboardButton(label, url=link))
+
+    kb.add(types.InlineKeyboardButton("✅ I've Joined — Check Again", callback_data="community_join_check"))
+
+    text = (
+        "🔐 <b>Join Required Before Using the Bot</b>\n\n"
+        "Please join both of these official community spaces first:\n\n"
+        "👥 <b>Group</b>\n"
+        "📢 <b>Channel</b>\n\n"
+        "Use the two Join buttons above, then tap <b>✅ I've Joined — Check Again</b>."
+    )
+    if any(not link for _, _, link in missing):
+        text += (
+            "\n\n⚠️ One required community link is not configured yet. "
+            "The administrator needs to finish Community Settings."
+        )
+    if note:
+        text += "\n\n" + note
+
+    try:
+        if message is not None:
+            bot.edit_message_text(text, chat_id, message.message_id, parse_mode="HTML", reply_markup=kb)
+        else:
+            bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+    except Exception as exc:
+        if "message is not modified" in str(exc).lower():
+            return  # identical screen is already showing: nothing to do
+        logger.warning("Could not display community join gate to %s: %s", chat_id, exc)
+        if message is not None:
+            try:
+                bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                logger.exception("Could not send community join gate to %s", chat_id)
+
+
+def _join_gate(chat_id, message=None, force=False):
     """Require both onboarding destinations before normal bot access."""
     if is_admin(chat_id):
         return True
 
-    state, missing = _community_membership_state(chat_id)
+    state, missing = _community_membership_state(chat_id, force=force)
     if state == "joined":
         _community_mark_verified(chat_id)
         return True
@@ -3746,80 +4186,158 @@ def _join_gate(chat_id, message=None):
             logger.warning("Could not send community verification unavailable notice to %s", chat_id)
         return False
 
-    # Always present both onboarding buttons when their links are configured.
-    # This fixes the old UI where users could see only "I Joined" after one
-    # requirement was already satisfied.
-    configured = {kind: (label, link) for kind, label, link in missing}
-    kb = types.InlineKeyboardMarkup()
-    for kind, label in _user_join_requirements():
-        link = configured.get(kind, (label, _community_effective_link(kind)))[1]
-        if link:
-            kb.add(types.InlineKeyboardButton(label, url=link))
+    _join_gate_screen(chat_id, missing, message)
+    return False
 
-    kb.add(types.InlineKeyboardButton("✅ I've Joined — Check Again", callback_data="community_join_check"))
 
-    text = (
-        "🔐 <b>Join Required Before Using the Bot</b>\n\n"
-        "Please join both of these official community spaces first:\n\n"
-        "👥 <b>Group</b>\n"
-        "📢 <b>Channel</b>\n\n"
-        "Use the two Join buttons above, then tap <b>✅ I've Joined — Check Again</b>."
+def _send_welcome(chat_id, full_name):
+    user_id = str(chat_id)
+    referral_link = _safe_referral_link(user_id)
+    referral_line = (
+        f"🎁 Referral Reward: Earn {fmt_amount(get_referral_amount('usdt'), 'usdt')} for every friend you invite!\n\n"
+        if is_referral_enabled() else ""
+    )
+    _, _welcome_default = TEXT_TEMPLATES["welcome"]
+    bot.send_message(
+        chat_id,
+        render_text(
+            "welcome", _welcome_default,
+            full_name=html.escape(full_name),
+            brand=html.escape(BRAND),
+            referral_line=referral_line,
+            referral_link=html.escape(referral_link),
+        ),
+        parse_mode="HTML",
+        reply_markup=main_menu(chat_id),
     )
 
-    if any(not link for _, _, link in missing):
-        text += (
-            "\n\n⚠️ One required community link is not configured yet. "
-            "The administrator needs to finish Community Settings."
-        )
+
+def _finish_onboarding(chat_id, full_name):
+    """Run the 'brand-new user' side effects exactly once, AFTER the join gate.
+
+    BUG THAT WAS FIXED: the new-user alert and the referral reward were run
+    inside /start only when the user was created in that very call. A new
+    user who was stopped by the join screen therefore never triggered them (on
+    the second /start he was no longer "new"), so the referrer lost the reward.
+    The referral id is now stored on the user row and paid out here, the first
+    time the user really gets in.
+    """
+    user_id = str(chat_id)
+    try:
+        row = fetchone("SELECT onboarded_at FROM users WHERE user_id=?", (user_id,))
+        if row is None or row["onboarded_at"]:
+            return False
+        with db_tx() as conn:
+            cur = conn.execute("SELECT onboarded_at, pending_ref FROM users WHERE user_id=?", (user_id,)).fetchone()
+            if cur is None or cur["onboarded_at"]:
+                return False
+            conn.execute("UPDATE users SET onboarded_at=?, pending_ref=NULL WHERE user_id=? AND onboarded_at IS NULL",
+                         (now_iso(), user_id))
+            ref_id = cur["pending_ref"]
+            conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",
+                         ("SYSTEM", "NEW_USER", user_id, None, None, full_name, now_iso()))
+    except Exception:
+        logger.exception("Could not finish onboarding for %s", user_id)
+        return False
+
+    notify_admins(f"🆕 NEW USER\n\n👤 Name: {full_name}\n🆔 ID: {user_id}")
 
     try:
-        if message is not None:
-            bot.edit_message_text(
-                text,
-                chat_id,
-                message.message_id,
-                parse_mode="HTML",
+        if ref_id and str(ref_id) != user_id and user_exists(ref_id) and is_referral_enabled():
+            ref_usdt = get_referral_amount("usdt")
+            kb = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton(f"🪙 USDT ({fmt_amount(ref_usdt, 'usdt')})", callback_data=f"refpay_usdt_{user_id}"))
+            bot.send_message(
+                ref_id,
+                f"🎊 New Referral!\n\n"
+                f"👤 {full_name} has joined {BRAND} using your link.\n"
+                "👉 Choose your reward currency below:",
                 reply_markup=kb,
             )
-        else:
-            bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
     except Exception:
-        logger.exception("Could not display community join gate to %s", chat_id)
-        if message is not None:
-            bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
-    return False
+        logger.warning("Could not notify referrer for new user %s", user_id, exc_info=True)
+    return True
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "community_join_check")
 @safe_handler
 def community_join_check_cb(c):
-    if is_admin(c.message.chat.id):
+    chat_id = c.message.chat.id
+    if is_admin(chat_id):
         bot.answer_callback_query(c.id, "✅ Admin access confirmed.")
-        _screen_from_callback(c, "🏠 Main Menu", reply_markup=main_menu(c.message.chat.id))
+        _screen_from_callback(c, "🏠 Main Menu", reply_markup=main_menu(chat_id))
         return
 
-    membership_state, missing = _community_membership_state(c.message.chat.id)
-    if membership_state == "joined":
-        _community_mark_verified(c.message.chat.id)
-        bot.answer_callback_query(c.id, "✅ Membership confirmed.")
-        _screen_from_callback(
-            c,
-            "✅ <b>Membership confirmed.</b>\n\nYou can now use the bot normally. We will only ask you to join again if Telegram later confirms that you left a required community.",
-            parse_mode="HTML",
-            reply_markup=main_menu(c.message.chat.id),
-        )
+    # Acknowledge the tap IMMEDIATELY. Telegram only accepts the answer for a
+    # short time; answering after the (network) membership check could be too
+    # late, which left the button spinning and looked like "the bot does not
+    # recognise that I joined".
+    try:
+        bot.answer_callback_query(c.id, "⏳ Checking…")
+    except Exception:
+        logger.debug("Could not acknowledge join-check tap", exc_info=True)
+
+    # Always ask Telegram again (never trust a cached "not joined").
+    state, missing = _community_membership_state(chat_id, force=True)
+    if state == "not_joined":
+        # Telegram can need a moment before a brand-new member shows up.
+        time.sleep(1.2)
+        state, missing = _community_membership_state(chat_id, force=True)
+
+    if state == "joined":
+        _community_mark_verified(chat_id)
+        try:
+            bot.edit_message_text(
+                "✅ <b>Membership confirmed.</b>\n\nYou can now use the bot normally. "
+                "We will only ask you to join again if Telegram later confirms that you left a required community.",
+                chat_id, c.message.message_id, parse_mode="HTML",
+            )
+        except Exception as exc:
+            if "message is not modified" not in str(exc).lower():
+                logger.debug("Could not edit join gate into confirmation: %s", exc)
+        fu = c.from_user
+        full_name = (getattr(fu, "first_name", None) or "Friend")
+        if getattr(fu, "last_name", None):
+            full_name += f" {fu.last_name}"
+        _finish_onboarding(chat_id, full_name)
+        _send_welcome(chat_id, full_name)
         return
 
-    if membership_state == "unknown":
-        bot.answer_callback_query(c.id, "⚠️ Telegram could not verify membership right now. Please try again shortly.", show_alert=True)
+    stamp = datetime.now(LAGOS_TZ).strftime("%H:%M:%S")
+    if state == "unknown":
+        note = (f"⚠️ Telegram could not verify membership right now. Please tap "
+                f"<b>Check Again</b> in a few seconds. <i>({stamp})</i>")
+        _join_gate_screen(chat_id, [], c.message, note)
         return
 
-    bot.answer_callback_query(
-        c.id,
-        "⚠️ Please join both the Group and Channel first.",
-        show_alert=True,
-    )
-    _join_gate(c.message.chat.id, c.message)
+    names = ", ".join(("👥 Group" if k == "user_group" else "📢 Channel") for k, _l, _k in missing) or "Group / Channel"
+    note = (f"❌ Not detected yet: <b>{names}</b>.\n"
+            "Tap the Join button, make sure you actually joined, wait a few seconds, then tap "
+            f"<b>Check Again</b>. <i>({stamp})</i>")
+    _join_gate_screen(chat_id, missing, c.message, note)
+
+
+def _community_join_request_cb(req):
+    """Auto-approve join requests for the two required communities.
+
+    If an invite link needs admin approval, a user who tapped "Request to join"
+    is NOT a member yet and could never pass the join gate. The bot (which must
+    be an admin there) approves the request itself.
+    """
+    try:
+        cid = req.chat.id
+        required = {_community_id(kind) for kind, _label in _user_join_requirements()}
+        if cid in required:
+            bot.approve_chat_join_request(cid, req.from_user.id)
+    except Exception as exc:
+        logger.warning("Could not auto-approve join request: %s", exc)
+
+
+if AUTO_APPROVE_JOIN_REQUESTS and hasattr(bot, "chat_join_request_handler"):
+    try:
+        bot.chat_join_request_handler(func=lambda r: True)(_community_join_request_cb)
+    except Exception:
+        logger.warning("Join-request auto-approval handler could not be registered", exc_info=True)
 
 # ================================================================
 # MENUS
@@ -4008,56 +4526,26 @@ def start(msg):
         full_name += f" {msg.from_user.last_name}"
     username = msg.from_user.username or None
 
-    command_parts = msg.text.split()
+    command_parts = (msg.text or "").split()
     ref_id = command_parts[1] if len(command_parts) > 1 else None
 
     with db_tx() as conn:
-        is_new = ensure_user(conn, user_id, full_name, username)
+        ensure_user(conn, user_id, full_name, username)
+        if ref_id:
+            # Remember who invited this user until he really gets in (passes
+            # the join gate). NOTE: safe_handler already created the user row
+            # before /start runs, so "is the row new?" is always False there;
+            # that is why referrals were never paid. Use "not onboarded yet".
+            conn.execute("UPDATE users SET pending_ref=? WHERE user_id=? AND onboarded_at IS NULL AND pending_ref IS NULL",
+                         (str(ref_id)[:64], user_id))
 
     clear_state(msg.chat.id)
 
     if not _join_gate(msg.chat.id):
         return
 
-    if is_new:
-        notify_admins(f"🆕 NEW USER\n\n👤 Name: {full_name}\n🆔 ID: {user_id}")
-        with db_tx() as conn:
-            conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",
-                         ("SYSTEM","NEW_USER",user_id,None,None,full_name,now_iso()))
-
-        if ref_id and str(ref_id) != user_id and user_exists(ref_id) and is_referral_enabled():
-            ref_usdt = get_referral_amount("usdt")
-            kb = types.InlineKeyboardMarkup()
-            kb.add(types.InlineKeyboardButton(f"🪙 USDT ({fmt_amount(ref_usdt, 'usdt')})", callback_data=f"refpay_usdt_{user_id}"))
-            try:
-                bot.send_message(
-                    ref_id,
-                    f"🎊 New Referral!\n\n"
-                    f"👤 {full_name} has joined {BRAND} using your link.\n"
-                    "👉 Choose your reward currency below:",
-                    reply_markup=kb,
-                )
-            except Exception:
-                logger.exception("Could not notify referrer %s", ref_id)
-
-    referral_link = _safe_referral_link(user_id)
-    referral_line = (
-        f"🎁 Referral Reward: Earn {fmt_amount(get_referral_amount('usdt'), 'usdt')} for every friend you invite!\n\n"
-        if is_referral_enabled() else ""
-    )
-    _, _welcome_default = TEXT_TEMPLATES["welcome"]
-    bot.send_message(
-        msg.chat.id,
-        render_text(
-            "welcome", _welcome_default,
-            full_name=html.escape(full_name),
-            brand=html.escape(BRAND),
-            referral_line=referral_line,
-            referral_link=html.escape(referral_link),
-        ),
-        parse_mode="HTML",
-        reply_markup=main_menu(msg.chat.id),
-    )
+    _finish_onboarding(msg.chat.id, full_name)
+    _send_welcome(msg.chat.id, full_name)
 
 
 # ================================================================
@@ -4065,6 +4553,7 @@ def start(msg):
 # ================================================================
 
 _BOT_PUBLIC_HANDLE_CACHE = None
+_BOT_USERNAME_CACHE = ""
 
 def _bot_public_identity():
     """Return the live bot username/link when Telegram can provide it."""
@@ -4111,13 +4600,15 @@ def _safe_referral_link(user_id):
         base = "https://" + base
     if re.match(r"^https?://t\.me/[A-Za-z0-9_]{4,64}$", base, re.I):
         return base + f"?start={user_id}"
+    global _BOT_USERNAME_CACHE
     try:
-        me = bot.get_me()
-        username = getattr(me, "username", None)
-        if username:
-            return f"https://t.me/{username}?start={user_id}"
+        if not _BOT_USERNAME_CACHE:
+            me = bot.get_me()
+            _BOT_USERNAME_CACHE = getattr(me, "username", None) or ""
+        if _BOT_USERNAME_CACHE:
+            return f"https://t.me/{_BOT_USERNAME_CACHE}?start={user_id}"
     except Exception:
-        logger.exception("Could not resolve bot username for referral link")
+        logger.warning("Could not resolve bot username for referral link", exc_info=True)
     return ""
 
 
@@ -5173,6 +5664,7 @@ def admin_role_remove_cb(c):
     uid = c.data.split(":", 1)[1]
     with db_tx() as conn:
         conn.execute("DELETE FROM extra_admins WHERE user_id=?", (uid,))
+    _admin_cache_clear()
     bot.answer_callback_query(c.id, "Admin role removed")
     extras = fetchall("SELECT * FROM extra_admins ORDER BY added_at")
     text = f"👮 ADMIN ROLES\n\n👑 Primary/Super Admin: <code>{PRIMARY_ADMIN}</code>\n\n"
@@ -5547,12 +6039,13 @@ def broadcast_decision_cb(c):
     if c.data=="cancel_admin":
         clear_state(chat_id); bot.answer_callback_query(c.id); bot.edit_message_text("❌ Cancelled.",chat_id,c.message.message_id); return
     text=state.get("text",""); target=state.get("target","all"); clear_state(chat_id)
-    bot.answer_callback_query(c.id); bot.edit_message_text("⌛ Sending message...",chat_id,c.message.message_id)
+    bot.answer_callback_query(c.id); bot.edit_message_text("⌛ Sending in the background…" if target=="all" else "⌛ Sending message...",chat_id,c.message.message_id)
     sent=0
     if target=="all":
-        for row in fetchall("SELECT user_id FROM users"):
-            try: bot.send_message(row["user_id"],f"📢 {BRAND}:\n\n{text}"); sent+=1
-            except Exception: logger.exception("Broadcast failed to reach %s",row["user_id"])
+        # Runs in its own thread and is paced: it used to occupy a Telegram
+        # handler thread for hours and flood the whole outbound budget.
+        _start_background_broadcast(chat_id, text)
+        return
     else:
         cid=_community_id(target)
         if not cid:
@@ -7810,16 +8303,68 @@ def _handle_auto_edit_field(m, state):
     bot.send_message(m.chat.id, "✅ Updated.", reply_markup=main_menu(m.chat.id))
 
 
+def _broadcast_text(user_ids, text):
+    """Send `text` to every id politely. Returns (sent, failed).
+
+    * paced at BROADCAST_RATE msgs/sec (never the whole Telegram budget),
+    * pauses while the outbound queue is long so normal users always go first,
+    * a blocked/deactivated user is one quiet counter, not a stack trace.
+    """
+    sent = 0
+    failed = 0
+    gap = 1.0 / BROADCAST_RATE
+    for uid in user_ids:
+        waited = 0.0
+        while _tg_backlog_seconds() > 2.0 and waited < 60.0:
+            time.sleep(0.5)
+            waited += 0.5
+        try:
+            bot.send_message(uid, text)
+            sent += 1
+        except Exception as exc:
+            if getattr(exc, "error_code", None) == 429:
+                try:
+                    retry = float(((getattr(exc, "result_json", None) or {}).get("parameters") or {}).get("retry_after", 5) or 5)
+                except Exception:
+                    retry = 5.0
+                time.sleep(min(60.0, retry + 1.0))
+                try:
+                    bot.send_message(uid, text)
+                    sent += 1
+                except Exception:
+                    failed += 1
+            else:
+                failed += 1
+                logger.debug("Broadcast could not reach %s: %s", uid, exc)
+        time.sleep(gap)
+    return sent, failed
+
+
+def _start_background_broadcast(admin_chat_id, text):
+    def run():
+        try:
+            sent, failed = _broadcast_text(all_user_ids(), f"📢 {BRAND}:\n\n{text}")
+            try:
+                bot.send_message(admin_chat_id,
+                                 f"✅ Broadcast finished.\n📨 Delivered: {sent}\n⚠️ Not delivered (blocked/inactive): {failed}",
+                                 reply_markup=main_menu(admin_chat_id))
+            except Exception:
+                logger.exception("Could not report broadcast result to admin %s", admin_chat_id)
+            with db_tx() as conn:
+                conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",
+                             (str(admin_chat_id), "BROADCAST_SENT", None, None, gen_id("MSG"),
+                              f"target=all; delivered={sent}; failed={failed}; {text[:300]}", now_iso()))
+        except Exception:
+            logger.exception("Background broadcast failed")
+    threading.Thread(target=run, daemon=True, name="broadcast").start()
+
+
 def _send_target_message(target_type, body, target_value=None):
     """Send a scheduled/manual message to the configured audience."""
-    sent=0
     if target_type == "bot_users":
-        for uid in all_user_ids():
-            try:
-                bot.send_message(uid, f"📢 {BRAND}:\n\n{body}")
-                sent+=1
-            except Exception:
-                logger.exception("Message delivery failed to bot user %s", uid)
+        sent, failed = _broadcast_text(all_user_ids(), f"📢 {BRAND}:\n\n{body}")
+        if failed:
+            logger.info("Auto message: %d delivered, %d not delivered", sent, failed)
         return sent
     cid=_community_id(target_type)
     if cid:
@@ -9243,9 +9788,57 @@ def otp_db_init():
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (r['service_code'] or 'wa',r['code'],r['name'],r['flag'],r['grizzly_cost'],r['explicit_price'],r['markup_percent'],r['markup_fixed'],r['available_count'],r['enabled'],r['profit_active'],r['updated_at']))
 
+class _Pacer:
+    """FIFO request pacer: every caller reserves its own time slot (no busy loops)."""
+    def __init__(self, rate):
+        self.interval = 1.0 / max(0.1, float(rate))
+        self.next = 0.0
+        self.lock = threading.Lock()
+
+    def wait(self):
+        with self.lock:
+            now = time.monotonic()
+            slot = max(now, self.next)
+            self.next = slot + self.interval
+        delay = slot - now
+        if delay > 0:
+            time.sleep(delay)
+        return delay
+
+    def penalize(self, seconds):
+        with self.lock:
+            self.next = max(self.next, time.monotonic() + float(seconds))
+
+    def backlog(self):
+        return max(0.0, self.next - time.monotonic())
+
+
+# Three independent lanes so a flood of one kind can never starve another:
+#  buy  : getNumberV2 / setStatus (cancel)    - what users are waiting for
+#  poll : getStatusV2 (+ automatic expiry)    - OTP delivery
+#  cat  : prices / countries / services       - catalogue refresh (low priority)
+_GRIZZLY_PACERS = {
+    'buy': _Pacer(GRIZZLY_BUY_RPS),
+    'poll': _Pacer(GRIZZLY_POLL_RPS),
+    'cat': _Pacer(GRIZZLY_CATALOG_RPS),
+}
+_GRIZZLY_TIMEOUTS = {'buy': 25, 'poll': 12, 'cat': 20}
+_GRIZZLY_BUY_ACTIONS = {'getNumberV2', 'getNumber', 'setStatus'}
+_GRIZZLY_POLL_ACTIONS = {'getStatusV2', 'getStatus'}
+
+
+def _otp_lane_for(action):
+    if action in _GRIZZLY_BUY_ACTIONS:
+        return 'buy'
+    if action in _GRIZZLY_POLL_ACTIONS:
+        return 'poll'
+    return 'cat'
+
+
 def _otp_http(action, **params):
     if not GRIZZLY_API_KEY:
         raise RuntimeError('GRIZZLY_API_KEY is not configured')
+    lane = params.pop('_lane', None) or _otp_lane_for(action)
     q={'api_key':GRIZZLY_API_KEY,'action':action,**params}
     # Keep the generic activation endpoint clean. `operator` is only a
     # catalogue/account-specific option; it must NOT be blindly appended to
@@ -9253,9 +9846,16 @@ def _otp_http(action, **params):
     # Catalogue calls that need an operator use _otp_http_catalog().
     url=GRIZZLY_BASE_URL+'?'+urllib.parse.urlencode(q)
     req=urllib.request.Request(url,headers={'User-Agent':os.environ.get('GRIZZLY_USER_AGENT','MobileDigitalHub-QuickOTP/4.0').strip() or 'MobileDigitalHub-QuickOTP/4.0'})
+    pacer = _GRIZZLY_PACERS[lane]
+    pacer.wait()
     try:
-        with urllib.request.urlopen(req,timeout=30) as r:
+        with urllib.request.urlopen(req,timeout=_GRIZZLY_TIMEOUTS[lane]) as r:
             body=r.read().decode('utf-8','replace').strip()
+    except urllib.error.HTTPError as exc:
+        # Provider told us to slow down: make every caller of this lane back off.
+        if getattr(exc, 'code', None) in (429, 503):
+            pacer.penalize(3.0)
+        raise ConnectionError(str(exc)) from exc
     except Exception as exc:
         raise ConnectionError(str(exc)) from exc
     try: data=json.loads(body)
@@ -9940,13 +10540,54 @@ def _otp_create_activation(user_id,service_code,country_code,source_chat_id):
     except Exception: pass
     return None,'⚠️ <b>An samu matsala wajen ajiye request ɗin number.</b>\n\nAn riga an tabbatar da number daga provider, amma tsarinmu ya kasa kammala ajiyar request ɗin. An tura shi zuwa reconciliation domin kada kuɗinka ya ɓace.\n\n🧾 Request: <code>'+html.escape(order_id)+'</code>'
 
+_OTP_UI_CACHE = {}
+_OTP_UI_CACHE_LOCK = threading.Lock()
+_OTP_UI_CACHE_TTL = 3.0
+
+
+def _otp_ui_cache_clear():
+    with _OTP_UI_CACHE_LOCK:
+        _OTP_UI_CACHE.clear()
+
+
+def _otp_cached(key, builder, ttl=_OTP_UI_CACHE_TTL):
+    """Tiny TTL cache: thousands of users opening the same menu share one DB read."""
+    now = time.monotonic()
+    with _OTP_UI_CACHE_LOCK:
+        hit = _OTP_UI_CACHE.get(key)
+    if hit and (now - hit[0]) < ttl:
+        return hit[1]
+    value = builder()
+    with _OTP_UI_CACHE_LOCK:
+        if len(_OTP_UI_CACHE) > 2000:
+            _OTP_UI_CACHE.clear()
+        _OTP_UI_CACHE[key] = (time.monotonic(), value)
+    return value
+
+
+def _otp_eligible_services():
+    def build():
+        services = fetchall('SELECT * FROM otp_services WHERE enabled=1 ORDER BY service_name')
+        by_service = {}
+        # ONE query instead of one query per service (it used to be N+1).
+        for r in fetchall('SELECT * FROM otp_service_countries WHERE enabled=1 AND profit_active=1 AND available_count>0'):
+            by_service.setdefault(r['service_code'], []).append(r)
+        return [svc for svc in services
+                if any(_otp_profit_active(r, svc) for r in by_service.get(svc['service_code'], []))]
+    return _otp_cached(('services',), build)
+
+
+def _otp_eligible_countries(service):
+    def build():
+        service_cfg = fetchone('SELECT * FROM otp_services WHERE service_code=?', (service,))
+        all_rows = fetchall('SELECT * FROM otp_service_countries WHERE service_code=? AND enabled=1 AND profit_active=1 AND available_count>0 ORDER BY name', (service,))
+        return service_cfg, [r for r in all_rows if _otp_profit_active(r, service_cfg)]
+    return _otp_cached(('countries', service), build)
+
+
 def _otp_show_services(chat_id, page=0, edit=None):
     per=20; page=max(0,int(page))
-    services=fetchall('SELECT * FROM otp_services WHERE enabled=1 ORDER BY service_name')
-    eligible=[]
-    for svc in services:
-        countries=fetchall('SELECT * FROM otp_service_countries WHERE service_code=? AND enabled=1 AND profit_active=1 AND available_count>0',(svc['service_code'],))
-        if any(_otp_profit_active(r,svc) for r in countries): eligible.append(svc)
+    eligible=_otp_eligible_services()
     total=len(eligible)
     rows=eligible[page*per:(page+1)*per]
     if not rows and page>0:
@@ -9979,6 +10620,20 @@ def otp_services_page_cb(c):
 _OTP_ACTIVATION_EXECUTOR = ThreadPoolExecutor(
     max_workers=OTP_ACTIVATION_WORKERS, thread_name_prefix='otp-activation'
 )
+
+def _otp_buy_overloaded():
+    """True when new purchases would wait unreasonably long.
+
+    Better to say "busy, try again" BEFORE charging anybody than to leave
+    thousands of users staring at "Getting your number..." for minutes.
+    """
+    try:
+        queued = _OTP_ACTIVATION_EXECUTOR._work_queue.qsize()
+    except Exception:
+        queued = 0
+    estimated = (queued / max(1.0, GRIZZLY_BUY_RPS)) + _GRIZZLY_PACERS['buy'].backlog()
+    return estimated > OTP_BUY_MAX_WAIT_SECONDS
+
 
 def _otp_activation_ui_result(chat_id, message_id, service, code, result, msg, new_message=False):
     try:
@@ -10080,14 +10735,43 @@ def otp_entry(m):
         _otp_refresh_catalog_async()
     _otp_show_services(m.chat.id, 0, edit=None)
 
+_OTP_STOCK_REFRESH_AT = {}
+_OTP_STOCK_REFRESH_INFLIGHT = set()
+_OTP_STOCK_REFRESH_LOCK = threading.Lock()
+_OTP_STOCK_REFRESH_SEM = threading.BoundedSemaphore(3)
+
+
 def _otp_refresh_service_async(chat_id, message_id, service, svc):
+    # BUG THAT WAS FIXED: every user click on a service started a NEW thread that
+    # asked the provider for the price/stock of EVERY country of that service
+    # (hundreds of provider calls per click). With many users that flooded the
+    # provider (rate limit / ban risk) and froze the bot. Now: at most one refresh
+    # per service at a time, and at most one per OTP_STOCK_REFRESH_TTL seconds.
+    now = time.monotonic()
+    with _OTP_STOCK_REFRESH_LOCK:
+        if service in _OTP_STOCK_REFRESH_INFLIGHT:
+            return
+        if (now - _OTP_STOCK_REFRESH_AT.get(service, 0.0)) < OTP_STOCK_REFRESH_TTL:
+            return
+        _OTP_STOCK_REFRESH_INFLIGHT.add(service)
+
     def worker():
         try:
-            otp_sync_service_stock(service)
+            with _OTP_STOCK_REFRESH_SEM:
+                otp_sync_service_stock(service)
+            with _OTP_STOCK_REFRESH_LOCK:
+                _OTP_STOCK_REFRESH_AT[service] = time.monotonic()
+            _otp_ui_cache_clear()
             # Update the same message after the live stock refresh completes.
             _otp_show_countries(chat_id, service, 0, svc, edit=message_id)
         except Exception as exc:
+            with _OTP_STOCK_REFRESH_LOCK:
+                # Try again in ~20 seconds instead of hammering a failing provider.
+                _OTP_STOCK_REFRESH_AT[service] = time.monotonic() - OTP_STOCK_REFRESH_TTL + 20.0
             logger.warning('Background OTP service refresh failed for %s: %s', service, exc)
+        finally:
+            with _OTP_STOCK_REFRESH_LOCK:
+                _OTP_STOCK_REFRESH_INFLIGHT.discard(service)
     threading.Thread(target=worker, daemon=True, name=f'quick-otp-stock-{service}').start()
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('otp_service:'))
@@ -10107,9 +10791,7 @@ def otp_service_cb(c):
 def _otp_show_countries(chat_id, service, page, svc, edit=None):
     per=20; page=max(0,int(page))
     where='service_code=? AND enabled=1 AND profit_active=1 AND available_count>0'
-    service_cfg=fetchone('SELECT * FROM otp_services WHERE service_code=?',(service,))
-    all_rows=fetchall(f'SELECT * FROM otp_service_countries WHERE {where} ORDER BY name', (service,))
-    rows=[r for r in all_rows if _otp_profit_active(r,service_cfg)]
+    service_cfg, rows=_otp_eligible_countries(service)
     total=len(rows)
     rows=rows[page*per:(page+1)*per]
     if not rows:
@@ -10211,6 +10893,8 @@ def otp_buy_cb(c):
     if not is_feature_enabled("quick_otp", c.from_user.id):
         return bot.answer_callback_query(c.id, "Quick OTP is currently unavailable.", show_alert=True)
     _,service,code=c.data.split(':',2)
+    if _otp_buy_overloaded():
+        return bot.answer_callback_query(c.id,'⏳ The server is very busy right now. You were NOT charged. Please try again in a few seconds.',show_alert=True)
     bot.answer_callback_query(c.id,'Getting a number…')
     try:
         bot.edit_message_text(
@@ -10236,6 +10920,8 @@ def otp_new_cb(c):
     if not old:
         return bot.answer_callback_query(c.id,'This OTP request is no longer available.',show_alert=True)
     service,code=old['service_code'],old['country_code']
+    if _otp_buy_overloaded():
+        return bot.answer_callback_query(c.id,'⏳ The server is very busy right now. You were NOT charged. Please try again in a few seconds.',show_alert=True)
     bot.answer_callback_query(c.id,'Getting a new number…')
     try:
         sent=bot.send_message(
@@ -10679,87 +11365,219 @@ def _otp_close_provider_order(o, terminal_status='cancelled', reason='provider c
         conn.execute('UPDATE otp_orders SET status=?,refunded=1,activation_id=NULL,next_poll_at=NULL,poll_lease_until=NULL,last_provider_status=?,updated_at=? WHERE order_id=?',(terminal_status,str(reason)[:120],_otp_now(),o['order_id']))
     return True
 
-def _otp_poll_one(o):
-    try: return o,_otp_http('getStatusV2',id=o['activation_id']),None
-    except Exception as exc: return o,None,exc
+_OTP_INFLIGHT = set()
+_OTP_INFLIGHT_LOCK = threading.Lock()
+_OTP_WAITING_CACHE = {'at': 0.0, 'n': 0}
+
+
+def _otp_waiting_count():
+    now = time.monotonic()
+    if (now - _OTP_WAITING_CACHE['at']) > 5.0:
+        _OTP_WAITING_CACHE['at'] = now
+        try:
+            row = fetchone("SELECT COUNT(*) AS n FROM otp_orders WHERE status='waiting'")
+            _OTP_WAITING_CACHE['n'] = int(row['n'] or 0) if row else 0
+        except Exception:
+            logger.debug('Could not count waiting OTP orders', exc_info=True)
+    return _OTP_WAITING_CACHE['n']
+
+
+def _otp_next_poll_delay(age_seconds):
+    """Seconds until a still-waiting order is asked about again.
+
+    New orders are polled quickly (an SMS usually arrives within a minute or
+    two); older orders less often; and when very many orders are waiting the
+    interval stretches so the provider is never asked for more than
+    GRIZZLY_POLL_RPS requests per second.
+    """
+    base = float(OTP_STATUS_POLL_SECONDS)
+    by_age = min(15.0, base * (1.0 + max(0.0, age_seconds) / 150.0))
+    by_load = _otp_waiting_count() / max(1.0, GRIZZLY_POLL_RPS)
+    return min(90.0, max(by_age, by_load))
+
+
+def _otp_release_lease(order_id, delay=0.0):
+    nxt = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat() if delay else None
+    with db_tx() as conn:
+        if nxt:
+            conn.execute("UPDATE otp_orders SET poll_lease_until=NULL,next_poll_at=?,updated_at=? WHERE order_id=? AND status='waiting'",
+                         (nxt, _otp_now(), order_id))
+        else:
+            conn.execute("UPDATE otp_orders SET poll_lease_until=NULL,updated_at=? WHERE order_id=? AND status='waiting'",
+                         (_otp_now(), order_id))
+
+
+def _otp_process_order(o):
+    """Handle ONE due order completely (expiry / OTP / closed / still waiting).
+
+    This runs on its own worker thread. Before, the main loop did all the slow
+    work itself, one order after another: a burst of orders reaching their 20
+    minute expiry at the same moment blocked OTP delivery for everybody else.
+    """
+    order_id = o['order_id']
+    if not o.get('activation_id'):
+        _otp_release_lease(order_id, 60.0)
+        return
+    now = datetime.now(timezone.utc)
+    try:
+        created = datetime.fromisoformat(o['created_at'])
+    except Exception:
+        _otp_release_lease(order_id, 60.0)
+        return
+    elapsed = (now - created).total_seconds()
+
+    # 1) Automatic expiry (20 minutes)
+    if elapsed >= 1200:
+        try:
+            r = _otp_http('setStatus', id=o['activation_id'], status='8', _lane='poll')
+        except Exception as exc:
+            logger.warning('OTP auto-expire cancel failed order=%s: %s', order_id, exc)
+            _otp_release_lease(order_id, 15.0)
+            return
+        if _otp_provider_missing(r):
+            if _otp_close_provider_order(o, 'expired', 'automatic expiry'):
+                try:
+                    _otp_update_message(o['chat_id'], o['message_id'], f'⌛ <b>OTP REQUEST EXPIRED</b>\n\n🆔 Request ID: <code>{html.escape(str(o["order_id"]))}</code>\n\n💰 Your refund has been processed because no code was received in time.', types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number', callback_data=f'otp_new:{o["order_id"]}')))
+                except Exception:
+                    logger.exception('Could not update expired OTP message')
+            else:
+                _otp_release_lease(order_id, 15.0)
+            return
+        # The provider did not confirm the cancel (a late SMS may have just
+        # arrived): fall through to a normal status check so it is not lost.
+
+    # 2) Ask the provider
+    try:
+        r = _otp_http('getStatusV2', id=o['activation_id'])
+    except Exception:
+        failures = int(o.get('poll_failures') or 0) + 1
+        delay = min(30, max(OTP_STATUS_POLL_SECONDS, 2 ** min(failures, 4)))
+        with db_tx() as conn:
+            conn.execute("UPDATE otp_orders SET poll_failures=?,next_poll_at=?,poll_lease_until=NULL,updated_at=? WHERE order_id=? AND status='waiting'",
+                         (failures, (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(), _otp_now(), order_id))
+        return
+
+    status = str(r.get('provider_status') or r.get('status') or '').upper()
+    otp = r.get('otp')
+    if otp:
+        with db_tx() as conn:
+            cur = conn.execute("SELECT * FROM otp_orders WHERE order_id=? AND status='waiting'", (order_id,)).fetchone()
+            if not cur:
+                return
+            conn.execute("UPDATE otp_orders SET status='completed',otp_code=?,last_provider_status=?,next_poll_at=NULL,poll_lease_until=NULL,updated_at=? WHERE order_id=?",
+                         (str(otp), status or 'STATUS_OK', _otp_now(), order_id))
+            conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",
+                         (str(cur['user_id']), 'OTP_COMPLETED', str(cur['user_id']), cur['selling_price'], order_id, f'service={cur["service_code"]}; country={cur["country_name"]}', _otp_now()))
+        updated = dict(o)
+        updated['otp_code'] = str(otp)
+        try:
+            _otp_update_message(o['chat_id'], o['message_id'], _otp_received_update_text(updated), _otp_kb(order_id, o['service_code'], o['country_code'], 0, o.get('phone_number'), str(otp)))
+        except Exception:
+            logger.exception('OTP received UI update failed order=%s', order_id)
+        return
+
+    if _otp_provider_missing(r):
+        if _otp_close_provider_order(o, 'cancelled', 'provider activation no longer exists or expired'):
+            try:
+                _otp_update_message(o['chat_id'], o['message_id'], f'❌ <b>OTP REQUEST CLOSED</b>\n\n🆔 Request ID: <code>{html.escape(str(o["order_id"]))}</code>\n\n💰 Your refund has been processed. This request is no longer active.', types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number', callback_data=f'otp_new:{o["order_id"]}')))
+            except Exception:
+                logger.exception('Could not update closed OTP message')
+        return
+
+    # 3) Still waiting for the SMS.
+    # BUG THAT WAS FIXED: the polling lease (poll_lease_until) was never cleared
+    # here, so every order was really asked about only once per 60 seconds
+    # (not every few seconds as configured) and OTP codes reached users up to a
+    # minute late. The lease is released now and the next poll is scheduled.
+    now_iso = _otp_now()
+    delay = 15.0 if elapsed >= 1200 else _otp_next_poll_delay(elapsed)
+    try:
+        last_ui = datetime.fromisoformat(o['ui_updated_at']) if o.get('ui_updated_at') else None
+        if last_ui is not None and last_ui.tzinfo is None:
+            last_ui = last_ui.replace(tzinfo=timezone.utc)
+    except Exception:
+        last_ui = None
+    # Countdown edits are cosmetic. With many waiting orders they would eat the whole
+    # Telegram message budget, so their interval stretches with the load and they are
+    # skipped while the outbound queue is long. The one edit that matters (the
+    # 'Cancel' button appearing after 5 minutes) is never skipped.
+    ui_interval = max(float(OTP_UI_UPDATE_SECONDS), min(1800.0, _otp_waiting_count() / OTP_UI_EDITS_PER_SECOND))
+    due_ui = last_ui is None or (datetime.now(timezone.utc) - last_ui).total_seconds() >= ui_interval
+    milestone = elapsed >= 300 and (last_ui is None or (last_ui - created).total_seconds() < 300)
+    should_update_ui = (due_ui or milestone) and (milestone or _tg_backlog_seconds() < 3.0)
+    with db_tx() as conn:
+        conn.execute(
+            "UPDATE otp_orders SET poll_failures=0,last_provider_status=?,next_poll_at=?,poll_lease_until=NULL,updated_at=?,ui_updated_at=CASE WHEN ? THEN ? ELSE ui_updated_at END WHERE order_id=? AND status='waiting'",
+            (status, (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(), now_iso, 1 if should_update_ui else 0, now_iso, order_id)
+        )
+    if should_update_ui:
+        try:
+            auto = max(0, 1200 - int(elapsed))
+            manual = max(0, 300 - int(elapsed))
+            _otp_update_message(o['chat_id'], o['message_id'], _otp_waiting_text(o, auto, manual), _otp_kb(order_id, o['service_code'], o['country_code'], manual, o.get('phone_number')))
+        except Exception:
+            logger.exception('OTP waiting UI update failed order=%s', order_id)
+
+
+def _otp_run_order(o):
+    try:
+        _otp_process_order(o)
+    except Exception:
+        logger.exception('Quick OTP order processing failed order=%s', o.get('order_id'))
+        try:
+            _otp_release_lease(o['order_id'], 5.0)
+        except Exception:
+            logger.exception('Could not release OTP lease order=%s', o.get('order_id'))
+    finally:
+        with _OTP_INFLIGHT_LOCK:
+            _OTP_INFLIGHT.discard(o['order_id'])
+
 
 def _otp_worker():
-    executor=ThreadPoolExecutor(max_workers=OTP_STATUS_WORKERS,thread_name_prefix='otp-status')
+    """Dispatcher: claims due orders and hands each to a worker thread.
+
+    It never waits for the provider itself, so one slow/failed provider call
+    can no longer delay everybody else's OTP.
+    """
+    executor = ThreadPoolExecutor(max_workers=OTP_STATUS_WORKERS, thread_name_prefix='otp-status')
+    max_inflight = OTP_STATUS_WORKERS * 2
     while True:
+        busy = False
         try:
-            now=datetime.now(timezone.utc)
-            rows=fetchall('SELECT o.*,s.service_name FROM otp_orders o LEFT JOIN otp_services s ON s.service_code=o.service_code WHERE o.status="waiting" AND (o.poll_lease_until IS NULL OR o.poll_lease_until<=?) ORDER BY COALESCE(o.next_poll_at,o.created_at) LIMIT ?',(now.isoformat(),OTP_STATUS_BATCH,))
-            due=[]
-            for row in rows:
-                o=dict(row)
-                try: elapsed=(now-datetime.fromisoformat(o['created_at'])).total_seconds()
-                except Exception: continue
-                if elapsed>=1200:
-                    try: r=_otp_http('setStatus',id=o['activation_id'],status='8')
-                    except Exception as exc:
-                        logger.warning('OTP auto-expire cancel failed order=%s: %s',o['order_id'],exc); continue
-                    if _otp_provider_missing(r) and _otp_close_provider_order(o,'expired','automatic expiry'):
-                        try: _otp_update_message(o['chat_id'],o['message_id'],f'⌛ <b>OTP REQUEST EXPIRED</b>\n\n🆔 Request ID: <code>{html.escape(str(o["order_id"]))}</code>\n\n💰 Your refund has been processed because no code was received in time.',types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{o["order_id"]}')))
-                        except Exception: logger.exception('Could not update expired OTP message')
-                    continue
-                due_at=o.get('next_poll_at')
-                if due_at:
-                    try:
-                        if datetime.fromisoformat(due_at)>now: continue
-                    except Exception: pass
-                if len(due) < OTP_STATUS_WORKERS:
-                    lease_until=(now+timedelta(seconds=60)).isoformat()
+            with _OTP_INFLIGHT_LOCK:
+                capacity = max_inflight - len(_OTP_INFLIGHT)
+            if capacity > 0:
+                now = datetime.now(timezone.utc)
+                now_s = now.isoformat()
+                limit = max(1, min(capacity, OTP_STATUS_BATCH))
+                rows = fetchall(
+                    "SELECT o.*,s.service_name FROM otp_orders o LEFT JOIN otp_services s ON s.service_code=o.service_code "
+                    "WHERE o.status='waiting' AND (o.poll_lease_until IS NULL OR o.poll_lease_until<=?) "
+                    "AND (o.next_poll_at IS NULL OR o.next_poll_at<=?) "
+                    "ORDER BY COALESCE(o.next_poll_at,o.created_at) LIMIT ?",
+                    (now_s, now_s, limit))
+                if rows:
+                    lease_until = (now + timedelta(seconds=90)).isoformat()
+                    claimed = []
+                    # ONE transaction for the whole batch (was one per order).
                     with db_tx() as conn:
-                        claimed=conn.execute(
-                            'UPDATE otp_orders SET poll_lease_until=?,updated_at=? WHERE order_id=? AND status="waiting" AND (poll_lease_until IS NULL OR poll_lease_until<=?)',
-                            (lease_until,_otp_now(),o['order_id'],now.isoformat())
-                        ).rowcount
-                    if claimed:
-                        o['poll_lease_until']=lease_until
-                        due.append(o)
-            futures=[executor.submit(_otp_poll_one,o) for o in due[:OTP_STATUS_WORKERS]]
-            for fut in futures:
-                o,r,exc=fut.result()
-                if exc:
-                    failures=int(o.get('poll_failures') or 0)+1
-                    delay=min(30,max(OTP_STATUS_POLL_SECONDS,2**min(failures,4)))
-                    with db_tx() as conn: conn.execute('UPDATE otp_orders SET poll_failures=?,next_poll_at=?,poll_lease_until=NULL,updated_at=? WHERE order_id=? AND status="waiting"',(failures,(datetime.now(timezone.utc)+timedelta(seconds=delay)).isoformat(),_otp_now(),o['order_id']))
-                    continue
-                status=str(r.get('provider_status') or r.get('status') or '').upper()
-                otp=r.get('otp')
-                if otp:
-                    with db_tx() as conn:
-                        cur=conn.execute('SELECT * FROM otp_orders WHERE order_id=? AND status="waiting"',(o['order_id'],)).fetchone()
-                        if not cur: continue
-                        conn.execute('UPDATE otp_orders SET status="completed",otp_code=?,last_provider_status=?,next_poll_at=NULL,poll_lease_until=NULL,updated_at=? WHERE order_id=?',(str(otp),status or 'STATUS_OK',_otp_now(),o['order_id']))
-                        conn.execute("INSERT INTO audit_log(admin_id,action,target_user,amount,txn_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",(str(cur['user_id']),'OTP_COMPLETED',str(cur['user_id']),cur['selling_price'],o['order_id'],f'service={cur["service_code"]}; country={cur["country_name"]}',_otp_now()))
-                    updated=dict(o); updated['otp_code']=str(otp)
-                    try: _otp_update_message(o['chat_id'],o['message_id'],_otp_received_update_text(updated),_otp_kb(o['order_id'],o['service_code'],o['country_code'],0,o.get('phone_number'),str(otp)))
-                    except Exception: logger.exception('OTP received UI update failed order=%s',o['order_id'])
-                elif _otp_provider_missing(r):
-                    if _otp_close_provider_order(o,'cancelled','provider activation no longer exists or expired'):
-                        try: _otp_update_message(o['chat_id'],o['message_id'],f'❌ <b>OTP REQUEST CLOSED</b>\n\n🆔 Request ID: <code>{html.escape(str(o["order_id"]))}</code>\n\n💰 Your refund has been processed. This request is no longer active.',types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🆕 Get New Number',callback_data=f'otp_new:{o["order_id"]}')))
-                        except Exception: logger.exception('Could not update closed OTP message')
-                else:
-                    now_iso=_otp_now()
-                    try:
-                        last_ui=datetime.fromisoformat(o['ui_updated_at']) if o.get('ui_updated_at') else None
-                    except Exception:
-                        last_ui=None
-                    should_update_ui = last_ui is None or (datetime.now(timezone.utc)-last_ui).total_seconds() >= OTP_UI_UPDATE_SECONDS
-                    with db_tx() as conn:
-                        conn.execute(
-                            'UPDATE otp_orders SET poll_failures=0,last_provider_status=?,next_poll_at=?,updated_at=?,ui_updated_at=CASE WHEN ? THEN ? ELSE ui_updated_at END WHERE order_id=? AND status="waiting"',
-                            (status,(datetime.now(timezone.utc)+timedelta(seconds=OTP_STATUS_POLL_SECONDS)).isoformat(),now_iso,1 if should_update_ui else 0,now_iso,o['order_id'])
-                        )
-                    if should_update_ui:
-                        try:
-                            elapsed=(datetime.now(timezone.utc)-datetime.fromisoformat(o['created_at'])).total_seconds(); auto=max(0,1200-int(elapsed)); manual=max(0,300-int(elapsed))
-                            _otp_update_message(o['chat_id'],o['message_id'],_otp_waiting_text(o,auto,manual),_otp_kb(o['order_id'],o['service_code'],o['country_code'],manual,o.get('phone_number')))
-                        except Exception:
-                            logger.exception('OTP waiting UI update failed order=%s',o['order_id'])
-        except Exception: logger.exception('Quick OTP worker error')
-        time.sleep(1)
+                        for row in rows:
+                            n = conn.execute(
+                                "UPDATE otp_orders SET poll_lease_until=?,updated_at=? WHERE order_id=? AND status='waiting' AND (poll_lease_until IS NULL OR poll_lease_until<=?)",
+                                (lease_until, _otp_now(), row['order_id'], now_s)).rowcount
+                            if n:
+                                d = dict(row)
+                                d['poll_lease_until'] = lease_until
+                                claimed.append(d)
+                    for d in claimed:
+                        with _OTP_INFLIGHT_LOCK:
+                            _OTP_INFLIGHT.add(d['order_id'])
+                        executor.submit(_otp_run_order, d)
+                    busy = len(rows) >= limit
+        except Exception:
+            logger.exception('Quick OTP worker error')
+        time.sleep(0.2 if busy else 1.0)
+
 
 @bot.message_handler(func=lambda m: m.content_type == "text")
 @safe_handler
