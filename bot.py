@@ -3354,6 +3354,64 @@ def community_set_cb(c):
     )
 
 
+
+def _tg_error_text(exc):
+    """Return the real Telegram error description (so the admin sees WHY)."""
+    desc = getattr(exc, "description", None) or str(exc) or exc.__class__.__name__
+    return html.escape(str(desc)[:300])
+
+def _community_resolve_chat(raw):
+    """Resolve a chat from what the admin typed.
+
+    Telegram supergroups/channels need the -100 prefix (e.g. -1001234567890).
+    Many people copy the ID without it (e.g. -1234567890 or 1234567890),
+    which makes get_chat() fail with 'chat not found' even though the bot
+    IS an admin. So we try the ID as typed AND with the -100 prefix, and
+    also accept @username.  Returns (chat, real_chat_id).
+    Raises ValueError for bad format, or the last Telegram exception.
+    """
+    raw = (raw or "").strip()
+    candidates = []
+    if re.fullmatch(r"@[A-Za-z0-9_]{5,32}", raw):
+        candidates.append(raw)
+    elif re.fullmatch(r"-?\d+", raw):
+        digits = raw.lstrip("-")
+        if raw.startswith("-100"):
+            candidates.append(int(raw))
+        else:
+            candidates.append(-int(digits))          # basic group style
+            candidates.append(int("-100" + digits))  # supergroup/channel style
+    else:
+        raise ValueError(
+            "Invalid chat ID. Send the numeric chat ID (e.g. -1001234567890) or the @username of a public chat."
+        )
+    last_exc = None
+    for cand in candidates:
+        try:
+            chat = bot.get_chat(cand)
+            return chat, int(chat.id)
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("get_chat(%s) failed: %s", cand, exc)
+    raise last_exc
+
+def _community_access_help(exc):
+    try:
+        me = bot.get_me()
+        bot_name = f"@{me.username}" if getattr(me, "username", None) else str(me.id)
+    except Exception:
+        bot_name = "unknown"
+    return (
+        "❌ The bot cannot access that chat.\n\n"
+        f"Telegram says: <code>{_tg_error_text(exc)}</code>\n\n"
+        f"🤖 This running bot is: <b>{html.escape(bot_name)}</b>\n"
+        "Make sure THIS exact bot (check the BOT_TOKEN on your host) is a member/admin of the chat.\n"
+        "Supergroup/channel IDs start with <code>-100</code>. "
+        "Tip: forward a message from the chat to @RawDataBot / @username_to_id_bot to get the right ID, "
+        "or send the chat's @username if it is public.\n\n"
+        "Then send the ID again."
+    )
+
 def _community_save_after_link(m, state, cid, link):
     """Finish a community destination after ID and link were collected separately."""
     kind = state.get("kind")
@@ -3363,7 +3421,7 @@ def _community_save_after_link(m, state, cid, link):
 
     try:
         normalized_link = "" if str(link).strip().upper() == "SKIP" else _community_normalize_link(link)
-        chat = bot.get_chat(int(cid))
+        chat, cid = _community_resolve_chat(str(cid))
         chat_type = str(getattr(chat, "type", "") or "")
         if kind == "user_group" and chat_type not in ("group", "supergroup"):
             raise ValueError("User Group must be a Telegram group/supergroup.")
@@ -3387,11 +3445,12 @@ def _community_save_after_link(m, state, cid, link):
             reply_markup=back_kb(),
         )
         return
-    except Exception:
+    except Exception as exc:
         logger.exception("Could not validate community destination %s", cid)
         _screen_send_for_chat(
             m.chat.id,
-            "❌ The bot cannot access that chat. Confirm the numeric ID is correct and that the bot is already a member/admin, then send the ID again.",
+            _community_access_help(exc),
+            parse_mode="HTML",
             reply_markup=back_kb(),
         )
         return
@@ -3426,18 +3485,8 @@ def _handle_community_set(m, state):
     if step == "id":
         # Telegram basic groups use negative IDs; supergroups/channels usually
         # use -100... IDs. Do not incorrectly reject a valid basic-group ID.
-        if not raw.lstrip("-").isdigit() or not raw.startswith("-") or int(raw) >= 0:
-            _screen_send_for_chat(
-                m.chat.id,
-                "❌ Invalid Telegram chat ID. Send the numeric negative chat ID only, for example <code>-1001234567890</code>.",
-                parse_mode="HTML",
-                reply_markup=back_kb(),
-            )
-            return
-
-        cid = int(raw)
         try:
-            chat = bot.get_chat(cid)
+            chat, cid = _community_resolve_chat(raw)
             chat_type = str(getattr(chat, "type", "") or "")
             if kind == "user_group" and chat_type not in ("group", "supergroup"):
                 raise ValueError("User Group must be a Telegram group/supergroup.")
@@ -3451,11 +3500,12 @@ def _handle_community_set(m, state):
                 reply_markup=back_kb(),
             )
             return
-        except Exception:
-            logger.exception("Could not validate community destination %s", cid)
+        except Exception as exc:
+            logger.exception("Could not validate community destination %s", raw)
             _screen_send_for_chat(
                 m.chat.id,
-                "❌ The bot cannot access that chat. Confirm the ID is correct and that the bot is already a member/admin of the target chat, then send the ID again.",
+                _community_access_help(exc),
+                parse_mode="HTML",
                 reply_markup=back_kb(),
             )
             return
